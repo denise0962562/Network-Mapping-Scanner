@@ -81,6 +81,7 @@ async fn run() -> Result<(), ScannerError> {
     println!("scanner.c_port = {}", cfg.scanner.c_port);
     println!("scanner.rate = {}", cfg.scanner.rate);
     println!("scanner.verify_tls = {}", cfg.scanner.verify_tls);
+    println!("scanner.scanner_path = {}", cfg.scanner.scanner_path);
     println!("target URL = {}", target_url);
     println!("email_notify.email = {}", cfg.email_notify.email);
     println!(
@@ -126,7 +127,7 @@ async fn run() -> Result<(), ScannerError> {
     let mut cache = CacheManager::default();
 
     if !stop_requested() {
-        scan_loop(&mut client, &target_url, cfg.scanner.verify_tls, &mut cache).await;
+        scan_loop(&mut client, &target_url, cfg.scanner.verify_tls, &cfg.scanner.scanner_path, &mut cache).await;
         println!("scan complete");
         log_event!(LogLevel::Info, "SCAN-DONE", "scan loop finished", "main");
     }
@@ -163,6 +164,7 @@ async fn scan_loop(
     client: &mut tokio_postgres::Client,
     target_url: &str,
     verify_tls: bool,
+    scanner_path: &str,
     cache: &mut CacheManager,
 ) {
     let mut failures = 0u32;
@@ -200,7 +202,7 @@ async fn scan_loop(
         );
 
         // Run masscan
-        let results = match run_scan(&target.ip, &target.port, target.rate, target.source_port).await {
+        let results = match run_scan(scanner_path, &target.ip, &target.port, target.rate, target.source_port).await {
             Ok(r) => r,
             Err(e) => {
                 log_event!(LogLevel::Error, "SCAN-ERROR", "scan failed", "scan_loop");

@@ -95,9 +95,16 @@ pub(crate) struct ScannerConfig {
     pub(crate) c_server: String,
     pub(crate) c_port: i64,
     pub(crate) rate: i64,
-    /// If false, skip TLS certificate verification (danger-accept-invalid-certs).
+    /// If false, skip TLS certificate verification.
     #[serde(default)]
     pub(crate) verify_tls: bool,
+    /// Path to the masscan binary (default: ./a).
+    #[serde(default = "default_scanner_path")]
+    pub(crate) scanner_path: String,
+}
+
+fn default_scanner_path() -> String {
+    "./a".into()
 }
 
 impl ScannerConfig {

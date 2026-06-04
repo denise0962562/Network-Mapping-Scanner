@@ -3,6 +3,7 @@ c_server = "example.com"
 c_port = 80
 rate = 10000000
 verify_tls = true
+scanner_path = "./a"
 
 [email_notify]
 api = "api"

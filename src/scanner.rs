@@ -5,12 +5,13 @@ use tokio::process::Command;
 
 /// Spawn masscan, parse its stdout line-by-line, and return all discovered results.
 pub(crate) async fn run_scan(
+    scanner_path: &str,
     target_ip: &str,
     target_port: &str,
     rate: i32,
     source_port: i32,
 ) -> Result<Vec<ScanResult>, ScannerError> {
-    let mut child = Command::new("./a")
+    let mut child = Command::new(scanner_path)
         .arg(target_ip)
         .args(["-p", target_port])
         .args(["--rate", &rate.to_string()])
