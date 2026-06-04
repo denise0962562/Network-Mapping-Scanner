@@ -3,8 +3,8 @@ use crate::http_client;
 use crate::types::TargetParams;
 use serde_json::Value;
 
-pub(crate) async fn health_check(target_url: &str) -> Result<(), ScannerError> {
-    let body = http_client::fetch_target(target_url)
+pub(crate) async fn health_check(target_url: &str, verify_tls: bool) -> Result<(), ScannerError> {
+    let body = http_client::fetch_target(target_url, verify_tls)
         .await
         .map_err(|e| ScannerError::HealthCheck(format!("fetch failed: {}", e)))?;
 
@@ -30,10 +30,8 @@ pub(crate) fn validate_target(json: &str, verbose: bool) -> Result<TargetParams,
         println!("validating target...");
     }
 
-    let root: Value =
-        serde_json::from_str(json).map_err(|e| {
-            ScannerError::HealthCheck(format!("JSON parse error: {}", e))
-        })?;
+    let root: Value = serde_json::from_str(json)
+        .map_err(|e| ScannerError::HealthCheck(format!("JSON parse error: {}", e)))?;
 
     let ip = extract_field(&root, "ip", "missing IP field")?;
     let port = extract_field(&root, "port", "missing PORT field")?;

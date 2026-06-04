@@ -69,10 +69,32 @@ async fn run() -> Result<(), ScannerError> {
 
     spawn_signal_handler();
 
+    // ---- load config (needed by both health-check and scan) ----
+    let cfg = load_config(&cli.config).inspect_err(|e| {
+        log_event!(LogLevel::Error, "CONFIG-LOAD", "failed to load config", "main");
+        eprintln!("\x1b[31mconfig error: {}\x1b[0m", e);
+    })?;
+
+    let target_url = cfg.scanner.target_url();
+
+    println!("scanner.c_server = {}", cfg.scanner.c_server);
+    println!("scanner.c_port = {}", cfg.scanner.c_port);
+    println!("scanner.rate = {}", cfg.scanner.rate);
+    println!("scanner.verify_tls = {}", cfg.scanner.verify_tls);
+    println!("target URL = {}", target_url);
+    println!("email_notify.email = {}", cfg.email_notify.email);
+    println!(
+        "database.host = {}\ndatabase.port = {}\ndatabase.db_name = {}",
+        cfg.database.host, cfg.database.port, cfg.database.db_name
+    );
+    println!("\nconfig validated\n");
+
+    log_event!(LogLevel::Info, "CONFIG-OK", "config validated", "main");
+
     // ---- health-check mode ----
     if cli.health_check {
         println!("HEALTH CHECKING");
-        match health_check("http://127.0.0.1:9999/scanner/target").await {
+        match health_check(&target_url, cfg.scanner.verify_tls).await {
             Ok(()) => {
                 log_event!(LogLevel::Info, "HEALTH-CHECK", "health check passed", "main");
                 println!("\x1b[32mhealth check passed\x1b[0m");
@@ -84,23 +106,6 @@ async fn run() -> Result<(), ScannerError> {
         }
         return Ok(());
     }
-
-    // ---- load config ----
-    let cfg = load_config(&cli.config).inspect_err(|e| {
-        log_event!(LogLevel::Error, "CONFIG-LOAD", "failed to load config", "main");
-        eprintln!("\x1b[31mconfig error: {}\x1b[0m", e);
-    })?;
-
-    println!("scanner.c_server = {}", cfg.scanner.c_server);
-    println!("scanner.rate = {}", cfg.scanner.rate);
-    println!("email_notify.email = {}", cfg.email_notify.email);
-    println!(
-        "database.host = {}\ndatabase.port = {}\ndatabase.db_name = {}",
-        cfg.database.host, cfg.database.port, cfg.database.db_name
-    );
-    println!("\nconfig validated\n");
-
-    log_event!(LogLevel::Info, "CONFIG-OK", "config validated", "main");
     println!("starting...");
 
     // ---- database ----
@@ -121,7 +126,7 @@ async fn run() -> Result<(), ScannerError> {
     let mut cache = CacheManager::default();
 
     if !stop_requested() {
-        scan_loop(&mut client, &cfg.scanner.c_server, &mut cache).await;
+        scan_loop(&mut client, &target_url, cfg.scanner.verify_tls, &mut cache).await;
         println!("scan complete");
         log_event!(LogLevel::Info, "SCAN-DONE", "scan loop finished", "main");
     }
@@ -156,15 +161,15 @@ fn spawn_signal_handler() {
 
 async fn scan_loop(
     client: &mut tokio_postgres::Client,
-    target_server: &str,
+    target_url: &str,
+    verify_tls: bool,
     cache: &mut CacheManager,
 ) {
-    let target_url = format!("{}/scanner/target", target_server);
     let mut failures = 0u32;
 
     while !stop_requested() {
         // Fetch target
-        let body = match fetch_target(&target_url).await {
+        let body = match fetch_target(target_url, verify_tls).await {
             Ok(b) => b,
             Err(e) => {
                 failures += 1;

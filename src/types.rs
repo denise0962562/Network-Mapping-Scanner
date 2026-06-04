@@ -95,6 +95,16 @@ pub(crate) struct ScannerConfig {
     pub(crate) c_server: String,
     pub(crate) c_port: i64,
     pub(crate) rate: i64,
+    /// If false, skip TLS certificate verification (danger-accept-invalid-certs).
+    #[serde(default)]
+    pub(crate) verify_tls: bool,
+}
+
+impl ScannerConfig {
+    /// Build the HTTPS target URL from configured server and port.
+    pub(crate) fn target_url(&self) -> String {
+        format!("https://{}:{}/scanner/target", self.c_server, self.c_port)
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
