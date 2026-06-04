@@ -4,7 +4,7 @@
 
 首先打开终端，输入以下指令：
 ```
-git clone https://github.com/wshijiang/scanner-test.git
+git clone https://github.com/wshijiang/Network-Mapping-Scanner.git
 ```
 
 然后切换目录 
