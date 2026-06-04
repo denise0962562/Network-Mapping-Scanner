@@ -36,7 +36,7 @@ pub(crate) fn validate_target(json: &str, verbose: bool) -> Result<TargetParams,
     let ip = extract_field(&root, "ip", "missing IP field")?;
     let port = extract_field(&root, "port", "missing PORT field")?;
     let rate = extract_int_range(&root, "rate", 1, 1_000_000, "RATE")?;
-    let source_port = extract_int_range(&root, "source-port", 1, 65535, "SOURCE-PORT")?;
+    let source_port = extract_int_range(&root, "source_port", 1, 65535, "SOURCE-PORT")?;
 
     Ok(TargetParams {
         ip,

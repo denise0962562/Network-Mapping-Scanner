@@ -10,7 +10,7 @@ git clone https://github.com/wshijiang/Network-Mapping-Scanner.git
 然后切换目录 
 
 ```
-cd scanner-test
+cd Network-Mapping-Scanner
 ```
 
 编译
