@@ -1,27 +1,18 @@
 use crate::error::ScannerError;
 use reqwest::Client;
 
-/// Perform an HTTP GET request to `url` and return the response body as a String.
-///
-/// Uses `User-Agent: Scanner/1.0` header, matching the C version's libcurl behavior.
-pub async fn http_requests(url: &str) -> Result<String, ScannerError> {
-    let client = Client::builder()
-        .user_agent("Scanner/1.0")
-        .build()?;
+const USER_AGENT: &str = "Scanner/1.0";
 
-    let response = client.get(url).send().await?;
+pub(crate) async fn fetch_target(url: &str) -> Result<String, ScannerError> {
+    let client = Client::builder().user_agent(USER_AGENT).build()?;
 
-    let body = response.text().await?;
-
+    let body = client.get(url).send().await?.text().await?;
     Ok(body)
 }
 
-/// Send a stop notification email via Mailgun API.
-///
-/// This is a placeholder matching the C version's `send_stop_email` function.
-/// Replace with real configuration before production use.
+/// Placeholder for Mailgun stop-notification. Replace credentials before use.
 #[allow(dead_code)]
-pub async fn send_stop_email(
+pub(crate) async fn send_stop_email(
     api_key: &str,
     domain: &str,
     from: &str,
@@ -29,10 +20,6 @@ pub async fn send_stop_email(
     subject: &str,
     text: &str,
 ) -> Result<(), ScannerError> {
-    let client = Client::new();
-
-    let url = format!("https://api.mailgun.net/v3/{}/messages", domain);
-
     let mut form = reqwest::multipart::Form::new()
         .text("from", from.to_string())
         .text("subject", subject.to_string())
@@ -42,7 +29,8 @@ pub async fn send_stop_email(
         form = form.text("to", recipient.to_string());
     }
 
-    let response = client
+    let url = format!("https://api.mailgun.net/v3/{}/messages", domain);
+    let response = Client::new()
         .post(&url)
         .basic_auth("api", Some(api_key))
         .multipart(form)
@@ -53,11 +41,11 @@ pub async fn send_stop_email(
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(ScannerError::Http(format!(
-            "邮件发送失败 ({}): {}",
+            "email send failed ({}): {}",
             status, body
         )));
     }
 
-    tracing::info!("邮件发送成功");
+    tracing::info!("email sent successfully");
     Ok(())
 }

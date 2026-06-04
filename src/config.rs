@@ -1,67 +1,38 @@
 use crate::error::ScannerError;
 use crate::types::AppConfig;
 
-/// Load and validate the TOML configuration file.
-///
-/// Reads `filename`, deserializes into `AppConfig`, and validates
-/// that all required fields are present and of the correct type.
-pub fn load_config(filename: &str) -> Result<AppConfig, ScannerError> {
-    let content = std::fs::read_to_string(filename)
-        .map_err(|e| ScannerError::Config(format!("无法读取配置文件 {}: {}", filename, e)))?;
+pub(crate) fn load_config(path: &str) -> Result<AppConfig, ScannerError> {
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        ScannerError::Config(format!("cannot read config file {}: {}", path, e))
+    })?;
 
-    let config: AppConfig = toml::from_str(&content)
-        .map_err(|e| ScannerError::Config(format!("解析配置文件失败 {}: {}", filename, e)))?;
+    let config: AppConfig = toml::from_str(&content).map_err(|e| {
+        ScannerError::Config(format!("failed to parse config {}: {}", path, e))
+    })?;
 
-    validate_config(&config)?;
-
+    validate(&config)?;
     Ok(config)
 }
 
-/// Validate configuration fields match expected types and constraints.
-fn validate_config(config: &AppConfig) -> Result<(), ScannerError> {
-    // Scanner section validation
-    if config.scanner.c_server.is_empty() {
-        return Err(ScannerError::Config("scanner.c_server 不能为空".into()));
-    }
-    if config.scanner.c_port <= 0 {
-        return Err(ScannerError::Config("scanner.c_port 必须大于 0".into()));
-    }
-    if config.scanner.rate <= 0 {
-        return Err(ScannerError::Config("scanner.rate 必须大于 0".into()));
-    }
+fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
+    let rules: &[(&str, bool, &str)] = &[
+        ("scanner.c_server", cfg.scanner.c_server.is_empty(), "scanner.c_server must not be empty"),
+        ("scanner.c_port", cfg.scanner.c_port <= 0, "scanner.c_port must be > 0"),
+        ("scanner.rate", cfg.scanner.rate <= 0, "scanner.rate must be > 0"),
+        ("email_notify.api", cfg.email_notify.api.is_empty(), "email_notify.api must not be empty"),
+        ("email_notify.send_email", cfg.email_notify.send_email.is_empty(), "email_notify.send_email must not be empty"),
+        ("email_notify.email", cfg.email_notify.email.is_empty(), "email_notify.email must not be empty"),
+        ("database.host", cfg.database.host.is_empty(), "database.host must not be empty"),
+        ("database.port", cfg.database.port <= 0, "database.port must be > 0"),
+        ("database.db_name", cfg.database.db_name.is_empty(), "database.db_name must not be empty"),
+        ("database.username", cfg.database.username.is_empty(), "database.username must not be empty"),
+        ("database.password", cfg.database.password.is_empty(), "database.password must not be empty"),
+    ];
 
-    // Email notify section validation
-    if config.email_notify.api.is_empty() {
-        return Err(ScannerError::Config("email_notify.api 不能为空".into()));
-    }
-    if config.email_notify.send_email.is_empty() {
-        return Err(ScannerError::Config(
-            "email_notify.send_email 不能为空".into(),
-        ));
-    }
-    if config.email_notify.email.is_empty() {
-        return Err(ScannerError::Config("email_notify.email 不能为空".into()));
-    }
-
-    // Database section validation
-    if config.database.host.is_empty() {
-        return Err(ScannerError::Config("database.host 不能为空".into()));
-    }
-    if config.database.port <= 0 {
-        return Err(ScannerError::Config("database.port 必须大于 0".into()));
-    }
-    if config.database.db_name.is_empty() {
-        return Err(ScannerError::Config("database.db_name 不能为空".into()));
-    }
-    if config.database.username.is_empty() {
-        return Err(ScannerError::Config(
-            "database.username 不能为空".into(),
-        ));
-    }
-    if config.database.password.is_empty() {
-        return Err(ScannerError::Config(
-            "database.password 不能为空".into(),
-        ));
+    for &(field, failed, msg) in rules {
+        if failed {
+            return Err(ScannerError::Config(format!("{}: {}", field, msg)));
+        }
     }
 
     Ok(())

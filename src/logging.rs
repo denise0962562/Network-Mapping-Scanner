@@ -1,36 +1,24 @@
-use chrono::Local;
 use std::path::Path;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// Initialize the tracing/logging system.
-///
-/// Logs are written both to:
-/// - Console (stderr, human-readable)
-/// - File (JSON format, rotated daily, stored in `./logs/`)
-pub fn init_logging(debug_mode: bool) -> Result<(), std::io::Error> {
-    // Ensure logs directory exists
+pub(crate) fn init_logging(debug: bool) -> Result<(), std::io::Error> {
     let log_dir = Path::new("./logs");
     if !log_dir.exists() {
         std::fs::create_dir_all(log_dir)?;
     }
 
-    // File appender with daily rotation
     let file_appender = tracing_appender::rolling::daily("./logs", "scanner.log");
 
-    // Filter: DEBUG level if debug_mode, INFO otherwise
-    let default_level = if debug_mode { "debug" } else { "info" };
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    let default_level = if debug { "debug" } else { "info" };
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
-    // Console layer (human-readable)
-    let console_layer = fmt::layer()
-        .with_target(true)
-        .with_thread_ids(false)
+    let console = fmt::layer()
+        .with_target(false)
         .with_file(true)
         .with_line_number(true);
 
-    // File layer (JSON format)
-    let file_layer = fmt::layer()
+    let file = fmt::layer()
         .json()
         .with_writer(file_appender)
         .with_target(true)
@@ -39,62 +27,51 @@ pub fn init_logging(debug_mode: bool) -> Result<(), std::io::Error> {
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(console_layer)
-        .with(file_layer)
+        .with(console)
+        .with(file)
         .init();
 
     Ok(())
 }
 
-/// Log a structured event, matching the C version's `log_to` function.
-///
-/// Parameters match the original C function signature:
-/// `log_to(level, event, message, event_path, log_type)`
-pub fn log_to(level: &str, event: &str, message: &str, event_path: &str) {
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%z").to_string();
-
-    match level.to_uppercase().as_str() {
-        "ERROR" => {
-            tracing::error!(
-                timestamp = %timestamp,
-                event = %event,
-                path = %event_path,
-                message = %message,
-                ""
-            );
+/// Convenience macro wrapping `tracing` field-value syntax for structured log events.
+#[macro_export]
+macro_rules! log_event {
+    ($level:expr, $event:expr, $msg:expr, $path:expr) => {
+        match $level {
+            $crate::logging::LogLevel::Error => {
+                ::tracing::error!(event = $event, path = $path, message = $msg)
+            }
+            $crate::logging::LogLevel::Warn => {
+                ::tracing::warn!(event = $event, path = $path, message = $msg)
+            }
+            $crate::logging::LogLevel::Debug => {
+                ::tracing::debug!(event = $event, path = $path, message = $msg)
+            }
+            $crate::logging::LogLevel::Info => {
+                ::tracing::info!(event = $event, path = $path, message = $msg)
+            }
         }
-        "WARN" => {
-            tracing::warn!(
-                timestamp = %timestamp,
-                event = %event,
-                path = %event_path,
-                message = %message,
-                ""
-            );
-        }
-        "DEBUG" => {
-            tracing::debug!(
-                timestamp = %timestamp,
-                event = %event,
-                path = %event_path,
-                message = %message,
-                ""
-            );
-        }
-        _ => {
-            tracing::info!(
-                timestamp = %timestamp,
-                event = %event,
-                path = %event_path,
-                message = %message,
-                ""
-            );
-        }
-    }
+    };
 }
 
-/// Get current milliseconds timestamp (replaces `get_milliseconds_timestamp`)
-#[allow(dead_code)]
-pub fn get_milliseconds_timestamp() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogLevel {
+    #[allow(dead_code)]
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    #[allow(dead_code)]
+    pub(crate) fn from_str(s: &str) -> Self {
+        match s.to_uppercase().as_str() {
+            "ERROR" => Self::Error,
+            "WARN" => Self::Warn,
+            "DEBUG" => Self::Debug,
+            _ => Self::Info,
+        }
+    }
 }
