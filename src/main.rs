@@ -35,6 +35,10 @@ struct Cli {
     /// 启用 DEBUG 模式
     #[arg(short = 'd', long = "debug")]
     debug: bool,
+
+    /// 指定配置文件路径（默认: config.toml）
+    #[arg(short = 'f', long = "config", default_value = "config.toml")]
+    config_file: String,
 }
 
 /// Global stop signal (replaces the C `stop_signal` global variable).
@@ -86,7 +90,7 @@ async fn main() -> Result<(), ScannerError> {
     }
 
     // Load configuration
-    let config = match load_config("config.toml") {
+    let config = match load_config(&cli.config_file) {
         Ok(cfg) => cfg,
         Err(e) => {
             log_to(
