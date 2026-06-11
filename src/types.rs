@@ -1,26 +1,9 @@
 use std::collections::HashMap;
 
-/// Database connection parameters.
-#[derive(Debug, Clone)]
-pub(crate) struct DbConnectInfo {
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    pub(crate) db_name: String,
-    pub(crate) username: String,
-    pub(crate) password: String,
-}
-
-impl DbConnectInfo {
-    pub(crate) fn conn_string(&self) -> String {
-        format!(
-            "host={} port={} dbname={} user={} password={} client_encoding=UTF8",
-            self.host, self.port, self.db_name, self.username, self.password
-        )
-    }
-}
+// ---- Cache data model ---------------------------------------------------
 
 /// A single service entry: service name and optional banner.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct ServiceInfo {
     pub(crate) name: Option<String>,
     pub(crate) banner: Option<String>,
@@ -33,7 +16,7 @@ impl ServiceInfo {
 }
 
 /// Per-port information: port number, protocol, and associated services.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct PortInfo {
     pub(crate) port: u16,
     pub(crate) protocol: String,
@@ -41,13 +24,13 @@ pub(crate) struct PortInfo {
 }
 
 /// An IP-scoped entry in the scan cache.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct IpEntry {
     pub(crate) scanner_name: String,
     pub(crate) ports: Vec<PortInfo>,
 }
 
-/// In-memory scan result cache. Accumulates results until flushed to the database.
+/// In-memory scan result cache. Accumulates results until flushed.
 #[derive(Debug, Default)]
 pub(crate) struct CacheManager {
     pub(crate) ip_table: HashMap<String, IpEntry>,
@@ -81,13 +64,28 @@ pub(crate) struct TargetParams {
     pub(crate) source_port: i32,
 }
 
-// ---- Configuration structures (matching config.toml) ----
+// ---- Upload payload -----------------------------------------------------
+
+/// Flat upload entry — one per (ip, port, service) tuple.
+/// Designed so the server can consume each entry independently.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct UploadEntry {
+    pub(crate) ip: String,
+    pub(crate) port: u16,
+    pub(crate) protocol: String,
+    pub(crate) scanner_name: String,
+    pub(crate) service: Option<String>,
+    pub(crate) banner: Option<String>,
+    pub(crate) scan_time: i64,
+}
+
+// ---- Configuration structures -------------------------------------------
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct AppConfig {
     pub(crate) scanner: ScannerConfig,
     pub(crate) email_notify: EmailNotifyConfig,
-    pub(crate) database: DatabaseConfig,
+    pub(crate) upload: UploadConfig,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -95,10 +93,8 @@ pub(crate) struct ScannerConfig {
     pub(crate) c_server: String,
     pub(crate) c_port: i64,
     pub(crate) rate: i64,
-    /// If false, skip TLS certificate verification.
     #[serde(default)]
     pub(crate) verify_tls: bool,
-    /// Path to the masscan binary (default: ./a).
     #[serde(default = "default_scanner_path")]
     pub(crate) scanner_path: String,
 }
@@ -122,22 +118,7 @@ pub(crate) struct EmailNotifyConfig {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-pub(crate) struct DatabaseConfig {
-    pub(crate) host: String,
-    pub(crate) port: i64,
-    pub(crate) db_name: String,
-    pub(crate) username: String,
-    pub(crate) password: String,
-}
-
-impl From<&DatabaseConfig> for DbConnectInfo {
-    fn from(cfg: &DatabaseConfig) -> Self {
-        Self {
-            host: cfg.host.clone(),
-            port: cfg.port as u16,
-            db_name: cfg.db_name.clone(),
-            username: cfg.username.clone(),
-            password: cfg.password.clone(),
-        }
-    }
+pub(crate) struct UploadConfig {
+    /// Full HTTPS URL where scan results are POSTed as JSON.
+    pub(crate) endpoint: String,
 }

@@ -1,21 +1,21 @@
 mod cache;
 mod config;
-mod db;
 mod error;
 mod health;
 mod http_client;
 mod logging;
 mod scanner;
 mod types;
+mod upload;
 
 use crate::config::load_config;
-use crate::db::{create_conn, flush_cache, init_tables};
 use crate::error::ScannerError;
 use crate::health::{health_check, validate_target};
 use crate::http_client::fetch_target;
 use crate::logging::{init_logging, LogLevel};
 use crate::scanner::run_scan;
-use crate::types::{CacheManager, DbConnectInfo};
+use crate::types::CacheManager;
+use crate::upload::Uploader;
 use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{sleep, Duration};
@@ -69,7 +69,7 @@ async fn run() -> Result<(), ScannerError> {
 
     spawn_signal_handler();
 
-    // ---- load config (needed by both health-check and scan) ----
+    // ---- load config ----
     let cfg = load_config(&cli.config).inspect_err(|e| {
         log_event!(LogLevel::Error, "CONFIG-LOAD", "failed to load config", "main");
         eprintln!("\x1b[31mconfig error: {}\x1b[0m", e);
@@ -77,17 +77,13 @@ async fn run() -> Result<(), ScannerError> {
 
     let target_url = cfg.scanner.target_url();
 
-    println!("scanner.c_server = {}", cfg.scanner.c_server);
-    println!("scanner.c_port = {}", cfg.scanner.c_port);
-    println!("scanner.rate = {}", cfg.scanner.rate);
+    println!("scanner.c_server   = {}", cfg.scanner.c_server);
+    println!("scanner.c_port     = {}", cfg.scanner.c_port);
+    println!("scanner.rate       = {}", cfg.scanner.rate);
     println!("scanner.verify_tls = {}", cfg.scanner.verify_tls);
-    println!("scanner.scanner_path = {}", cfg.scanner.scanner_path);
-    println!("target URL = {}", target_url);
-    println!("email_notify.email = {}", cfg.email_notify.email);
-    println!(
-        "database.host = {}\ndatabase.port = {}\ndatabase.db_name = {}",
-        cfg.database.host, cfg.database.port, cfg.database.db_name
-    );
+    println!("scanner.path       = {}", cfg.scanner.scanner_path);
+    println!("target URL         = {}", target_url);
+    println!("upload.endpoint    = {}", cfg.upload.endpoint);
     println!("\nconfig validated\n");
 
     log_event!(LogLevel::Info, "CONFIG-OK", "config validated", "main");
@@ -107,39 +103,30 @@ async fn run() -> Result<(), ScannerError> {
         }
         return Ok(());
     }
+
     println!("starting...");
 
-    // ---- database ----
-    let db_info = DbConnectInfo::from(&cfg.database);
-
-    let mut client = create_conn(&db_info).await.inspect_err(|e| {
-        log_event!(LogLevel::Error, "DB-CONNECT", "db connection failed", "main");
-        eprintln!("\x1b[31mdb connect error: {}\x1b[0m", e);
-    })?;
-
-    println!("initializing database...");
-    init_tables(&mut client).await.inspect_err(|e| {
-        log_event!(LogLevel::Error, "DB-INIT", "db init failed", "main");
-        eprintln!("\x1b[31mdb init error: {}\x1b[0m", e);
-    })?;
+    // ---- build pipeline components ----
+    let uploader = Uploader::new(cfg.upload.endpoint.clone(), cfg.scanner.verify_tls);
 
     // ---- scan loop ----
     let mut cache = CacheManager::default();
 
     if !stop_requested() {
-        scan_loop(&mut client, &target_url, cfg.scanner.verify_tls, &cfg.scanner.scanner_path, &mut cache).await;
+        scan_loop(
+            &cfg.scanner.scanner_path,
+            &target_url,
+            cfg.scanner.verify_tls,
+            &uploader,
+            &mut cache,
+        )
+        .await;
         println!("scan complete");
         log_event!(LogLevel::Info, "SCAN-DONE", "scan loop finished", "main");
     }
 
     // ---- final flush ----
-    if cache.total_records > 0 {
-        if let Err(e) = flush_cache(&mut client, &cache).await {
-            log_event!(LogLevel::Error, "FINAL-FLUSH", "final flush failed", "main");
-            eprintln!("\x1b[31mflush error: {}\x1b[0m", e);
-        }
-        cache.clear();
-    }
+    flush(&uploader, &mut cache).await;
 
     log_event!(LogLevel::Info, "CLEANUP", "shutdown complete", "main");
     println!("shutdown complete");
@@ -158,21 +145,46 @@ fn spawn_signal_handler() {
     });
 }
 
+// ---- pipeline helpers ---------------------------------------------------
+
+/// Flatten the cache, upload via HTTPS POST, then clear.
+async fn flush(uploader: &Uploader, cache: &mut CacheManager) {
+    if cache.total_records == 0 {
+        return;
+    }
+
+    let entries = cache.flatten();
+    match uploader.upload(&entries).await {
+        Ok(()) => {
+            log_event!(LogLevel::Info, "UPLOAD", "upload complete", "flush");
+            cache.clear();
+        }
+        Err(e) => {
+            // Keep data in cache on failure — it will be retried on next flush
+            log_event!(LogLevel::Error, "UPLOAD-ERROR", "upload failed", "flush");
+            tracing::error!("upload failed ({} entries kept in cache): {}", entries.len(), e);
+        }
+    }
+}
+
 // ---- scan loop ----------------------------------------------------------
 
 async fn scan_loop(
-    client: &mut tokio_postgres::Client,
+    scanner_path: &str,
     target_url: &str,
     verify_tls: bool,
-    scanner_path: &str,
+    uploader: &Uploader,
     cache: &mut CacheManager,
 ) {
     let mut failures = 0u32;
 
     while !stop_requested() {
-        // Fetch target
+        // ---- fetch target ----
         let body = match fetch_target(target_url, verify_tls).await {
-            Ok(b) => b,
+            Ok(b) => {
+                failures = 0;
+                b
+            }
             Err(e) => {
                 failures += 1;
                 tracing::warn!("fetch target failed ({}/5): {}", failures, e);
@@ -184,9 +196,8 @@ async fn scan_loop(
                 continue;
             }
         };
-        failures = 0;
 
-        // Validate
+        // ---- validate target ----
         let target = match validate_target(&body, false) {
             Ok(t) => t,
             Err(e) => {
@@ -201,8 +212,8 @@ async fn scan_loop(
             target.ip, target.port, target.rate, target.source_port
         );
 
-        // Run masscan
-        let results = match run_scan(scanner_path, &target.ip, &target.port, target.rate, target.source_port).await {
+        // ---- run scan ----
+        let results = match run_scan(scanner_path, &target).await {
             Ok(r) => r,
             Err(e) => {
                 log_event!(LogLevel::Error, "SCAN-ERROR", "scan failed", "scan_loop");
@@ -211,15 +222,12 @@ async fn scan_loop(
             }
         };
 
-        // Cache results
+        // ---- cache results ----
         for r in &results {
-            // On stop signal, flush first
             if stop_requested() {
                 log_event!(LogLevel::Info, "FLUSH", "flushing on stop signal", "scan_loop");
-                if let Err(e) = flush_cache(client, cache).await {
-                    log_event!(LogLevel::Error, "FLUSH-ERROR", "flush failed", "scan_loop");
-                    tracing::error!("flush error: {}", e);
-                    request_stop();
+                flush(uploader, cache).await;
+                if stop_requested() {
                     return;
                 }
             }
@@ -236,11 +244,5 @@ async fn scan_loop(
     }
 
     // Final flush
-    if cache.total_records > 0 {
-        if let Err(e) = flush_cache(client, cache).await {
-            log_event!(LogLevel::Error, "FINAL-FLUSH", "flush failed", "scan_loop");
-            tracing::error!("final flush error: {}", e);
-        }
-        cache.clear();
-    }
+    flush(uploader, cache).await;
 }
