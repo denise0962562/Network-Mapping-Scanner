@@ -1,16 +1,19 @@
 [scanner]
+# Target API server hostname
 c_server = "example.com"
-c_port = 80
+# Target API server port
+c_port = 443
+# Masscan packet rate
 rate = 10000000
+# Verify TLS certificates (set to false for self-signed certs)
+verify_tls = true
+# Path to masscan binary
+scanner_path = "./a"
+# Auto-generated scanner identity (UUIDv7) — do not edit manually
+scanner_id = ""
+# Registration token — set via --token or after successful registration
+token = ""
 
-[email_notify]
-api = "api"
-send_email = "test@example.com"
-email = "test1@example.com"
-
-[database]
-host = "127.0.0.1"
-port = 54433
-db_name = "nmapping"
-username = "nmapping"
-password = "123456"
+[upload]
+# Endpoint for scan result upload (HTTPS POST JSON)
+endpoint = "https://example.com/api/scan-results"

@@ -1,3 +1,6 @@
 /target
 
 .codegraph
+
+logs/
+test-resource/

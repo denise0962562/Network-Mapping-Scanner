@@ -15,7 +15,7 @@ pub(crate) enum ScannerError {
     Http(String),
 
     #[error("{0}")]
-    Database(String),
+    Upload(String),
 
     #[error("{0}")]
     Config(String),
@@ -27,8 +27,8 @@ pub(crate) enum ScannerError {
     HealthCheck(String),
 }
 
-impl From<toml::de::Error> for ScannerError {
-    fn from(e: toml::de::Error) -> Self {
+impl From<toml_edit::de::Error> for ScannerError {
+    fn from(e: toml_edit::de::Error) -> Self {
         Self::Toml(e.to_string())
     }
 }
@@ -36,11 +36,5 @@ impl From<toml::de::Error> for ScannerError {
 impl From<reqwest::Error> for ScannerError {
     fn from(e: reqwest::Error) -> Self {
         Self::Http(e.to_string())
-    }
-}
-
-impl From<tokio_postgres::Error> for ScannerError {
-    fn from(e: tokio_postgres::Error) -> Self {
-        Self::Database(e.to_string())
     }
 }

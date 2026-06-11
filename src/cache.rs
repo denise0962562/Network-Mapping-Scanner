@@ -1,5 +1,5 @@
 use crate::error::ScannerError;
-use crate::types::{CacheManager, IpEntry, PortInfo, ServiceInfo};
+use crate::types::{CacheManager, IpEntry, PortInfo, ServiceInfo, UploadEntry};
 use std::collections::hash_map::Entry;
 
 impl CacheManager {
@@ -28,9 +28,37 @@ impl CacheManager {
         self.total_records += 1;
         Ok(())
     }
+
+    /// Flatten the hierarchical cache into a flat `Vec<UploadEntry>`.
+    ///
+    /// Each (ip, port, service) tuple becomes one independent upload entry
+    /// so the server can consume them without understanding the nested structure.
+    pub(crate) fn flatten(&self) -> Vec<UploadEntry> {
+        let scan_time = chrono::Utc::now().timestamp_millis();
+        let mut entries = Vec::new();
+
+        for (ip, ip_entry) in &self.ip_table {
+            for port_info in &ip_entry.ports {
+                for svc in &port_info.services {
+                    entries.push(UploadEntry {
+                        ip: ip.clone(),
+                        port: port_info.port,
+                        protocol: port_info.protocol.clone(),
+                        scanner_name: ip_entry.scanner_name.clone(),
+                        service: svc.name.clone(),
+                        banner: svc.banner.clone(),
+                        scan_time,
+                    });
+                }
+            }
+        }
+
+        entries
+    }
 }
 
-/// Find an existing (port, protocol) slot or create a new one, then add the service.
+// ---- Internal helpers ---------------------------------------------------
+
 fn add_or_fill(
     entry: &mut IpEntry,
     port: u16,
@@ -43,14 +71,12 @@ fn add_or_fill(
         .iter_mut()
         .find(|pi| pi.port == port && pi.protocol == protocol)
     {
-        // Duplicate Discovered line → skip
         if service.is_none() && banner.is_none() {
             return Ok(());
         }
         return upsert_service(pi, service, banner);
     }
 
-    // New port entry
     let mut pi = PortInfo {
         port,
         protocol: protocol.to_owned(),
@@ -61,7 +87,6 @@ fn add_or_fill(
     Ok(())
 }
 
-/// Fill the first empty placeholder (service == None), or append a new service record.
 fn upsert_service(
     pi: &mut PortInfo,
     service: Option<&str>,
