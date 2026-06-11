@@ -82,8 +82,8 @@ async fn run() -> Result<(), ScannerError> {
     println!("scanner.rate       = {}", cfg.scanner.rate);
     println!("scanner.verify_tls = {}", cfg.scanner.verify_tls);
     println!("scanner.path       = {}", cfg.scanner.scanner_path);
-    println!("target URL         = {}", target_url);
     println!("upload.endpoint    = {}", cfg.upload.endpoint);
+    println!("target URL         = {}", target_url);
     println!("\nconfig validated\n");
 
     log_event!(LogLevel::Info, "CONFIG-OK", "config validated", "main");

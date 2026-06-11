@@ -84,7 +84,6 @@ pub(crate) struct UploadEntry {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct AppConfig {
     pub(crate) scanner: ScannerConfig,
-    pub(crate) email_notify: EmailNotifyConfig,
     pub(crate) upload: UploadConfig,
 }
 
@@ -108,13 +107,6 @@ impl ScannerConfig {
     pub(crate) fn target_url(&self) -> String {
         format!("https://{}:{}/scanner/target", self.c_server, self.c_port)
     }
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub(crate) struct EmailNotifyConfig {
-    pub(crate) api: String,
-    pub(crate) send_email: String,
-    pub(crate) email: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

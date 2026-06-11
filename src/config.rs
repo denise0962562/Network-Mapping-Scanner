@@ -19,9 +19,6 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
         ("scanner.c_server", cfg.scanner.c_server.is_empty(), "must not be empty"),
         ("scanner.c_port", cfg.scanner.c_port <= 0, "must be > 0"),
         ("scanner.rate", cfg.scanner.rate <= 0, "must be > 0"),
-        ("email_notify.api", cfg.email_notify.api.is_empty(), "must not be empty"),
-        ("email_notify.send_email", cfg.email_notify.send_email.is_empty(), "must not be empty"),
-        ("email_notify.email", cfg.email_notify.email.is_empty(), "must not be empty"),
         ("upload.endpoint", cfg.upload.endpoint.is_empty(), "must not be empty"),
     ];
 
