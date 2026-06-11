@@ -87,6 +87,14 @@ pub(crate) struct AppConfig {
     pub(crate) upload: UploadConfig,
 }
 
+fn default_scanner_path() -> String {
+    "./a".into()
+}
+
+fn default_scanner_id() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct ScannerConfig {
     pub(crate) c_server: String,
@@ -96,10 +104,12 @@ pub(crate) struct ScannerConfig {
     pub(crate) verify_tls: bool,
     #[serde(default = "default_scanner_path")]
     pub(crate) scanner_path: String,
-}
-
-fn default_scanner_path() -> String {
-    "./a".into()
+    /// Scanner identity — auto-generated UUIDv7 on first run.
+    #[serde(default = "default_scanner_id")]
+    pub(crate) scanner_id: String,
+    /// Registration token issued by the server.
+    #[serde(default)]
+    pub(crate) token: String,
 }
 
 impl ScannerConfig {

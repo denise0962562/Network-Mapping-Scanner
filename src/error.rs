@@ -27,8 +27,8 @@ pub(crate) enum ScannerError {
     HealthCheck(String),
 }
 
-impl From<toml::de::Error> for ScannerError {
-    fn from(e: toml::de::Error) -> Self {
+impl From<toml_edit::de::Error> for ScannerError {
+    fn from(e: toml_edit::de::Error) -> Self {
         Self::Toml(e.to_string())
     }
 }
