@@ -345,14 +345,30 @@ async fn scan_loop(config: ScanLoopConfig<'_>, uploader: &Uploader, cache: &mut 
                     sleep(Duration::from_secs(5)).await;
                     continue;
                 }
-                Ok(FetchTaskOutcome::Unauthorized) => {
+                Ok(FetchTaskOutcome::Unauthorized { detail }) => {
                     log_event!(
                         LogLevel::Error,
                         "AUTH",
                         "runtime token rejected",
                         "scan_loop"
                     );
-                    tracing::error!("runtime token rejected; register the scanner again");
+                    tracing::error!(
+                        "runtime token rejected; register the scanner again: {}",
+                        detail
+                    );
+                    break;
+                }
+                Ok(FetchTaskOutcome::Forbidden { detail }) => {
+                    log_event!(
+                        LogLevel::Error,
+                        "SERVER-POLICY",
+                        "task request forbidden",
+                        "scan_loop"
+                    );
+                    tracing::error!(
+                        "task request was blocked by server security middleware: {}",
+                        detail
+                    );
                     break;
                 }
                 Err(e) => {

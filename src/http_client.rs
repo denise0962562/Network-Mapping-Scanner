@@ -1,13 +1,49 @@
 use crate::error::ScannerError;
 use crate::types::AssignedTask;
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Response, StatusCode};
 
 const USER_AGENT: &str = "Scanner/1.0";
 
 pub(crate) enum FetchTaskOutcome {
     Task(AssignedTask),
     NoTask,
+    Unauthorized { detail: String },
+    Forbidden { detail: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TaskResponseStatus {
+    Task,
+    NoTask,
     Unauthorized,
+    Forbidden,
+    Other(StatusCode),
+}
+
+fn classify_task_status(status: StatusCode) -> TaskResponseStatus {
+    match status {
+        StatusCode::OK => TaskResponseStatus::Task,
+        StatusCode::NOT_FOUND => TaskResponseStatus::NoTask,
+        StatusCode::UNAUTHORIZED => TaskResponseStatus::Unauthorized,
+        StatusCode::FORBIDDEN => TaskResponseStatus::Forbidden,
+        status => TaskResponseStatus::Other(status),
+    }
+}
+
+async fn response_detail(response: Response) -> String {
+    let body = response.text().await.unwrap_or_default();
+    let detail: String = body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(256)
+        .collect();
+    if detail.is_empty() {
+        "empty response body".into()
+    } else {
+        detail
+    }
 }
 
 fn client(verify_tls: bool) -> Result<Client, ScannerError> {
@@ -29,18 +65,23 @@ pub(crate) async fn fetch_task(
         .send()
         .await?;
 
-    match response.status() {
-        StatusCode::OK => response
+    match classify_task_status(response.status()) {
+        TaskResponseStatus::Task => response
             .json::<AssignedTask>()
             .await
             .map(FetchTaskOutcome::Task)
             .map_err(|error| ScannerError::Http(format!("invalid task response: {error}"))),
-        StatusCode::NOT_FOUND => Ok(FetchTaskOutcome::NoTask),
-        StatusCode::UNAUTHORIZED => Ok(FetchTaskOutcome::Unauthorized),
-        status => {
-            let body = response.text().await.unwrap_or_default();
+        TaskResponseStatus::NoTask => Ok(FetchTaskOutcome::NoTask),
+        TaskResponseStatus::Unauthorized => Ok(FetchTaskOutcome::Unauthorized {
+            detail: response_detail(response).await,
+        }),
+        TaskResponseStatus::Forbidden => Ok(FetchTaskOutcome::Forbidden {
+            detail: response_detail(response).await,
+        }),
+        TaskResponseStatus::Other(status) => {
+            let detail = response_detail(response).await;
             Err(ScannerError::Http(format!(
-                "task endpoint returned {status}: {body}"
+                "task endpoint returned {status}: {detail}"
             )))
         }
     }
@@ -57,16 +98,56 @@ pub(crate) async fn validate_credentials(
         .send()
         .await?;
 
-    match response.status() {
+    let status = response.status();
+    match status {
         StatusCode::OK => Ok(()),
-        StatusCode::UNAUTHORIZED => Err(ScannerError::HealthCheck(
-            "runtime credentials were rejected".into(),
-        )),
-        status => {
-            let body = response.text().await.unwrap_or_default();
+        StatusCode::UNAUTHORIZED => {
+            let detail = response_detail(response).await;
             Err(ScannerError::HealthCheck(format!(
-                "credential check returned {status}: {body}"
+                "runtime credentials were rejected: {detail}"
             )))
         }
+        StatusCode::FORBIDDEN => {
+            let detail = response_detail(response).await;
+            Err(ScannerError::HealthCheck(format!(
+                "credential check was blocked by server security middleware: {detail}"
+            )))
+        }
+        status => {
+            let detail = response_detail(response).await;
+            Err(ScannerError::HealthCheck(format!(
+                "credential check returned {status}: {detail}"
+            )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TaskResponseStatus, classify_task_status};
+    use reqwest::StatusCode;
+
+    #[test]
+    fn task_http_statuses_are_classified_for_actionable_errors() {
+        assert_eq!(
+            classify_task_status(StatusCode::OK),
+            TaskResponseStatus::Task
+        );
+        assert_eq!(
+            classify_task_status(StatusCode::NOT_FOUND),
+            TaskResponseStatus::NoTask
+        );
+        assert_eq!(
+            classify_task_status(StatusCode::UNAUTHORIZED),
+            TaskResponseStatus::Unauthorized
+        );
+        assert_eq!(
+            classify_task_status(StatusCode::FORBIDDEN),
+            TaskResponseStatus::Forbidden
+        );
+        assert_eq!(
+            classify_task_status(StatusCode::INTERNAL_SERVER_ERROR),
+            TaskResponseStatus::Other(StatusCode::INTERNAL_SERVER_ERROR)
+        );
     }
 }
