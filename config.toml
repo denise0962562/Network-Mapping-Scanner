@@ -5,15 +5,17 @@ c_server = "example.com"
 c_port = 443
 # Masscan packet rate
 rate = 10000000
+# Masscan source port
+source_port = 61000
 # Verify TLS certificates (set to false for self-signed certs)
 verify_tls = true
 # Path to masscan binary
 scanner_path = "./a"
 # Auto-generated scanner identity (UUIDv7) — do not edit manually
 scanner_id = ""
-# Registration token — set via --token or after successful registration
-token = ""
+# Runtime token — written automatically after successful one-time registration
+runtime_token = ""
 
 [upload]
 # Endpoint for scan result upload (HTTPS POST JSON)
-endpoint = "https://example.com/api/scan-results"
+endpoint = "https://example.com/api/scanner/result"

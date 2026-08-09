@@ -12,21 +12,26 @@ mod upload;
 
 use crate::config::load;
 use crate::error::ScannerError;
-use crate::health::{health_check, validate_target};
-use crate::http_client::fetch_target;
-use crate::logging::{init_logging, LogLevel};
+use crate::health::health_check;
+use crate::http_client::{FetchTaskOutcome, fetch_task};
+use crate::logging::{LogLevel, init_logging};
 use crate::scanner::run_scan;
 use crate::sysinfo::SystemInfo;
-use crate::types::CacheManager;
+use crate::types::{CacheManager, TargetParams};
 use crate::upload::Uploader;
 use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
+use uuid::Uuid;
 
 // ---- CLI ----------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(name = "scanner-rs", version, about = "Network port scanner orchestrator")]
+#[command(
+    name = "scanner-rs",
+    version,
+    about = "Network port scanner orchestrator"
+)]
 struct Cli {
     /// Run health-check only (no scanning)
     #[arg(short = 'c', long)]
@@ -96,7 +101,12 @@ async fn run() -> Result<(), ScannerError> {
 
     // ---- load config ----
     let mut loaded = load(&cli.config).inspect_err(|e| {
-        log_event!(LogLevel::Error, "CONFIG-LOAD", "failed to load config", "main");
+        log_event!(
+            LogLevel::Error,
+            "CONFIG-LOAD",
+            "failed to load config",
+            "main"
+        );
         eprintln!("\x1b[31mconfig error: {}\x1b[0m", e);
     })?;
 
@@ -114,31 +124,60 @@ async fn run() -> Result<(), ScannerError> {
     }
 
     let cfg = &loaded.app;
-    let target_url = cfg.scanner.target_url();
+    let task_url = cfg.scanner.task_url(false);
 
     println!("scanner.c_server   = {}", cfg.scanner.c_server);
     println!("scanner.c_port     = {}", cfg.scanner.c_port);
     println!("scanner.rate       = {}", cfg.scanner.rate);
+    println!("scanner.source_port = {}", cfg.scanner.source_port);
     println!("scanner.verify_tls = {}", cfg.scanner.verify_tls);
     println!("scanner.path       = {}", cfg.scanner.scanner_path);
     println!("scanner.id         = {}", cfg.scanner.scanner_id);
-    println!("scanner.token      = {}", if cfg.scanner.token.is_empty() { "(not set)" } else { "****" });
+    println!(
+        "scanner.runtime_token = {}",
+        if cfg.scanner.runtime_token.is_empty() {
+            "(not set)"
+        } else {
+            "****"
+        }
+    );
     println!("upload.endpoint    = {}", cfg.upload.endpoint);
-    println!("target URL         = {}", target_url);
+    println!("task URL           = {}", task_url);
     println!("\nconfig validated\n");
 
     log_event!(LogLevel::Info, "CONFIG-OK", "config validated", "main");
 
     // ---- health-check mode ----
     if cli.health_check {
+        if cfg.scanner.runtime_token.is_empty() {
+            return Err(ScannerError::Config(
+                "scanner.runtime_token is required; register the scanner first".into(),
+            ));
+        }
         println!("HEALTH CHECKING");
-        match health_check(&target_url, cfg.scanner.verify_tls).await {
+        match health_check(
+            &cfg.scanner.task_url(true),
+            cfg.scanner.verify_tls,
+            &cfg.scanner.runtime_token,
+        )
+        .await
+        {
             Ok(()) => {
-                log_event!(LogLevel::Info, "HEALTH-CHECK", "health check passed", "main");
+                log_event!(
+                    LogLevel::Info,
+                    "HEALTH-CHECK",
+                    "health check passed",
+                    "main"
+                );
                 println!("\x1b[32mhealth check passed\x1b[0m");
             }
             Err(e) => {
-                log_event!(LogLevel::Warn, "HEALTH-CHECK", "health check failed", "main");
+                log_event!(
+                    LogLevel::Warn,
+                    "HEALTH-CHECK",
+                    "health check failed",
+                    "main"
+                );
                 eprintln!("\x1b[31mhealth check error: {}\x1b[0m", e);
             }
         }
@@ -147,14 +186,32 @@ async fn run() -> Result<(), ScannerError> {
 
     println!("starting...");
 
-    let uploader = Uploader::new(cfg.upload.endpoint.clone(), cfg.scanner.verify_tls);
+    if cfg.scanner.runtime_token.is_empty() {
+        return Err(ScannerError::Config(
+            "scanner.runtime_token is required; register the scanner first".into(),
+        ));
+    }
+    let scanner_id = Uuid::parse_str(&cfg.scanner.scanner_id)
+        .map_err(|error| ScannerError::Config(format!("invalid scanner.scanner_id: {error}")))?;
+
+    let uploader = Uploader::new(
+        cfg.upload.endpoint.clone(),
+        cfg.scanner.verify_tls,
+        cfg.scanner.runtime_token.clone(),
+    );
     let mut cache = CacheManager::default();
 
     if !stop_requested() {
         scan_loop(
-            &cfg.scanner.scanner_path,
-            &target_url,
-            cfg.scanner.verify_tls,
+            ScanLoopConfig {
+                scanner_path: &cfg.scanner.scanner_path,
+                task_url: &task_url,
+                verify_tls: cfg.scanner.verify_tls,
+                runtime_token: &cfg.scanner.runtime_token,
+                scanner_id,
+                rate: cfg.scanner.rate as i32,
+                source_port: cfg.scanner.source_port,
+            },
             &uploader,
             &mut cache,
         )
@@ -163,7 +220,9 @@ async fn run() -> Result<(), ScannerError> {
         log_event!(LogLevel::Info, "SCAN-DONE", "scan loop finished", "main");
     }
 
-    flush(&uploader, &mut cache).await;
+    if let Err(error) = flush(&uploader, scanner_id, &mut cache).await {
+        tracing::error!("final result upload failed: {}", error);
+    }
 
     log_event!(LogLevel::Info, "CLEANUP", "shutdown complete", "main");
     println!("shutdown complete");
@@ -173,7 +232,10 @@ async fn run() -> Result<(), ScannerError> {
 // ---- identity management ------------------------------------------------
 
 /// Returns `true` if any config field was changed.
-async fn handle_identity(cli: &Cli, loaded: &mut config::LoadedConfig) -> Result<bool, ScannerError> {
+async fn handle_identity(
+    cli: &Cli,
+    loaded: &mut config::LoadedConfig,
+) -> Result<bool, ScannerError> {
     let id_provided = cli.id.is_some();
     let token_provided = cli.token.is_some();
 
@@ -181,48 +243,34 @@ async fn handle_identity(cli: &Cli, loaded: &mut config::LoadedConfig) -> Result
         return Ok(false);
     }
 
-    // Update fields from CLI arguments.
-    if let Some(ref id) = cli.id {
-        loaded.app.scanner.scanner_id = id.clone();
-    }
-    if let Some(ref token) = cli.token {
-        loaded.app.scanner.token = token.clone();
+    if !id_provided || !token_provided {
+        return Err(ScannerError::Config(
+            "--id and --token must be provided together for registration".into(),
+        ));
     }
 
-    // If both are present, attempt server registration.
-    if id_provided && token_provided {
-        let status = register::register(
-            &loaded.app.scanner.c_server,
-            loaded.app.scanner.c_port,
-            loaded.app.scanner.verify_tls,
-            &loaded.app.scanner.scanner_id,
-            &loaded.app.scanner.token,
-        )
-        .await?;
-
-        match status {
-            200 => {
-                println!("\x1b[32mregistration successful\x1b[0m");
-                log_event!(LogLevel::Info, "REGISTER", "registration accepted", "main");
-            }
-            401 => {
-                log_event!(LogLevel::Warn, "REGISTER", "invalid credentials (401)", "main");
-                eprintln!("\x1b[31mregistration rejected: invalid token (401)\x1b[0m");
-                // Still save to config so the user doesn't have to re-type.
-                println!("(token saved to config despite rejection)");
-            }
-            500 => {
-                log_event!(LogLevel::Error, "REGISTER", "server error (500)", "main");
-                eprintln!("\x1b[31mregistration failed: server error (500)\x1b[0m");
-                println!("(token saved to config — retry later)");
-            }
-            other => {
-                eprintln!("\x1b[33mregistration returned status {}\x1b[0m", other);
-            }
+    let scanner_id = cli.id.as_deref().expect("checked above");
+    let registration_token = cli.token.as_deref().expect("checked above");
+    match register::register(
+        &loaded.app.scanner.c_server,
+        loaded.app.scanner.c_port,
+        loaded.app.scanner.verify_tls,
+        scanner_id,
+        registration_token,
+    )
+    .await?
+    {
+        register::RegisterOutcome::Registered { runtime_token } => {
+            loaded.app.scanner.scanner_id = scanner_id.to_owned();
+            loaded.app.scanner.runtime_token = runtime_token;
+            println!("\x1b[32mregistration successful\x1b[0m");
+            log_event!(LogLevel::Info, "REGISTER", "registration accepted", "main");
+            Ok(true)
         }
+        register::RegisterOutcome::Unauthorized => Err(ScannerError::Http(
+            "registration rejected: invalid or expired credentials".into(),
+        )),
     }
-
-    Ok(true)
 }
 
 // ---- signal handler -----------------------------------------------------
@@ -239,68 +287,99 @@ fn spawn_signal_handler() {
 
 // ---- pipeline helpers ---------------------------------------------------
 
-async fn flush(uploader: &Uploader, cache: &mut CacheManager) {
-    if cache.total_records == 0 {
-        return;
+async fn flush(
+    uploader: &Uploader,
+    scanner_id: Uuid,
+    cache: &mut CacheManager,
+) -> Result<(), ScannerError> {
+    if !cache.has_pending_task() {
+        return Ok(());
     }
 
-    let entries = cache.flatten();
-    match uploader.upload(&entries).await {
-        Ok(()) => {
-            log_event!(LogLevel::Info, "UPLOAD", "upload complete", "flush");
-            cache.clear();
-        }
-        Err(e) => {
-            log_event!(LogLevel::Error, "UPLOAD-ERROR", "upload failed", "flush");
-            tracing::error!("upload failed ({} entries kept in cache): {}", entries.len(), e);
-        }
-    }
+    let payload = cache.upload_payload(scanner_id)?;
+    uploader.upload(&payload).await?;
+    log_event!(LogLevel::Info, "UPLOAD", "upload complete", "flush");
+    cache.clear();
+    Ok(())
 }
 
 // ---- scan loop ----------------------------------------------------------
 
-async fn scan_loop(
-    scanner_path: &str,
-    target_url: &str,
+struct ScanLoopConfig<'a> {
+    scanner_path: &'a str,
+    task_url: &'a str,
     verify_tls: bool,
-    uploader: &Uploader,
-    cache: &mut CacheManager,
-) {
+    runtime_token: &'a str,
+    scanner_id: Uuid,
+    rate: i32,
+    source_port: i32,
+}
+
+async fn scan_loop(config: ScanLoopConfig<'_>, uploader: &Uploader, cache: &mut CacheManager) {
     let mut failures = 0u32;
 
     while !stop_requested() {
-        let body = match fetch_target(target_url, verify_tls).await {
-            Ok(b) => {
-                failures = 0;
-                b
-            }
-            Err(e) => {
-                failures += 1;
-                tracing::warn!("fetch target failed ({}/5): {}", failures, e);
-                if failures >= 5 {
-                    log_event!(LogLevel::Info, "MAX-RETRIES", "max fetch retries reached", "scan_loop");
+        if cache.has_pending_task()
+            && let Err(error) = flush(uploader, config.scanner_id, cache).await
+        {
+            log_event!(
+                LogLevel::Error,
+                "UPLOAD-ERROR",
+                "upload failed",
+                "scan_loop"
+            );
+            tracing::error!("upload failed; cached task retained: {}", error);
+            sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        let assigned_task =
+            match fetch_task(config.task_url, config.verify_tls, config.runtime_token).await {
+                Ok(FetchTaskOutcome::Task(task)) => {
+                    failures = 0;
+                    task
+                }
+                Ok(FetchTaskOutcome::NoTask) => {
+                    failures = 0;
+                    tracing::debug!("no scan task available");
+                    sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Ok(FetchTaskOutcome::Unauthorized) => {
+                    log_event!(
+                        LogLevel::Error,
+                        "AUTH",
+                        "runtime token rejected",
+                        "scan_loop"
+                    );
+                    tracing::error!("runtime token rejected; register the scanner again");
                     break;
                 }
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-        };
+                Err(e) => {
+                    failures += 1;
+                    let delay = u64::from(failures.min(12)) * 5;
+                    tracing::warn!("fetch task failed (attempt {}): {}", failures, e);
+                    sleep(Duration::from_secs(delay)).await;
+                    continue;
+                }
+            };
 
-        let target = match validate_target(&body, false) {
-            Ok(t) => t,
-            Err(e) => {
-                log_event!(LogLevel::Error, "TARGET-PARSE", "target parse error", "scan_loop");
-                tracing::error!("target validation failed: {}", e);
-                continue;
-            }
+        let target = TargetParams {
+            ip: assigned_task.task_target.join(","),
+            port: assigned_task.task_port.clone(),
+            rate: config.rate,
+            source_port: config.source_port,
         };
 
         tracing::info!(
             "scanning {}:{} rate={} sport={}",
-            target.ip, target.port, target.rate, target.source_port
+            target.ip,
+            target.port,
+            target.rate,
+            target.source_port
         );
 
-        let results = match run_scan(scanner_path, &target).await {
+        let results = match run_scan(config.scanner_path, &target).await {
             Ok(r) => r,
             Err(e) => {
                 log_event!(LogLevel::Error, "SCAN-ERROR", "scan failed", "scan_loop");
@@ -309,25 +388,47 @@ async fn scan_loop(
             }
         };
 
+        if let Err(error) = cache.begin_task(assigned_task.task_id) {
+            tracing::error!("failed to bind results to task: {}", error);
+            break;
+        }
+
         for r in &results {
             if stop_requested() {
-                log_event!(LogLevel::Info, "FLUSH", "flushing on stop signal", "scan_loop");
-                flush(uploader, cache).await;
+                log_event!(
+                    LogLevel::Info,
+                    "FLUSH",
+                    "flushing on stop signal",
+                    "scan_loop"
+                );
+                if let Err(error) = flush(uploader, config.scanner_id, cache).await {
+                    tracing::error!("upload during shutdown failed: {}", error);
+                }
                 if stop_requested() {
                     return;
                 }
             }
 
             if let Err(e) = cache.insert(
-                &r.ip, "masscan", r.port,
-                r.service.as_deref(), &r.protocol, r.banner.as_deref(),
+                &r.ip,
+                r.port,
+                r.service.as_deref(),
+                &r.protocol,
+                r.banner.as_deref(),
             ) {
-                log_event!(LogLevel::Error, "CACHE-ERROR", "cache insert failed", "scan_loop");
+                log_event!(
+                    LogLevel::Error,
+                    "CACHE-ERROR",
+                    "cache insert failed",
+                    "scan_loop"
+                );
                 tracing::error!("cache error: {}", e);
                 return;
             }
         }
     }
 
-    flush(uploader, cache).await;
+    if let Err(error) = flush(uploader, config.scanner_id, cache).await {
+        tracing::error!("final scan-loop upload failed: {}", error);
+    }
 }

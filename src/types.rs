@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use uuid::Uuid;
 
 // ---- Cache data model ---------------------------------------------------
 
@@ -26,19 +27,20 @@ pub(crate) struct PortInfo {
 /// An IP-scoped entry in the scan cache.
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct IpEntry {
-    pub(crate) scanner_name: String,
     pub(crate) ports: Vec<PortInfo>,
 }
 
 /// In-memory scan result cache. Accumulates results until flushed.
 #[derive(Debug, Default)]
 pub(crate) struct CacheManager {
+    pub(crate) task_id: Option<Uuid>,
     pub(crate) ip_table: HashMap<String, IpEntry>,
     pub(crate) total_records: u32,
 }
 
 impl CacheManager {
     pub(crate) fn clear(&mut self) {
+        self.task_id = None;
         self.ip_table.clear();
         self.total_records = 0;
     }
@@ -54,29 +56,40 @@ pub(crate) struct ScanResult {
     pub(crate) banner: Option<String>,
 }
 
-/// Target parameters received from the HTTP target API.
+/// Task assigned by the server.
 #[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct AssignedTask {
+    pub(crate) task_id: Uuid,
+    pub(crate) task_target: Vec<String>,
+    pub(crate) task_port: String,
+}
+
+/// Parameters passed to masscan after applying local scanner settings.
+#[derive(Debug, Clone)]
 pub(crate) struct TargetParams {
     pub(crate) ip: String,
     pub(crate) port: String,
     pub(crate) rate: i32,
-    #[serde(rename = "source-port")]
     pub(crate) source_port: i32,
 }
 
 // ---- Upload payload -----------------------------------------------------
 
-/// Flat upload entry — one per (ip, port, service) tuple.
-/// Designed so the server can consume each entry independently.
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct UploadEntry {
+pub(crate) struct ScannerResultItem {
     pub(crate) ip: String,
     pub(crate) port: u16,
-    pub(crate) protocol: String,
-    pub(crate) scanner_name: String,
+    pub(crate) protocol: Option<String>,
     pub(crate) service: Option<String>,
     pub(crate) banner: Option<String>,
-    pub(crate) scan_time: i64,
+    pub(crate) other: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ScannerResultUpload {
+    pub(crate) scanner_id: Uuid,
+    pub(crate) task_id: Uuid,
+    pub(crate) results: Vec<ScannerResultItem>,
 }
 
 // ---- Configuration structures -------------------------------------------
@@ -100,6 +113,8 @@ pub(crate) struct ScannerConfig {
     pub(crate) c_server: String,
     pub(crate) c_port: i64,
     pub(crate) rate: i64,
+    #[serde(default = "default_source_port")]
+    pub(crate) source_port: i32,
     #[serde(default)]
     pub(crate) verify_tls: bool,
     #[serde(default = "default_scanner_path")]
@@ -107,15 +122,81 @@ pub(crate) struct ScannerConfig {
     /// Scanner identity — auto-generated UUIDv7 on first run.
     #[serde(default = "default_scanner_id")]
     pub(crate) scanner_id: String,
-    /// Registration token issued by the server.
+    /// Runtime token returned after one-time registration.
     #[serde(default)]
-    pub(crate) token: String,
+    pub(crate) runtime_token: String,
 }
 
 impl ScannerConfig {
-    /// Build the HTTPS target URL from configured server and port.
-    pub(crate) fn target_url(&self) -> String {
-        format!("https://{}:{}/scanner/target", self.c_server, self.c_port)
+    pub(crate) fn task_url(&self, dry_run: bool) -> String {
+        let mut url = format!(
+            "https://{}:{}/api/task/apply?scannerid={}",
+            self.c_server, self.c_port, self.scanner_id
+        );
+        if dry_run {
+            url.push_str("&dryrun=true");
+        }
+        url
+    }
+}
+
+fn default_source_port() -> i32 {
+    61_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AssignedTask, ScannerConfig};
+
+    #[test]
+    fn assigned_task_matches_server_response() {
+        let task: AssignedTask = serde_json::from_str(
+            r#"{
+                "user_id": 7,
+                "task_id": "019c0000-0000-7000-8000-000000000001",
+                "task_target": ["192.0.2.0/24", "198.51.100.10"],
+                "task_port": "80,443"
+            }"#,
+        )
+        .expect("server task response must deserialize");
+
+        assert_eq!(task.task_target.len(), 2);
+        assert_eq!(task.task_port, "80,443");
+    }
+
+    #[test]
+    fn task_url_contains_scanner_identity_and_dry_run_flag() {
+        let config = ScannerConfig {
+            c_server: "scanner.example".into(),
+            c_port: 443,
+            rate: 1_000,
+            source_port: 61_000,
+            verify_tls: true,
+            scanner_path: "masscan".into(),
+            scanner_id: "019c0000-0000-7000-8000-000000000001".into(),
+            runtime_token: "secret".into(),
+        };
+
+        assert_eq!(
+            config.task_url(true),
+            "https://scanner.example:443/api/task/apply?scannerid=019c0000-0000-7000-8000-000000000001&dryrun=true"
+        );
+    }
+
+    #[test]
+    fn legacy_registration_token_is_not_used_as_runtime_token() {
+        let config: ScannerConfig = serde_json::from_str(
+            r#"{
+                "c_server": "scanner.example",
+                "c_port": 443,
+                "rate": 1000,
+                "scanner_id": "019c0000-0000-7000-8000-000000000001",
+                "token": "one-time-secret"
+            }"#,
+        )
+        .expect("legacy scanner config must remain readable");
+
+        assert!(config.runtime_token.is_empty());
     }
 }
 

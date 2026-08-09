@@ -1,5 +1,5 @@
 use crate::error::ScannerError;
-use crate::types::UploadEntry;
+use crate::types::ScannerResultUpload;
 use reqwest::Client;
 
 const USER_AGENT: &str = "Scanner/1.0";
@@ -11,33 +11,29 @@ const USER_AGENT: &str = "Scanner/1.0";
 pub(crate) struct Uploader {
     endpoint: String,
     verify_tls: bool,
+    runtime_token: String,
 }
 
 impl Uploader {
-    pub(crate) fn new(endpoint: String, verify_tls: bool) -> Self {
+    pub(crate) fn new(endpoint: String, verify_tls: bool, runtime_token: String) -> Self {
         Self {
             endpoint,
             verify_tls,
+            runtime_token,
         }
     }
 
     /// POST a batch of scan entries as JSON to the configured endpoint.
-    pub(crate) async fn upload(&self, entries: &[UploadEntry]) -> Result<(), ScannerError> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-
+    pub(crate) async fn upload(&self, payload: &ScannerResultUpload) -> Result<(), ScannerError> {
         let client = Client::builder()
             .user_agent(USER_AGENT)
             .danger_accept_invalid_certs(!self.verify_tls)
             .build()?;
 
-        let payload = serde_json::to_string(entries)?;
-
         let response = client
             .post(&self.endpoint)
-            .header("Content-Type", "application/json")
-            .body(payload)
+            .bearer_auth(&self.runtime_token)
+            .json(payload)
             .send()
             .await
             .map_err(|e| ScannerError::Upload(format!("upload request failed: {}", e)))?;
@@ -52,8 +48,9 @@ impl Uploader {
         }
 
         tracing::info!(
-            "uploaded {} entries to {}",
-            entries.len(),
+            "uploaded {} entries for task {} to {}",
+            payload.results.len(),
+            payload.task_id,
             self.endpoint
         );
         Ok(())

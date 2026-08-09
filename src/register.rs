@@ -6,25 +6,28 @@ const USER_AGENT: &str = "Scanner/1.0";
 #[derive(Debug, serde::Serialize)]
 struct RegisterRequest {
     scanner_id: String,
-    token: String,
 }
 
-/// POST to the registration endpoint. Returns the HTTP status code.
-///
-/// - 200 → registration accepted
-/// - 401 → invalid credentials
-/// - 500 → server error
+#[derive(Debug, serde::Deserialize)]
+struct RegisterResponse {
+    runtime_token: String,
+}
+
+pub(crate) enum RegisterOutcome {
+    Registered { runtime_token: String },
+    Unauthorized,
+}
+
 pub(crate) async fn register(
     c_server: &str,
     c_port: i64,
     verify_tls: bool,
     scanner_id: &str,
     token: &str,
-) -> Result<u16, ScannerError> {
+) -> Result<RegisterOutcome, ScannerError> {
     let url = format!("https://{}:{}/api/scanner/register", c_server, c_port);
     let body = RegisterRequest {
         scanner_id: scanner_id.to_string(),
-        token: token.to_string(),
     };
 
     let client = Client::builder()
@@ -32,15 +35,37 @@ pub(crate) async fn register(
         .danger_accept_invalid_certs(!verify_tls)
         .build()?;
 
-    let response = client.post(&url).json(&body).send().await?;
-    let status = response.status().as_u16();
+    let response = client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await?;
 
-    match status {
-        200 => tracing::info!("scanner registered successfully (id={})", scanner_id),
-        401 => tracing::warn!("registration rejected: invalid credentials (401)"),
-        500 => tracing::error!("registration failed: server error (500)"),
-        other => tracing::warn!("registration returned unexpected status: {}", other),
+    match response.status().as_u16() {
+        200 => {
+            let response: RegisterResponse = response.json().await.map_err(|error| {
+                ScannerError::Http(format!("invalid registration response: {error}"))
+            })?;
+            if response.runtime_token.is_empty() {
+                return Err(ScannerError::Http(
+                    "registration response contained an empty runtime token".into(),
+                ));
+            }
+            tracing::info!("scanner registered successfully (id={})", scanner_id);
+            Ok(RegisterOutcome::Registered {
+                runtime_token: response.runtime_token,
+            })
+        }
+        401 => {
+            tracing::warn!("registration rejected: invalid credentials (401)");
+            Ok(RegisterOutcome::Unauthorized)
+        }
+        status => {
+            let body = response.text().await.unwrap_or_default();
+            Err(ScannerError::Http(format!(
+                "registration failed with status {status}: {body}"
+            )))
+        }
     }
-
-    Ok(status)
 }

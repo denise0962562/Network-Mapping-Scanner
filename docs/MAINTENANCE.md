@@ -17,11 +17,11 @@ src/
 ├── main.rs          # 入口、CLI、编排主循环、身份注册
 ├── config.rs        # TOML 配置加载/验证/回写（注释保留）
 ├── scanner.rs       # 扫描器调度 + Masscan 实现
-├── cache.rs         # 内存缓存：去重、聚合、打平
+├── cache.rs         # 按任务隔离的内存结果缓存
 ├── upload.rs        # 结果上报：HTTPS POST JSON
 ├── register.rs      # 扫描器注册：POST /api/scanner/register
 ├── http_client.rs   # 底层 HTTP GET / POST
-├── health.rs        # 健康检查 + 目标 JSON 验证
+├── health.rs        # 运行凭据健康检查
 ├── sysinfo.rs       # 系统信息采集（OS/CPU/RAM/uptime）
 ├── types.rs         # 全部数据结构与配置类型
 ├── error.rs         # 统一错误类型（thiserror）
@@ -38,8 +38,8 @@ src/
 |------|------|
 | `run()` | 主入口：系统信息 → 身份处理 → 配置加载 → health check / 扫描 |
 | `handle_identity()` | 处理 `--id` / `--token`，执行注册 POST，触发配置回写 |
-| `scan_loop()` | 循环体：获取目标 → 验证 → 扫描 → 缓存 → 条件触发 flush |
-| `flush()` | 调用 `cache.flatten()` → `uploader.upload()` |
+| `scan_loop()` | 循环体：领取任务 → 扫描 → 按任务缓存 → 上传；无任务时持续轮询 |
+| `flush()` | 构造包含 scanner_id/task_id 的上传载荷并提交 |
 | `spawn_signal_handler()` | SIGINT/SIGTERM 注册 |
 
 #### `config.rs`
@@ -56,7 +56,7 @@ impl LoadedConfig {
 }
 ```
 
-将当前 `scanner_id` 和 `token` 写回 **当前使用的配置文件**（`--config` 指定的路径）。
+将当前 `scanner_id` 和 `runtime_token` 写回 **当前使用的配置文件**（`--config` 指定的路径）。旧 `token` 字段会在成功注册后移除。
 实现方式为重新解析原始文件内容 → 修改 `[scanner]` 段 → 序列化写回，
 **原有注释、空行、键顺序全部保留**。
 
@@ -81,8 +81,9 @@ Masscan 输出行解析：
 
 ```rust
 impl CacheManager {
-    pub(crate) fn insert(&mut self, ip, scanner_name, port, service, protocol, banner) -> Result
-    pub(crate) fn flatten(&self) -> Vec<UploadEntry>
+    pub(crate) fn begin_task(&mut self, task_id: Uuid) -> Result
+    pub(crate) fn insert(&mut self, ip, port, service, protocol, banner) -> Result
+    pub(crate) fn upload_payload(&self, scanner_id: Uuid) -> Result<ScannerResultUpload, ScannerError>
     pub(crate) fn clear(&mut self)
 }
 ```
@@ -93,18 +94,18 @@ impl CacheManager {
 - 同一 IP + port + protocol 的重复 `Discovered` 行（service=None）→ 跳过
 - `Banner` 行（service=Some）→ 查找首个 placeholder（name=None）填充，否则追加
 
-`flatten()` 将三层结构打平为 `Vec<UploadEntry>`，每条自包含 ip/port/protocol/scanner_name/service/banner/scan_time。
+缓存始终绑定一个 `task_id`。存在待上传任务时拒绝开始新任务，避免多个任务的数据混合。`upload_payload()` 将缓存转换为服务端要求的 `ScannerResultUpload`。
 
 #### `upload.rs`
 
 ```rust
 impl Uploader {
-    pub(crate) fn new(endpoint: String, verify_tls: bool) -> Self
-    pub(crate) async fn upload(&self, entries: &[UploadEntry]) -> Result<(), ScannerError>
+    pub(crate) fn new(endpoint: String, verify_tls: bool, runtime_token: String) -> Self
+    pub(crate) async fn upload(&self, payload: &ScannerResultUpload) -> Result<(), ScannerError>
 }
 ```
 
-`upload()` 将 `Vec<UploadEntry>` 序列化为 JSON，通过 HTTPS POST 发送到 `endpoint`。失败时保留缓存不清理，等待下次重试。
+`upload()` 使用运行令牌作为 Bearer 凭据，将包含扫描器 ID、任务 ID和结果数组的 JSON 发送到 `endpoint`。失败时保留整个任务缓存并暂停领取新任务。
 
 扩展加密：在 `upload()` 中加密 payload 后再发送，调用方无需改动。
 
@@ -117,11 +118,10 @@ pub(crate) async fn register(
     verify_tls: bool,
     scanner_id: &str,
     token: &str,
-) -> Result<u16, ScannerError>
+) -> Result<RegisterOutcome, ScannerError>
 ```
 
-POST `{ scanner_id, token }` 到 `https://{c_server}:{c_port}/api/scanner/register`。
-返回 HTTP 状态码：200（成功）、401（凭证无效）、500（服务端错误）。
+使用一次性注册令牌作为 Bearer 凭据，POST `{ scanner_id }` 到注册接口。成功时解析并返回 `runtime_token`；401 不保存注册令牌。
 
 #### `sysinfo.rs`
 
@@ -134,24 +134,16 @@ pub(crate) fn gather() -> Result<SystemInfo, ScannerError>
 #### `http_client.rs`
 
 ```rust
-pub(crate) async fn fetch_target(url: &str, verify_tls: bool) -> Result<String, ScannerError>
+pub(crate) async fn fetch_task(url: &str, verify_tls: bool, runtime_token: &str) -> Result<FetchTaskOutcome, ScannerError>
 ```
 
 #### `health.rs`
 
 ```rust
-pub(crate) async fn health_check(target_url: &str, verify_tls: bool) -> Result<(), ScannerError>
-pub(crate) fn validate_target(json: &str, verbose: bool) -> Result<TargetParams, ScannerError>
+pub(crate) async fn health_check(url: &str, verify_tls: bool, runtime_token: &str) -> Result<(), ScannerError>
 ```
 
-验证目标 JSON 必须字段及取值范围：
-
-| 字段 | 类型 | 范围 |
-|------|------|------|
-| `ip` | string | 非空 |
-| `port` | string | 非空 |
-| `rate` | int | (0, 1,000,000] |
-| `source_port` | int | (0, 65535] |
+健康检查调用任务接口的 `dryrun=true` 模式，只验证 scanner_id 和运行令牌，不领取任务。
 
 #### `types.rs`
 
@@ -188,18 +180,20 @@ c_server = "example.com"
 c_port = 443
 # Masscan packet rate
 rate = 10000000
+# Masscan source port
+source_port = 61000
 # Verify TLS certificates (set to false for self-signed certs)
 verify_tls = true
 # Path to masscan binary
 scanner_path = "./a"
 # Auto-generated scanner identity (UUIDv7) — do not edit manually
 scanner_id = "019eb66c-6ac6-7530-b73f-454037448fa2"
-# Registration token — set via --token or after successful registration
-token = ""
+# Runtime token — written automatically after successful one-time registration
+runtime_token = ""
 
 [upload]
 # Endpoint for scan result upload (HTTPS POST JSON)
-endpoint = "https://example.com/api/scan-results"
+endpoint = "https://example.com/api/scanner/result"
 ```
 
 ### 字段说明
@@ -208,11 +202,12 @@ endpoint = "https://example.com/api/scan-results"
 |------|------|--------|------|
 | `scanner.c_server` | string | — | 目标 API 主机名 |
 | `scanner.c_port` | int | — | 目标 API 端口 |
-| `scanner.rate` | int | — | masscan 发包速率（当前由 API 返回的 rate 覆盖） |
+| `scanner.rate` | int | — | masscan 本地发包速率 |
+| `scanner.source_port` | int | `61000` | masscan 源端口，范围 1-65535 |
 | `scanner.verify_tls` | bool | `false` | 是否验证 TLS 证书 |
 | `scanner.scanner_path` | string | `"./a"` | 扫描器二进制路径 |
 | `scanner.scanner_id` | string | 自动生成 | UUIDv7，首次启动自动生成 |
-| `scanner.token` | string | `""` | 注册令牌，通过 `--token` 设置 |
+| `scanner.runtime_token` | string | `""` | 注册成功后由程序自动写入的运行令牌 |
 | `upload.endpoint` | string | — | 扫描结果上报地址 |
 
 ### 验证规则
@@ -221,12 +216,13 @@ endpoint = "https://example.com/api/scan-results"
 |------|------|
 | `scanner.c_server` | 非空 |
 | `scanner.c_port` | > 0 |
-| `scanner.rate` | > 0 |
+| `scanner.rate` | 1-2147483647 |
+| `scanner.source_port` | 1-65535 |
 | `upload.endpoint` | 非空 |
 
 ### 配置回写（注释保留）
 
-`--id` 或 `--token` 传入时，程序会更新 `[scanner]` 段中 `scanner_id` / `token` 的值并写回磁盘。写回时基于原始文件内容重建 `DocumentMut`，因此文件中的注释、空行、键排列顺序全部保持不变。仅当前 `--config` 指定的文件被写入。
+注册时必须同时提供 `--id` 和 `--token`。`--token` 是不落盘的一次性注册令牌；旧配置中的 `scanner.token` 不会被当作运行令牌，升级后需重新注册。只有注册成功后，程序才会将 `scanner_id` / `runtime_token` 写回当前配置文件，并移除旧 `token` 字段。写回时保留其余注释和键顺序。
 
 ---
 
@@ -255,22 +251,14 @@ scanner-rs --id "019eb66c-..." --token "sLJiUUS6..."
 ```
 
 1. 从 CLI 读取 `--id` 和 `--token`
-2. POST `{ scanner_id, token }` 到 `https://{c_server}:{c_port}/api/scanner/register`
+2. 使用 `Authorization: Bearer <registration_token>` POST `{ scanner_id }` 到注册接口
 3. 收到响应：
-   - **200** → 注册成功，id/token 写入 `config.toml`，退出
-   - **401** → 凭证无效，但仍将 id/token 写入配置文件（避免重复输入），退出
-   - **500** → 服务端错误，id/token 写入配置文件，退出
+   - **200** → 解析 `runtime_token`，与 id 一起写入 `config.toml` 后退出
+   - **401** → 凭证无效或过期，不写入配置
+   - **5xx/网络错误** → 返回失败，不覆盖现有运行凭据
 4. 后续运行无需再传 `--id` / `--token`，程序自动从配置文件读取
 
-### 更新注册信息
-
-```bash
-# 更新 token（不触发服务器注册，直接写入 config.toml）
-scanner-rs --token "new-token"
-
-# 重新注册（同时更新 id 和 token）
-scanner-rs --id "new-id" --token "new-token"
-```
+重新注册时必须再次同时提供新的 `--id` 和一次性 `--token`。
 
 ### 普通运行
 
@@ -284,24 +272,25 @@ scanner-rs
 ## 数据流
 
 ```
-┌─────────────┐    GET /scanner/target     ┌──────────────┐
+┌─────────────┐ GET /api/task/apply + Bearer ┌──────────────┐
 │  target API │ ◄────────────────────────── │  scanner-rs  │
 │  (c_server) │ ──────── JSON ────────────► │              │
 └─────────────┘                             │  ① fetch     │
-                                            │  ② validate  │
+                                            │  ② deserialize│
 ┌─────────────┐                             │  ③ run_scan  │
 │   masscan   │ ◄── spawn ───────────────── │              │
 │   binary    │ ──── stdout ──────────────► │  ④ parse     │
 └─────────────┘                             │  ⑤ cache     │
-                                            │  ⑥ flatten   │
-┌─────────────┐   POST /api/scan-results   │  ⑦ upload    │
+                                            │  ⑥ payload   │
+┌─────────────┐ POST /api/scanner/result   │  ⑦ upload    │
 │  upload API │ ◄──── JSON ─────────────── │              │
 │  (endpoint) │                             │              │
 └─────────────┘                             └──────────────┘
 
         ┌─ 启动时 ──────────────────────────┐
         │  POST /api/scanner/register       │  ← 仅 --id + --token 时
-        │  { scanner_id, token }            │
+        │  Bearer registration_token        │
+        │  { scanner_id }                   │
         └────────────────────────────────────┘
 ```
 
@@ -309,31 +298,32 @@ scanner-rs
 
 1. **（可选）register** — 携带 `--id --token` 时 POST 注册
 2. **sysinfo** — 采集并打印系统信息
-3. **fetch** — HTTP GET 从 target API 获取扫描目标 JSON
-4. **validate** — 验证 JSON 字段合法性
+3. **fetch** — 使用运行令牌领取真实任务；404 时等待并继续轮询
+4. **deserialize** — 解析 task_id、task_target 和 task_port
 5. **run_scan** — 启动 masscan 子进程，传递目标参数
 6. **parse** — 逐行解析 masscan stdout（Discovered / Banner / ERROR / COMPLETE / DONE_OK）
 7. **cache** — 按 IP → port → service 三层去重聚合到 `CacheManager`
-8. **flatten** — 将缓存打平为 `Vec<UploadEntry>`
-9. **upload** — HTTPS POST JSON 到 upload endpoint
+8. **payload** — 生成包含 scanner_id、task_id 和 results 的载荷
+9. **upload** — 携带运行令牌 HTTPS POST 到 upload endpoint
 
 ### 上传 JSON 格式
 
 ```json
-[
-  {
-    "ip": "192.168.1.1",
-    "port": 80,
-    "protocol": "tcp",
-    "scanner_name": "masscan",
-    "service": "http",
-    "banner": "Apache/2.4.29",
-    "scan_time": 1718123456789
-  }
-]
+{
+  "scanner_id": "019c0000-0000-7000-8000-000000000001",
+  "task_id": "019c0000-0000-7000-8000-000000000002",
+  "results": [
+    {
+      "ip": "192.168.1.1",
+      "port": 80,
+      "protocol": "tcp",
+      "service": "http",
+      "banner": "Apache/2.4.29",
+      "other": null
+    }
+  ]
+}
 ```
-
-> `service: null` 表示端口开放但未识别服务。`scan_time` 为 Unix 毫秒时间戳。
 
 ---
 

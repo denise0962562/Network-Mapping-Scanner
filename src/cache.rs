@@ -1,12 +1,14 @@
 use crate::error::ScannerError;
-use crate::types::{CacheManager, IpEntry, PortInfo, ServiceInfo, UploadEntry};
+use crate::types::{
+    CacheManager, IpEntry, PortInfo, ScannerResultItem, ScannerResultUpload, ServiceInfo,
+};
 use std::collections::hash_map::Entry;
+use uuid::Uuid;
 
 impl CacheManager {
     pub(crate) fn insert(
         &mut self,
         ip: &str,
-        scanner_name: &str,
         port: u16,
         service: Option<&str>,
         protocol: &str,
@@ -17,10 +19,7 @@ impl CacheManager {
                 add_or_fill(e.get_mut(), port, service, protocol, banner)?;
             }
             Entry::Vacant(e) => {
-                let mut entry = IpEntry {
-                    scanner_name: scanner_name.to_owned(),
-                    ports: Vec::new(),
-                };
+                let mut entry = IpEntry { ports: Vec::new() };
                 add_or_fill(&mut entry, port, service, protocol, banner)?;
                 e.insert(entry);
             }
@@ -29,31 +28,49 @@ impl CacheManager {
         Ok(())
     }
 
-    /// Flatten the hierarchical cache into a flat `Vec<UploadEntry>`.
-    ///
-    /// Each (ip, port, service) tuple becomes one independent upload entry
-    /// so the server can consume them without understanding the nested structure.
-    pub(crate) fn flatten(&self) -> Vec<UploadEntry> {
-        let scan_time = chrono::Utc::now().timestamp_millis();
+    pub(crate) fn begin_task(&mut self, task_id: Uuid) -> Result<(), ScannerError> {
+        if self.task_id.is_some() || self.total_records > 0 {
+            return Err(ScannerError::Scan(
+                "cannot start a new task while results are pending".into(),
+            ));
+        }
+        self.task_id = Some(task_id);
+        Ok(())
+    }
+
+    pub(crate) fn has_pending_task(&self) -> bool {
+        self.task_id.is_some()
+    }
+
+    pub(crate) fn upload_payload(
+        &self,
+        scanner_id: Uuid,
+    ) -> Result<ScannerResultUpload, ScannerError> {
+        let task_id = self.task_id.ok_or_else(|| {
+            ScannerError::Upload("missing task context for cached results".into())
+        })?;
         let mut entries = Vec::new();
 
         for (ip, ip_entry) in &self.ip_table {
             for port_info in &ip_entry.ports {
                 for svc in &port_info.services {
-                    entries.push(UploadEntry {
+                    entries.push(ScannerResultItem {
                         ip: ip.clone(),
                         port: port_info.port,
-                        protocol: port_info.protocol.clone(),
-                        scanner_name: ip_entry.scanner_name.clone(),
+                        protocol: Some(port_info.protocol.clone()),
                         service: svc.name.clone(),
                         banner: svc.banner.clone(),
-                        scan_time,
+                        other: None,
                     });
                 }
             }
         }
 
-        entries
+        Ok(ScannerResultUpload {
+            scanner_id,
+            task_id,
+            results: entries,
+        })
     }
 }
 
@@ -92,14 +109,14 @@ fn upsert_service(
     service: Option<&str>,
     banner: Option<&str>,
 ) -> Result<(), ScannerError> {
-    if let Some(name) = service {
-        if let Some(empty) = pi.services.iter_mut().find(|s| s.is_placeholder()) {
-            empty.name = Some(name.to_owned());
-            if banner.is_some() && empty.banner.is_none() {
-                empty.banner = banner.map(str::to_owned);
-            }
-            return Ok(());
+    if let Some(name) = service
+        && let Some(empty) = pi.services.iter_mut().find(|s| s.is_placeholder())
+    {
+        empty.name = Some(name.to_owned());
+        if banner.is_some() && empty.banner.is_none() {
+            empty.banner = banner.map(str::to_owned);
         }
+        return Ok(());
     }
 
     pi.services.push(ServiceInfo {
@@ -107,4 +124,52 @@ fn upsert_service(
         banner: banner.map(str::to_owned),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::types::CacheManager;
+    use uuid::Uuid;
+
+    fn uuid(value: &str) -> Uuid {
+        Uuid::parse_str(value).expect("valid test UUID")
+    }
+
+    #[test]
+    fn payload_keeps_scanner_and_task_context() {
+        let scanner_id = uuid("019c0000-0000-7000-8000-000000000001");
+        let task_id = uuid("019c0000-0000-7000-8000-000000000002");
+        let mut cache = CacheManager::default();
+        cache.begin_task(task_id).expect("task must start");
+        cache
+            .insert("192.0.2.1", 443, Some("https"), "tcp", Some("banner"))
+            .expect("result must be cached");
+
+        let payload = cache
+            .upload_payload(scanner_id)
+            .expect("payload must be built");
+
+        assert_eq!(payload.scanner_id, scanner_id);
+        assert_eq!(payload.task_id, task_id);
+        assert_eq!(payload.results.len(), 1);
+        assert_eq!(payload.results[0].protocol.as_deref(), Some("tcp"));
+
+        let json = serde_json::to_value(payload).expect("payload must serialize");
+        assert_eq!(json["scanner_id"], scanner_id.to_string());
+        assert_eq!(json["task_id"], task_id.to_string());
+        assert_eq!(json["results"][0]["ip"], "192.0.2.1");
+        assert!(json["results"][0].get("scanner_name").is_none());
+        assert!(json["results"][0].get("scan_time").is_none());
+    }
+
+    #[test]
+    fn pending_task_prevents_result_mixing() {
+        let first = uuid("019c0000-0000-7000-8000-000000000001");
+        let second = uuid("019c0000-0000-7000-8000-000000000002");
+        let mut cache = CacheManager::default();
+
+        cache.begin_task(first).expect("first task must start");
+
+        assert!(cache.begin_task(second).is_err());
+    }
 }
