@@ -154,6 +154,13 @@ impl ScannerConfig {
             self.c_server, self.c_port
         )
     }
+
+    pub(crate) fn task_cancelled_url(&self) -> String {
+        format!(
+            "https://{}:{}/api/scanner/task/cancelled",
+            self.c_server, self.c_port
+        )
+    }
 }
 
 fn default_source_port() -> i32 {

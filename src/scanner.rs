@@ -1,7 +1,14 @@
 use crate::error::ScannerError;
 use crate::types::{ScanResult, TargetParams};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::time::{Duration, sleep};
+
+pub(crate) enum ScanOutcome {
+    Completed(Vec<ScanResult>),
+    Cancelled,
+}
 
 // ---- Scanner abstraction ------------------------------------------------
 //
@@ -18,9 +25,10 @@ use tokio::process::Command;
 pub(crate) async fn run_scan(
     scanner_path: &str,
     target: &TargetParams,
-) -> Result<Vec<ScanResult>, ScannerError> {
+    cancel_requested: &AtomicBool,
+) -> Result<ScanOutcome, ScannerError> {
     // Future: match on scanner type / path to dispatch
-    run_masscan(scanner_path, target).await
+    run_masscan(scanner_path, target, cancel_requested).await
 }
 
 // ---- Masscan implementation ---------------------------------------------
@@ -28,7 +36,8 @@ pub(crate) async fn run_scan(
 async fn run_masscan(
     path: &str,
     target: &TargetParams,
-) -> Result<Vec<ScanResult>, ScannerError> {
+    cancel_requested: &AtomicBool,
+) -> Result<ScanOutcome, ScannerError> {
     let mut child = Command::new(path)
         .arg(&target.ip)
         .args(["-p", &target.port])
@@ -48,11 +57,20 @@ async fn run_masscan(
     let mut lines = BufReader::new(stdout).lines();
     let mut results = Vec::new();
 
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|e| ScannerError::Scan(format!("read error: {}", e)))?
-    {
+    loop {
+        if cancel_requested.load(Ordering::Relaxed) {
+            child
+                .kill()
+                .await
+                .map_err(|e| ScannerError::Scan(format!("failed to stop scanner: {e}")))?;
+            let _ = child.wait().await;
+            return Ok(ScanOutcome::Cancelled);
+        }
+        let line = tokio::select! {
+            line = lines.next_line() => line.map_err(|e| ScannerError::Scan(format!("read error: {e}")))?,
+            _ = sleep(Duration::from_millis(200)) => continue,
+        };
+        let Some(line) = line else { break };
         let trimmed = line.trim();
 
         match MasscanLine::parse(trimmed) {
@@ -77,7 +95,7 @@ async fn run_masscan(
         tracing::warn!("scanner exited with non-zero status: {:?}", status.code());
     }
 
-    Ok(results)
+    Ok(ScanOutcome::Completed(results))
 }
 
 // ---- Masscan line parser ------------------------------------------------

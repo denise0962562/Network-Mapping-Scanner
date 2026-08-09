@@ -17,7 +17,7 @@ use crate::health::health_check;
 use crate::heartbeat::{ActiveTask, HeartbeatClient};
 use crate::http_client::{FetchTaskOutcome, fetch_task};
 use crate::logging::{LogLevel, init_logging};
-use crate::scanner::run_scan;
+use crate::scanner::{ScanOutcome, run_scan};
 use crate::sysinfo::SystemInfo;
 use crate::types::{CacheManager, TargetParams};
 use crate::upload::Uploader;
@@ -208,6 +208,7 @@ async fn run() -> Result<(), ScannerError> {
     let heartbeat_client = HeartbeatClient::new(
         cfg.scanner.heartbeat_url(),
         cfg.scanner.task_failure_url(),
+        cfg.scanner.task_cancelled_url(),
         cfg.scanner.verify_tls,
         cfg.scanner.runtime_token.clone(),
         scanner_id,
@@ -318,8 +319,16 @@ fn spawn_heartbeat(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if let Err(error) = client.send(active_task.get().await, false).await {
-                tracing::warn!("heartbeat failed: {}", error);
+            match client.send(active_task.get().await, false).await {
+                Ok(response) => client.apply_command(response, &active_task).await,
+                Err(error) => {
+                    tracing::warn!("heartbeat failed: {}", error);
+                    if error.to_string().contains("401 Unauthorized") {
+                        request_stop();
+                        tracing::error!("runtime token rejected by heartbeat endpoint; stopping");
+                        break;
+                    }
+                }
             }
             sleep(Duration::from_secs(interval_seconds)).await;
         }
@@ -444,8 +453,25 @@ async fn scan_loop(
             target.source_port
         );
 
-        let results = match run_scan(config.scanner_path, &target).await {
-            Ok(r) => r,
+        let cancel_flag = active_task.cancellation_flag();
+        let results = match run_scan(config.scanner_path, &target, &cancel_flag).await {
+            Ok(ScanOutcome::Completed(results)) => results,
+            Ok(ScanOutcome::Cancelled) => {
+                match heartbeat_client
+                    .report_cancelled(assigned_task.task_id)
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!("task {} cancelled by server", assigned_task.task_id);
+                        active_task.clear().await;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::error!("failed to acknowledge task cancellation: {error}");
+                        break;
+                    }
+                }
+            }
             Err(e) => {
                 log_event!(LogLevel::Error, "SCAN-ERROR", "scan failed", "scan_loop");
                 tracing::error!("scan error: {}", e);
