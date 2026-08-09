@@ -1,12 +1,12 @@
 use crate::error::ScannerError;
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct SystemInfo {
     pub(crate) os_name: String,
     pub(crate) os_version: String,
     pub(crate) cpu_model: String,
     pub(crate) cpu_cores: u32,
-    pub(crate) ram_total_gb: f64,
+    pub(crate) ram_total_mb: u64,
     pub(crate) uptime_seconds: u64,
 }
 
@@ -17,7 +17,7 @@ impl SystemInfo {
             os_version: read_os_version(),
             cpu_model: read_cpu_model().unwrap_or_else(|_| "unknown".into()),
             cpu_cores: read_cpu_cores().unwrap_or(0),
-            ram_total_gb: read_ram_total().unwrap_or(0.0),
+            ram_total_mb: read_ram_total().unwrap_or(0),
             uptime_seconds: read_uptime().unwrap_or(0),
         })
     }
@@ -35,7 +35,11 @@ impl SystemInfo {
         println!("║ Version  : {:<30}║", truncate(&self.os_version, 30));
         println!("║ CPU      : {:<30}║", truncate(&self.cpu_model, 30));
         println!("║ Cores    : {:<30}║", self.cpu_cores);
-        println!("║ RAM      : {:.1} GB{:>24}║", self.ram_total_gb, "");
+        println!(
+            "║ RAM      : {:.1} GB{:>24}║",
+            self.ram_total_mb as f64 / 1024.0,
+            ""
+        );
         println!("║ Uptime   : {}d {}h {}m{:>20}║", d, h, m, "");
         println!("╚══════════════════════════════════════════╝");
     }
@@ -44,8 +48,7 @@ impl SystemInfo {
 // ---- /proc readers ------------------------------------------------------
 
 fn read_file(path: &str) -> Result<String, ScannerError> {
-    std::fs::read_to_string(path)
-        .map_err(|e| ScannerError::Io(e))
+    std::fs::read_to_string(path).map_err(|e| ScannerError::Io(e))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -70,7 +73,11 @@ fn read_os_name() -> String {
     }
     // Fallback
     if let Ok(content) = read_file("/proc/version") {
-        return content.split_whitespace().take(1).collect::<Vec<_>>().join(" ");
+        return content
+            .split_whitespace()
+            .take(1)
+            .collect::<Vec<_>>()
+            .join(" ");
     }
     "Linux".into()
 }
@@ -88,7 +95,11 @@ fn read_os_version() -> String {
     }
     // Fallback: kernel version
     if let Ok(content) = read_file("/proc/version") {
-        return content.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+        return content
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ");
     }
     "unknown".into()
 }
@@ -97,7 +108,12 @@ fn read_cpu_model() -> Result<String, ScannerError> {
     let content = read_file("/proc/cpuinfo")?;
     for line in content.lines() {
         if let Some(val) = line.strip_prefix("model name") {
-            return Ok(val.split(':').nth(1).unwrap_or("unknown").trim().to_string());
+            return Ok(val
+                .split(':')
+                .nth(1)
+                .unwrap_or("unknown")
+                .trim()
+                .to_string());
         }
     }
     Ok("unknown".into())
@@ -139,7 +155,7 @@ fn read_cpu_cores() -> Result<u32, ScannerError> {
     Ok(cores)
 }
 
-fn read_ram_total() -> Result<f64, ScannerError> {
+fn read_ram_total() -> Result<u64, ScannerError> {
     let content = read_file("/proc/meminfo")?;
     for line in content.lines() {
         if line.starts_with("MemTotal:") {
@@ -149,10 +165,10 @@ fn read_ram_total() -> Result<f64, ScannerError> {
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            return Ok(kb as f64 / 1024.0 / 1024.0); // kB → GB
+            return Ok(kb / 1024); // kB → MB
         }
     }
-    Ok(0.0)
+    Ok(0)
 }
 
 fn read_uptime() -> Result<u64, ScannerError> {

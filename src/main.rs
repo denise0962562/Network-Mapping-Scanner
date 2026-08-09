@@ -2,6 +2,7 @@ mod cache;
 mod config;
 mod error;
 mod health;
+mod heartbeat;
 mod http_client;
 mod logging;
 mod register;
@@ -13,6 +14,7 @@ mod upload;
 use crate::config::load;
 use crate::error::ScannerError;
 use crate::health::health_check;
+use crate::heartbeat::{ActiveTask, HeartbeatClient};
 use crate::http_client::{FetchTaskOutcome, fetch_task};
 use crate::logging::{LogLevel, init_logging};
 use crate::scanner::run_scan;
@@ -142,6 +144,10 @@ async fn run() -> Result<(), ScannerError> {
         }
     );
     println!("upload.endpoint    = {}", cfg.upload.endpoint);
+    println!(
+        "heartbeat.interval = {}s",
+        cfg.scanner.heartbeat_interval_seconds
+    );
     println!("task URL           = {}", task_url);
     println!("\nconfig validated\n");
 
@@ -199,6 +205,19 @@ async fn run() -> Result<(), ScannerError> {
         cfg.scanner.verify_tls,
         cfg.scanner.runtime_token.clone(),
     );
+    let heartbeat_client = HeartbeatClient::new(
+        cfg.scanner.heartbeat_url(),
+        cfg.scanner.task_failure_url(),
+        cfg.scanner.verify_tls,
+        cfg.scanner.runtime_token.clone(),
+        scanner_id,
+    )?;
+    let active_task = ActiveTask::default();
+    let heartbeat_handle = spawn_heartbeat(
+        heartbeat_client.clone(),
+        active_task.clone(),
+        cfg.scanner.heartbeat_interval_seconds,
+    );
     let mut cache = CacheManager::default();
 
     if !stop_requested() {
@@ -213,6 +232,8 @@ async fn run() -> Result<(), ScannerError> {
                 source_port: cfg.scanner.source_port,
             },
             &uploader,
+            &heartbeat_client,
+            &active_task,
             &mut cache,
         )
         .await;
@@ -220,9 +241,14 @@ async fn run() -> Result<(), ScannerError> {
         log_event!(LogLevel::Info, "SCAN-DONE", "scan loop finished", "main");
     }
 
-    if let Err(error) = flush(&uploader, scanner_id, &mut cache).await {
-        tracing::error!("final result upload failed: {}", error);
+    match flush(&uploader, scanner_id, &mut cache).await {
+        Ok(()) => active_task.clear().await,
+        Err(error) => tracing::error!("final result upload failed: {}", error),
     }
+    if let Err(error) = heartbeat_client.send(active_task.get().await, true).await {
+        tracing::warn!("final heartbeat failed: {}", error);
+    }
+    heartbeat_handle.abort();
 
     log_event!(LogLevel::Info, "CLEANUP", "shutdown complete", "main");
     println!("shutdown complete");
@@ -285,6 +311,21 @@ fn spawn_signal_handler() {
     });
 }
 
+fn spawn_heartbeat(
+    client: HeartbeatClient,
+    active_task: ActiveTask,
+    interval_seconds: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = client.send(active_task.get().await, false).await {
+                tracing::warn!("heartbeat failed: {}", error);
+            }
+            sleep(Duration::from_secs(interval_seconds)).await;
+        }
+    })
+}
+
 // ---- pipeline helpers ---------------------------------------------------
 
 async fn flush(
@@ -315,22 +356,29 @@ struct ScanLoopConfig<'a> {
     source_port: i32,
 }
 
-async fn scan_loop(config: ScanLoopConfig<'_>, uploader: &Uploader, cache: &mut CacheManager) {
+async fn scan_loop(
+    config: ScanLoopConfig<'_>,
+    uploader: &Uploader,
+    heartbeat_client: &HeartbeatClient,
+    active_task: &ActiveTask,
+    cache: &mut CacheManager,
+) {
     let mut failures = 0u32;
 
     while !stop_requested() {
-        if cache.has_pending_task()
-            && let Err(error) = flush(uploader, config.scanner_id, cache).await
-        {
-            log_event!(
-                LogLevel::Error,
-                "UPLOAD-ERROR",
-                "upload failed",
-                "scan_loop"
-            );
-            tracing::error!("upload failed; cached task retained: {}", error);
-            sleep(Duration::from_secs(5)).await;
-            continue;
+        if cache.has_pending_task() {
+            if let Err(error) = flush(uploader, config.scanner_id, cache).await {
+                log_event!(
+                    LogLevel::Error,
+                    "UPLOAD-ERROR",
+                    "upload failed",
+                    "scan_loop"
+                );
+                tracing::error!("upload failed; cached task retained: {}", error);
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            active_task.clear().await;
         }
 
         let assigned_task =
@@ -379,6 +427,7 @@ async fn scan_loop(config: ScanLoopConfig<'_>, uploader: &Uploader, cache: &mut 
                     continue;
                 }
             };
+        active_task.set(assigned_task.task_id).await;
 
         let target = TargetParams {
             ip: assigned_task.task_target.join(","),
@@ -400,7 +449,30 @@ async fn scan_loop(config: ScanLoopConfig<'_>, uploader: &Uploader, cache: &mut 
             Err(e) => {
                 log_event!(LogLevel::Error, "SCAN-ERROR", "scan failed", "scan_loop");
                 tracing::error!("scan error: {}", e);
-                continue;
+                let mut reported = false;
+                for attempt in 1..=3 {
+                    match heartbeat_client
+                        .report_failure(assigned_task.task_id, &e.to_string())
+                        .await
+                    {
+                        Ok(()) => {
+                            reported = true;
+                            active_task.clear().await;
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::warn!("failed to report task failure ({attempt}/3): {error}");
+                            sleep(Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+                if reported {
+                    continue;
+                }
+                tracing::error!(
+                    "task failure could not be reported; stopping to preserve lease ownership"
+                );
+                break;
             }
         };
 
@@ -444,7 +516,9 @@ async fn scan_loop(config: ScanLoopConfig<'_>, uploader: &Uploader, cache: &mut 
         }
     }
 
-    if let Err(error) = flush(uploader, config.scanner_id, cache).await {
-        tracing::error!("final scan-loop upload failed: {}", error);
+    match flush(uploader, config.scanner_id, cache).await {
+        Ok(()) if !cache.has_pending_task() => active_task.clear().await,
+        Ok(()) => {}
+        Err(error) => tracing::error!("final scan-loop upload failed: {}", error),
     }
 }

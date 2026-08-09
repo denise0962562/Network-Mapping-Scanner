@@ -71,6 +71,11 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
             cfg.upload.endpoint.is_empty(),
             "must not be empty",
         ),
+        (
+            "scanner.heartbeat_interval_seconds",
+            !(5..=300).contains(&cfg.scanner.heartbeat_interval_seconds),
+            "must be between 5 and 300",
+        ),
     ];
 
     for &(field, failed, msg) in rules {

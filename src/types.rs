@@ -125,6 +125,8 @@ pub(crate) struct ScannerConfig {
     /// Runtime token returned after one-time registration.
     #[serde(default)]
     pub(crate) runtime_token: String,
+    #[serde(default = "default_heartbeat_interval")]
+    pub(crate) heartbeat_interval_seconds: u64,
 }
 
 impl ScannerConfig {
@@ -138,10 +140,28 @@ impl ScannerConfig {
         }
         url
     }
+
+    pub(crate) fn heartbeat_url(&self) -> String {
+        format!(
+            "https://{}:{}/api/scanner/heartbeat",
+            self.c_server, self.c_port
+        )
+    }
+
+    pub(crate) fn task_failure_url(&self) -> String {
+        format!(
+            "https://{}:{}/api/scanner/task/fail",
+            self.c_server, self.c_port
+        )
+    }
 }
 
 fn default_source_port() -> i32 {
     61_000
+}
+
+fn default_heartbeat_interval() -> u64 {
+    30
 }
 
 #[cfg(test)]
@@ -175,11 +195,20 @@ mod tests {
             scanner_path: "masscan".into(),
             scanner_id: "019c0000-0000-7000-8000-000000000001".into(),
             runtime_token: "secret".into(),
+            heartbeat_interval_seconds: 30,
         };
 
         assert_eq!(
             config.task_url(true),
             "https://scanner.example:443/api/task/apply?scannerid=019c0000-0000-7000-8000-000000000001&dryrun=true"
+        );
+        assert_eq!(
+            config.heartbeat_url(),
+            "https://scanner.example:443/api/scanner/heartbeat"
+        );
+        assert_eq!(
+            config.task_failure_url(),
+            "https://scanner.example:443/api/scanner/task/fail"
         );
     }
 
