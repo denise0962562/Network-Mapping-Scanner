@@ -9,6 +9,7 @@ pub(crate) struct LoadedConfig {
 }
 
 pub(crate) fn load(path: &str) -> Result<LoadedConfig, ScannerError> {
+    tracing::debug!(config_path = path, "reading scanner configuration");
     let raw = std::fs::read_to_string(path)
         .map_err(|e| ScannerError::Config(format!("cannot read config file {}: {}", path, e)))?;
 
@@ -22,6 +23,11 @@ pub(crate) fn load(path: &str) -> Result<LoadedConfig, ScannerError> {
     })?;
 
     validate(&app)?;
+    tracing::debug!(
+        config_path = path,
+        config_bytes = raw.len(),
+        "configuration parsed"
+    );
     Ok(LoadedConfig {
         app,
         raw,
@@ -35,6 +41,7 @@ impl LoadedConfig {
     /// Re-parses the original file content so that all comments, whitespace,
     /// and ordering are preserved exactly as they were on disk.
     pub(crate) fn save_scanner_identity(&self) -> Result<(), ScannerError> {
+        tracing::debug!(config_path = %self.path, "persisting scanner identity");
         let mut doc: toml_edit::DocumentMut = self.raw.parse().map_err(|e| {
             ScannerError::Config(format!("failed to re-parse config for saving: {}", e))
         })?;
@@ -44,7 +51,9 @@ impl LoadedConfig {
         scanner.remove("token");
         scanner["scanner_id"] = toml_edit::value(&self.app.scanner.scanner_id);
         scanner["runtime_token"] = toml_edit::value(&self.app.scanner.runtime_token);
-        std::fs::write(&self.path, doc.to_string()).map_err(ScannerError::Io)
+        std::fs::write(&self.path, doc.to_string()).map_err(ScannerError::Io)?;
+        tracing::debug!(config_path = %self.path, "scanner identity persisted");
+        Ok(())
     }
 }
 

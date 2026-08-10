@@ -77,6 +77,8 @@ Masscan 输出行解析：
 - `ERROR` → 返回错误
 - `COMPLETE` / `DONE_OK` → 正常结束
 
+masscan 只有在进程退出码为 0 时才算执行成功。非零退出码会连同最多 4096 个字符的 stderr 作为扫描错误上报，任务不会上传空结果并误标为成功；退出码为 0 且没有发现开放端口仍属于合法的空结果。
+
 #### `cache.rs`
 
 ```rust
@@ -205,7 +207,7 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.rate` | int | — | masscan 本地发包速率 |
 | `scanner.source_port` | int | `61000` | masscan 源端口，范围 1-65535 |
 | `scanner.verify_tls` | bool | `false` | 是否验证 TLS 证书 |
-| `scanner.scanner_path` | string | `"./a"` | 扫描器二进制路径 |
+| `scanner.scanner_path` | string | `"./a"` | 扫描器二进制路径；也可填写能从 `PATH` 解析的命令名 |
 | `scanner.scanner_id` | string | 自动生成 | UUIDv7，首次启动自动生成 |
 | `scanner.runtime_token` | string | `""` | 注册成功后由程序自动写入的运行令牌 |
 | `upload.endpoint` | string | — | 扫描结果上报地址 |
@@ -218,7 +220,10 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.c_port` | > 0 |
 | `scanner.rate` | 1-2147483647 |
 | `scanner.source_port` | 1-65535 |
+| `scanner.scanner_path` | 普通扫描启动时必须能解析到存在且可执行的普通文件 |
 | `upload.endpoint` | 非空 |
+
+扫描器在启动扫描循环前检查 `scanner_path`。显式的相对路径或绝对路径会直接检查；不含目录的命令名（例如 `masscan`）会从 `PATH` 查找。注册、`--health-check` 和 `--get-system-info` 模式不执行扫描，因此跳过该检查。
 
 ### 配置回写（注释保留）
 
@@ -412,7 +417,9 @@ cargo test
 | stderr | 人类可读，含文件+行号 |
 | `./logs/scanner.YYYY-MM-DD` | JSON，按日滚动 |
 
-级别：默认 `INFO`，`--debug` 启用 `DEBUG`，也可通过 `RUST_LOG` 环境变量覆盖。
+级别：默认 `INFO`，`--debug` 启用 `DEBUG`。如果设置了 `RUST_LOG`，其过滤规则优先于 CLI 默认级别，例如 `RUST_LOG=scanner_rs=debug scanner-rs`。
+
+DEBUG 日志覆盖配置加载、启动模式、任务 HTTP 状态、任务上下文、心跳与服务端命令、masscan 启动参数和进程状态、masscan stderr、输出解析统计、缓存及上传状态、重试延迟和退出清理。日志不会记录注册令牌、运行令牌或 HTTP `Authorization` 头；但会包含扫描目标、端口和扫描器输出，需按敏感运维数据保护日志文件。
 
 ---
 

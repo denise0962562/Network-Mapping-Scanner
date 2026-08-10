@@ -30,6 +30,8 @@ pub(crate) async fn register(
         scanner_id: scanner_id.to_string(),
     };
 
+    tracing::debug!(url, scanner_id, verify_tls, "starting scanner registration");
+
     let client = Client::builder()
         .user_agent(USER_AGENT)
         .danger_accept_invalid_certs(!verify_tls)
@@ -41,6 +43,8 @@ pub(crate) async fn register(
         .json(&body)
         .send()
         .await?;
+
+    tracing::debug!(status = %response.status(), "registration endpoint responded");
 
     match response.status().as_u16() {
         200 => {
