@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStderr, Command};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
+
+const MAX_SCANNER_STDERR_CHARS: usize = 4096;
 
 pub(crate) enum ScanOutcome {
     Completed(Vec<ScanResult>),
@@ -164,7 +167,7 @@ async fn run_masscan(
                 .await
                 .map_err(|e| ScannerError::Scan(format!("failed to stop scanner: {e}")))?;
             let _ = child.wait().await;
-            let _ = stderr_handle.await;
+            let _ = finish_scanner_stderr(stderr_handle).await;
             tracing::debug!(
                 elapsed_ms = started_at.elapsed().as_millis(),
                 "masscan cancelled"
@@ -190,8 +193,9 @@ async fn run_masscan(
             MasscanLine::Error => {
                 tracing::error!("scanner reported error: {}", trimmed);
                 let _ = child.wait().await;
-                let _ = stderr_handle.await;
-                return Err(ScannerError::Scan(format!("scanner error: {}", trimmed)));
+                let stderr_output = finish_scanner_stderr(stderr_handle).await;
+                let detail = scanner_failure_detail(trimmed, &stderr_output);
+                return Err(ScannerError::Scan(format!("scanner error: {detail}")));
             }
             MasscanLine::Complete => {
                 tracing::debug!(marker = "COMPLETE", "masscan completion marker received");
@@ -212,7 +216,7 @@ async fn run_masscan(
         .wait()
         .await
         .map_err(|e| ScannerError::Scan(format!("waitpid failed: {}", e)))?;
-    let _ = stderr_handle.await;
+    let stderr_output = finish_scanner_stderr(stderr_handle).await;
 
     tracing::debug!(
         exit_code = ?status.code(),
@@ -226,23 +230,73 @@ async fn run_masscan(
     );
 
     if !status.success() {
-        tracing::warn!("scanner exited with non-zero status: {:?}", status.code());
+        let detail = scanner_failure_detail("scanner produced no stderr output", &stderr_output);
+        tracing::error!(
+            exit_code = ?status.code(),
+            stderr = %stderr_output,
+            "masscan exited unsuccessfully"
+        );
+        return Err(ScannerError::Scan(format!(
+            "masscan exited with {status}: {detail}"
+        )));
     }
 
     Ok(ScanOutcome::Completed(results))
 }
 
-async fn log_scanner_stderr(stderr: ChildStderr) {
+async fn log_scanner_stderr(stderr: ChildStderr) -> String {
     let mut lines = BufReader::new(stderr).lines();
+    let mut captured = String::new();
+    let mut captured_chars = 0usize;
+    let mut truncated = false;
+
     loop {
         match lines.next_line().await {
-            Ok(Some(line)) => tracing::debug!(line = %line, "masscan stderr"),
+            Ok(Some(line)) => {
+                tracing::debug!(line = %line, "masscan stderr");
+                if captured_chars < MAX_SCANNER_STDERR_CHARS {
+                    if !captured.is_empty() {
+                        captured.push('\n');
+                        captured_chars += 1;
+                    }
+                    let remaining = MAX_SCANNER_STDERR_CHARS.saturating_sub(captured_chars);
+                    let line_chars = line.chars().count();
+                    captured.extend(line.chars().take(remaining));
+                    captured_chars += line_chars.min(remaining);
+                    truncated |= line_chars > remaining;
+                } else {
+                    truncated = true;
+                }
+            }
             Ok(None) => break,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to read masscan stderr");
                 break;
             }
         }
+    }
+
+    if truncated {
+        captured.push_str("\n[stderr truncated]");
+    }
+    captured
+}
+
+async fn finish_scanner_stderr(handle: JoinHandle<String>) -> String {
+    match handle.await {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::warn!(error = %error, "masscan stderr reader task failed");
+            String::new()
+        }
+    }
+}
+
+fn scanner_failure_detail(stdout_error: &str, stderr_output: &str) -> String {
+    if stderr_output.trim().is_empty() {
+        stdout_error.to_owned()
+    } else {
+        stderr_output.trim().to_owned()
     }
 }
 
@@ -309,6 +363,45 @@ fn parse_banner(line: &str) -> Option<ScanResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_scanner_exit_returns_error_with_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "scanner-rs-failing-scanner-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            b"#!/bin/sh\nprintf 'permission denied by test scanner\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let target = TargetParams {
+            ip: "192.0.2.1/32".into(),
+            port: "80".into(),
+            rate: 100,
+            source_port: 61_000,
+        };
+        let cancel_requested = AtomicBool::new(false);
+        let result = run_masscan(path.to_str().unwrap(), &target, &cancel_requested).await;
+        std::fs::remove_file(&path).unwrap();
+
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("non-zero scanner exit must not be reported as completed"),
+        };
+        assert!(error.contains("exit status: 1"));
+        assert!(error.contains("permission denied by test scanner"));
+    }
 
     #[test]
     fn validate_scanner_binary_accepts_current_executable() {
