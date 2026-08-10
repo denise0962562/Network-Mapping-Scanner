@@ -1,7 +1,7 @@
 use std::path::Path;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-pub(crate) fn init_logging(debug: bool) -> Result<(), std::io::Error> {
+pub(crate) fn init_logging(debug_enabled: bool) -> Result<(), std::io::Error> {
     let log_dir = Path::new("./logs");
     if !log_dir.exists() {
         std::fs::create_dir_all(log_dir)?;
@@ -9,7 +9,7 @@ pub(crate) fn init_logging(debug: bool) -> Result<(), std::io::Error> {
 
     let file_appender = tracing_appender::rolling::daily("./logs", "scanner.log");
 
-    let default_level = if debug { "debug" } else { "info" };
+    let default_level = if debug_enabled { "debug" } else { "info" };
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
@@ -30,6 +30,13 @@ pub(crate) fn init_logging(debug: bool) -> Result<(), std::io::Error> {
         .with(console)
         .with(file)
         .init();
+
+    tracing::debug!(
+        debug_flag = debug_enabled,
+        rust_log = ?std::env::var_os("RUST_LOG"),
+        log_directory = %log_dir.display(),
+        "logging initialized"
+    );
 
     Ok(())
 }

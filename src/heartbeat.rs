@@ -23,16 +23,23 @@ impl ActiveTask {
     pub(crate) async fn set(&self, task_id: Uuid) {
         self.cancel_requested.store(false, Ordering::Relaxed);
         *self.current.write().await = Some(task_id);
+        tracing::debug!(%task_id, "active task set");
     }
 
     pub(crate) async fn clear(&self) {
+        let previous_task_id = *self.current.read().await;
         *self.current.write().await = None;
         self.cancel_requested.store(false, Ordering::Relaxed);
+        tracing::debug!(?previous_task_id, "active task cleared");
     }
 
     pub(crate) async fn request_cancel(&self, task_id: Uuid) {
-        if self.get().await == Some(task_id) {
+        let active_task_id = self.get().await;
+        if active_task_id == Some(task_id) {
             self.cancel_requested.store(true, Ordering::Relaxed);
+            tracing::debug!(%task_id, "cancellation requested for active task");
+        } else {
+            tracing::debug!(%task_id, ?active_task_id, "ignored cancellation for inactive task");
         }
     }
 
@@ -128,6 +135,13 @@ impl HeartbeatClient {
             scanner_version: env!("CARGO_PKG_VERSION"),
             system: SystemInfo::gather()?,
         };
+        tracing::debug!(
+            scanner_id = %self.scanner_id,
+            state,
+            ?active_task_id,
+            stopping,
+            "sending heartbeat"
+        );
         let response = self
             .client
             .post(&self.heartbeat_url)
@@ -135,8 +149,11 @@ impl HeartbeatClient {
             .json(&payload)
             .send()
             .await?;
+        tracing::debug!(status = %response.status(), state, "heartbeat endpoint responded");
         if response.status().is_success() {
-            Ok(response.json().await?)
+            let response = response.json().await?;
+            tracing::debug!(response = ?response, "heartbeat response decoded");
+            Ok(response)
         } else {
             Err(ScannerError::Http(format!(
                 "heartbeat endpoint returned {}",
@@ -156,6 +173,7 @@ impl HeartbeatClient {
             error,
             retryable: true,
         };
+        tracing::debug!(%task_id, "reporting scan task failure");
         let response = self
             .client
             .post(&self.failure_url)
@@ -163,6 +181,7 @@ impl HeartbeatClient {
             .json(&payload)
             .send()
             .await?;
+        tracing::debug!(%task_id, status = %response.status(), "task failure endpoint responded");
         if response.status().is_success() {
             Ok(())
         } else {
@@ -174,6 +193,7 @@ impl HeartbeatClient {
     }
 
     pub(crate) async fn report_cancelled(&self, task_id: Uuid) -> Result<(), ScannerError> {
+        tracing::debug!(%task_id, "acknowledging scan task cancellation");
         let response = self
             .client
             .post(&self.cancelled_url)
@@ -184,6 +204,7 @@ impl HeartbeatClient {
             })
             .send()
             .await?;
+        tracing::debug!(%task_id, status = %response.status(), "task cancellation endpoint responded");
         if response.status().is_success() {
             Ok(())
         } else {
@@ -198,7 +219,10 @@ impl HeartbeatClient {
         if let Some(command) = response.command
             && command.command_type == "cancel_task"
         {
+            tracing::debug!(task_id = %command.task_id, "applying heartbeat cancellation command");
             active.request_cancel(command.task_id).await;
+        } else {
+            tracing::debug!("heartbeat contained no actionable command");
         }
     }
 }

@@ -87,6 +87,16 @@ async fn run() -> Result<(), ScannerError> {
 
     init_logging(cli.debug)?;
 
+    tracing::debug!(
+        version = env!("CARGO_PKG_VERSION"),
+        process_id = std::process::id(),
+        config_path = %cli.config,
+        health_check = cli.health_check,
+        system_info_only = cli.get_system_info,
+        registration_requested = cli.id.is_some() || cli.token.is_some(),
+        "command-line options parsed"
+    );
+
     log_event!(LogLevel::Info, "SCANNER-START", "scanner started", "main");
 
     spawn_signal_handler();
@@ -112,6 +122,8 @@ async fn run() -> Result<(), ScannerError> {
         eprintln!("\x1b[31mconfig error: {}\x1b[0m", e);
     })?;
 
+    tracing::debug!(config_path = %cli.config, "configuration loaded and validated");
+
     // ---- handle --id / --token ----
     let identity_changed = handle_identity(&cli, &mut loaded).await?;
 
@@ -127,6 +139,20 @@ async fn run() -> Result<(), ScannerError> {
 
     let cfg = &loaded.app;
     let task_url = cfg.scanner.task_url(false);
+
+    tracing::debug!(
+        server = %cfg.scanner.c_server,
+        server_port = cfg.scanner.c_port,
+        scan_rate = cfg.scanner.rate,
+        source_port = cfg.scanner.source_port,
+        verify_tls = cfg.scanner.verify_tls,
+        scanner_path = %cfg.scanner.scanner_path,
+        scanner_id = %cfg.scanner.scanner_id,
+        runtime_token_configured = !cfg.scanner.runtime_token.is_empty(),
+        upload_endpoint = %cfg.upload.endpoint,
+        heartbeat_interval_seconds = cfg.scanner.heartbeat_interval_seconds,
+        "effective scanner configuration"
+    );
 
     println!("scanner.c_server   = {}", cfg.scanner.c_server);
     println!("scanner.c_port     = {}", cfg.scanner.c_port);
@@ -221,6 +247,11 @@ async fn run() -> Result<(), ScannerError> {
         active_task.clone(),
         cfg.scanner.heartbeat_interval_seconds,
     );
+    tracing::debug!(
+        scanner_id = %scanner_id,
+        heartbeat_interval_seconds = cfg.scanner.heartbeat_interval_seconds,
+        "runtime clients initialized"
+    );
     let mut cache = CacheManager::default();
 
     if !stop_requested() {
@@ -269,8 +300,15 @@ async fn handle_identity(
     let token_provided = cli.token.is_some();
 
     if !id_provided && !token_provided {
+        tracing::debug!("registration options not provided; using stored identity");
         return Ok(false);
     }
+
+    tracing::debug!(
+        id_provided,
+        token_provided,
+        "processing scanner registration options"
+    );
 
     if !id_provided || !token_provided {
         return Err(ScannerError::Config(
@@ -320,8 +358,11 @@ fn spawn_heartbeat(
     interval_seconds: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        tracing::debug!(interval_seconds, "heartbeat loop started");
         loop {
-            match client.send(active_task.get().await, false).await {
+            let active_task_id = active_task.get().await;
+            tracing::debug!(?active_task_id, "sending periodic heartbeat");
+            match client.send(active_task_id, false).await {
                 Ok(response) => client.apply_command(response, &active_task).await,
                 Err(error) => {
                     tracing::warn!("heartbeat failed: {}", error);
@@ -345,10 +386,16 @@ async fn flush(
     cache: &mut CacheManager,
 ) -> Result<(), ScannerError> {
     if !cache.has_pending_task() {
+        tracing::debug!("result flush skipped; no pending task");
         return Ok(());
     }
 
     let payload = cache.upload_payload(scanner_id)?;
+    tracing::debug!(
+        task_id = %payload.task_id,
+        result_count = payload.results.len(),
+        "flushing cached scan results"
+    );
     uploader.upload(&payload).await?;
     log_event!(LogLevel::Info, "UPLOAD", "upload complete", "flush");
     cache.clear();
@@ -376,6 +423,14 @@ async fn scan_loop(
 ) {
     let mut failures = 0u32;
 
+    tracing::debug!(
+        scanner_id = %config.scanner_id,
+        task_url = %config.task_url,
+        scan_rate = config.rate,
+        source_port = config.source_port,
+        "scan loop started"
+    );
+
     while !stop_requested() {
         if cache.has_pending_task() {
             if let Err(error) = flush(uploader, config.scanner_id, cache).await {
@@ -396,11 +451,17 @@ async fn scan_loop(
             match fetch_task(config.task_url, config.verify_tls, config.runtime_token).await {
                 Ok(FetchTaskOutcome::Task(task)) => {
                     failures = 0;
+                    tracing::debug!(
+                        task_id = %task.task_id,
+                        target_count = task.task_target.len(),
+                        ports = %task.task_port,
+                        "scan task received"
+                    );
                     task
                 }
                 Ok(FetchTaskOutcome::NoTask) => {
                     failures = 0;
-                    tracing::debug!("no scan task available");
+                    tracing::debug!(retry_delay_seconds = 5, "no scan task available");
                     sleep(Duration::from_secs(5)).await;
                     continue;
                 }
@@ -433,12 +494,18 @@ async fn scan_loop(
                 Err(e) => {
                     failures += 1;
                     let delay = u64::from(failures.min(12)) * 5;
-                    tracing::warn!("fetch task failed (attempt {}): {}", failures, e);
+                    tracing::warn!(
+                        attempt = failures,
+                        retry_delay_seconds = delay,
+                        error = %e,
+                        "fetch task failed"
+                    );
                     sleep(Duration::from_secs(delay)).await;
                     continue;
                 }
             };
         active_task.set(assigned_task.task_id).await;
+        tracing::debug!(task_id = %assigned_task.task_id, "task marked active");
 
         let target = TargetParams {
             ip: assigned_task.task_target.join(","),
@@ -504,6 +571,12 @@ async fn scan_loop(
             }
         };
 
+        tracing::debug!(
+            task_id = %assigned_task.task_id,
+            result_count = results.len(),
+            "scan execution completed"
+        );
+
         if let Err(error) = cache.begin_task(assigned_task.task_id) {
             tracing::error!("failed to bind results to task: {}", error);
             break;
@@ -542,7 +615,15 @@ async fn scan_loop(
                 return;
             }
         }
+
+        tracing::debug!(
+            task_id = %assigned_task.task_id,
+            cached_result_count = results.len(),
+            "scan results cached"
+        );
     }
+
+    tracing::debug!(stop_requested = stop_requested(), "scan loop exiting");
 
     match flush(uploader, config.scanner_id, cache).await {
         Ok(()) if !cache.has_pending_task() => active_task.clear().await,

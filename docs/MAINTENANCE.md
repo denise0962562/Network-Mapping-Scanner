@@ -415,7 +415,9 @@ cargo test
 | stderr | 人类可读，含文件+行号 |
 | `./logs/scanner.YYYY-MM-DD` | JSON，按日滚动 |
 
-级别：默认 `INFO`，`--debug` 启用 `DEBUG`，也可通过 `RUST_LOG` 环境变量覆盖。
+级别：默认 `INFO`，`--debug` 启用 `DEBUG`。如果设置了 `RUST_LOG`，其过滤规则优先于 CLI 默认级别，例如 `RUST_LOG=scanner_rs=debug scanner-rs`。
+
+DEBUG 日志覆盖配置加载、启动模式、任务 HTTP 状态、任务上下文、心跳与服务端命令、masscan 启动参数和进程状态、masscan stderr、输出解析统计、缓存及上传状态、重试延迟和退出清理。日志不会记录注册令牌、运行令牌或 HTTP `Authorization` 头；但会包含扫描目标、端口和扫描器输出，需按敏感运维数据保护日志文件。
 
 ---
 

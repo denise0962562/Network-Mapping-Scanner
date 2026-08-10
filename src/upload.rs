@@ -25,6 +25,14 @@ impl Uploader {
 
     /// POST a batch of scan entries as JSON to the configured endpoint.
     pub(crate) async fn upload(&self, payload: &ScannerResultUpload) -> Result<(), ScannerError> {
+        tracing::debug!(
+            endpoint = %self.endpoint,
+            verify_tls = self.verify_tls,
+            scanner_id = %payload.scanner_id,
+            task_id = %payload.task_id,
+            result_count = payload.results.len(),
+            "starting result upload"
+        );
         let client = Client::builder()
             .user_agent(USER_AGENT)
             .danger_accept_invalid_certs(!self.verify_tls)
@@ -37,6 +45,12 @@ impl Uploader {
             .send()
             .await
             .map_err(|e| ScannerError::Upload(format!("upload request failed: {}", e)))?;
+
+        tracing::debug!(
+            task_id = %payload.task_id,
+            status = %response.status(),
+            "upload endpoint responded"
+        );
 
         if !response.status().is_success() {
             let status = response.status();

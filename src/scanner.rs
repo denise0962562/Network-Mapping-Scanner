@@ -2,8 +2,9 @@ use crate::error::ScannerError;
 use crate::types::{ScanResult, TargetParams};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{ChildStderr, Command};
 use tokio::time::{Duration, sleep};
 
 pub(crate) enum ScanOutcome {
@@ -116,6 +117,16 @@ async fn run_masscan(
     target: &TargetParams,
     cancel_requested: &AtomicBool,
 ) -> Result<ScanOutcome, ScannerError> {
+    tracing::debug!(
+        scanner_path = path,
+        targets = %target.ip,
+        ports = %target.port,
+        rate = target.rate,
+        source_port = target.source_port,
+        banner_scan = true,
+        "spawning masscan process"
+    );
+    let started_at = Instant::now();
     let mut child = Command::new(path)
         .arg(&target.ip)
         .args(["-p", &target.port])
@@ -127,21 +138,37 @@ async fn run_masscan(
         .spawn()
         .map_err(|e| ScannerError::Scan(format!("failed to spawn scanner: {}", e)))?;
 
+    tracing::debug!(process_id = ?child.id(), "masscan process spawned");
+
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| ScannerError::Scan("scanner stdout unavailable".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ScannerError::Scan("scanner stderr unavailable".into()))?;
+    let stderr_handle = tokio::spawn(log_scanner_stderr(stderr));
 
     let mut lines = BufReader::new(stdout).lines();
     let mut results = Vec::new();
+    let mut discovered_count = 0usize;
+    let mut banner_count = 0usize;
+    let mut unknown_count = 0usize;
 
     loop {
         if cancel_requested.load(Ordering::Relaxed) {
+            tracing::debug!(process_id = ?child.id(), "stopping masscan after cancellation request");
             child
                 .kill()
                 .await
                 .map_err(|e| ScannerError::Scan(format!("failed to stop scanner: {e}")))?;
             let _ = child.wait().await;
+            let _ = stderr_handle.await;
+            tracing::debug!(
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "masscan cancelled"
+            );
             return Ok(ScanOutcome::Cancelled);
         }
         let line = tokio::select! {
@@ -152,15 +179,32 @@ async fn run_masscan(
         let trimmed = line.trim();
 
         match MasscanLine::parse(trimmed) {
-            MasscanLine::Discovered(r) => results.push(r),
-            MasscanLine::Banner(r) => results.push(r),
+            MasscanLine::Discovered(r) => {
+                discovered_count += 1;
+                results.push(r);
+            }
+            MasscanLine::Banner(r) => {
+                banner_count += 1;
+                results.push(r);
+            }
             MasscanLine::Error => {
                 tracing::error!("scanner reported error: {}", trimmed);
                 let _ = child.wait().await;
+                let _ = stderr_handle.await;
                 return Err(ScannerError::Scan(format!("scanner error: {}", trimmed)));
             }
-            MasscanLine::Complete | MasscanLine::DoneOk => break,
-            MasscanLine::Unknown => {}
+            MasscanLine::Complete => {
+                tracing::debug!(marker = "COMPLETE", "masscan completion marker received");
+                break;
+            }
+            MasscanLine::DoneOk => {
+                tracing::debug!(marker = "DONE_OK", "masscan completion marker received");
+                break;
+            }
+            MasscanLine::Unknown => {
+                unknown_count += 1;
+                tracing::debug!(line = trimmed, "unrecognized masscan stdout line");
+            }
         }
     }
 
@@ -168,12 +212,38 @@ async fn run_masscan(
         .wait()
         .await
         .map_err(|e| ScannerError::Scan(format!("waitpid failed: {}", e)))?;
+    let _ = stderr_handle.await;
+
+    tracing::debug!(
+        exit_code = ?status.code(),
+        success = status.success(),
+        elapsed_ms = started_at.elapsed().as_millis(),
+        discovered_count,
+        banner_count,
+        unknown_count,
+        result_count = results.len(),
+        "masscan process finished"
+    );
 
     if !status.success() {
         tracing::warn!("scanner exited with non-zero status: {:?}", status.code());
     }
 
     Ok(ScanOutcome::Completed(results))
+}
+
+async fn log_scanner_stderr(stderr: ChildStderr) {
+    let mut lines = BufReader::new(stderr).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => tracing::debug!(line = %line, "masscan stderr"),
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to read masscan stderr");
+                break;
+            }
+        }
+    }
 }
 
 // ---- Masscan line parser ------------------------------------------------

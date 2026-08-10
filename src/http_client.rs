@@ -47,6 +47,11 @@ async fn response_detail(response: Response) -> String {
 }
 
 fn client(verify_tls: bool) -> Result<Client, ScannerError> {
+    tracing::debug!(
+        verify_tls,
+        user_agent = USER_AGENT,
+        "building task HTTP client"
+    );
     Client::builder()
         .user_agent(USER_AGENT)
         .danger_accept_invalid_certs(!verify_tls)
@@ -59,18 +64,29 @@ pub(crate) async fn fetch_task(
     verify_tls: bool,
     runtime_token: &str,
 ) -> Result<FetchTaskOutcome, ScannerError> {
+    tracing::debug!(url, verify_tls, "requesting scan task");
     let response = client(verify_tls)?
         .get(url)
         .bearer_auth(runtime_token)
         .send()
         .await?;
 
+    tracing::debug!(status = %response.status(), "task endpoint responded");
+
     match classify_task_status(response.status()) {
-        TaskResponseStatus::Task => response
-            .json::<AssignedTask>()
-            .await
-            .map(FetchTaskOutcome::Task)
-            .map_err(|error| ScannerError::Http(format!("invalid task response: {error}"))),
+        TaskResponseStatus::Task => {
+            let task = response
+                .json::<AssignedTask>()
+                .await
+                .map_err(|error| ScannerError::Http(format!("invalid task response: {error}")))?;
+            tracing::debug!(
+                task_id = %task.task_id,
+                target_count = task.task_target.len(),
+                ports = %task.task_port,
+                "task response decoded"
+            );
+            Ok(FetchTaskOutcome::Task(task))
+        }
         TaskResponseStatus::NoTask => Ok(FetchTaskOutcome::NoTask),
         TaskResponseStatus::Unauthorized => Ok(FetchTaskOutcome::Unauthorized {
             detail: response_detail(response).await,
@@ -92,6 +108,7 @@ pub(crate) async fn validate_credentials(
     verify_tls: bool,
     runtime_token: &str,
 ) -> Result<(), ScannerError> {
+    tracing::debug!(url, verify_tls, "validating runtime credentials");
     let response = client(verify_tls)?
         .get(url)
         .bearer_auth(runtime_token)
@@ -99,6 +116,7 @@ pub(crate) async fn validate_credentials(
         .await?;
 
     let status = response.status();
+    tracing::debug!(status = %status, "credential endpoint responded");
     match status {
         StatusCode::OK => Ok(()),
         StatusCode::UNAUTHORIZED => {
