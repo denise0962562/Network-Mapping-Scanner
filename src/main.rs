@@ -17,7 +17,7 @@ use crate::health::health_check;
 use crate::heartbeat::{ActiveTask, HeartbeatClient};
 use crate::http_client::{FetchTaskOutcome, fetch_task};
 use crate::logging::{LogLevel, init_logging};
-use crate::scanner::{ScanOutcome, run_scan};
+use crate::scanner::{ScanOutcome, run_scan, validate_scanner_binary};
 use crate::sysinfo::SystemInfo;
 use crate::types::{CacheManager, TargetParams};
 use crate::upload::Uploader;
@@ -189,6 +189,8 @@ async fn run() -> Result<(), ScannerError> {
         }
         return Ok(());
     }
+
+    validate_scanner_binary(&cfg.scanner.scanner_path)?;
 
     println!("starting...");
 

@@ -205,7 +205,7 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.rate` | int | — | masscan 本地发包速率 |
 | `scanner.source_port` | int | `61000` | masscan 源端口，范围 1-65535 |
 | `scanner.verify_tls` | bool | `false` | 是否验证 TLS 证书 |
-| `scanner.scanner_path` | string | `"./a"` | 扫描器二进制路径 |
+| `scanner.scanner_path` | string | `"./a"` | 扫描器二进制路径；也可填写能从 `PATH` 解析的命令名 |
 | `scanner.scanner_id` | string | 自动生成 | UUIDv7，首次启动自动生成 |
 | `scanner.runtime_token` | string | `""` | 注册成功后由程序自动写入的运行令牌 |
 | `upload.endpoint` | string | — | 扫描结果上报地址 |
@@ -218,7 +218,10 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.c_port` | > 0 |
 | `scanner.rate` | 1-2147483647 |
 | `scanner.source_port` | 1-65535 |
+| `scanner.scanner_path` | 普通扫描启动时必须能解析到存在且可执行的普通文件 |
 | `upload.endpoint` | 非空 |
+
+扫描器在启动扫描循环前检查 `scanner_path`。显式的相对路径或绝对路径会直接检查；不含目录的命令名（例如 `masscan`）会从 `PATH` 查找。注册、`--health-check` 和 `--get-system-info` 模式不执行扫描，因此跳过该检查。
 
 ### 配置回写（注释保留）
 

@@ -1,5 +1,6 @@
 use crate::error::ScannerError;
 use crate::types::{ScanResult, TargetParams};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -8,6 +9,83 @@ use tokio::time::{Duration, sleep};
 pub(crate) enum ScanOutcome {
     Completed(Vec<ScanResult>),
     Cancelled,
+}
+
+/// Validate that the configured scanner resolves to an executable file.
+///
+/// Explicit paths are checked directly. A bare command name is resolved
+/// through `PATH`, matching the way `std::process::Command` locates programs.
+pub(crate) fn validate_scanner_binary(scanner_path: &str) -> Result<(), ScannerError> {
+    if scanner_path.trim().is_empty() {
+        return Err(ScannerError::Config(
+            "scanner.scanner_path must not be empty".into(),
+        ));
+    }
+
+    let configured_path = Path::new(scanner_path);
+    let resolved = if is_explicit_path(configured_path) {
+        configured_path.to_path_buf()
+    } else {
+        find_in_path(configured_path).ok_or_else(|| {
+            ScannerError::Config(format!(
+                "scanner.scanner_path '{scanner_path}' was not found as an executable file in PATH"
+            ))
+        })?
+    };
+
+    let metadata = std::fs::metadata(&resolved).map_err(|error| {
+        ScannerError::Config(format!(
+            "scanner.scanner_path '{}' cannot be accessed: {error}",
+            resolved.display()
+        ))
+    })?;
+
+    if !metadata.is_file() {
+        return Err(ScannerError::Config(format!(
+            "scanner.scanner_path '{}' is not a file",
+            resolved.display()
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(ScannerError::Config(format!(
+                "scanner.scanner_path '{}' is not executable",
+                resolved.display()
+            )));
+        }
+    }
+
+    tracing::info!(scanner_path = %resolved.display(), "scanner binary validated");
+    Ok(())
+}
+
+fn is_explicit_path(path: &Path) -> bool {
+    path.is_absolute() || path.components().count() > 1
+}
+
+fn find_in_path(program: &Path) -> Option<PathBuf> {
+    let search_path = std::env::var_os("PATH")?;
+    std::env::split_paths(&search_path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file() && is_executable(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 // ---- Scanner abstraction ------------------------------------------------
@@ -161,6 +239,52 @@ fn parse_banner(line: &str) -> Option<ScanResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_scanner_binary_accepts_current_executable() {
+        let executable = std::env::current_exe().expect("current executable path");
+
+        assert!(validate_scanner_binary(executable.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn validate_scanner_binary_rejects_missing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "scanner-rs-missing-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+
+        let error = validate_scanner_binary(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.to_string().contains("cannot be accessed"));
+        assert!(error.to_string().contains(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn validate_scanner_binary_rejects_directory() {
+        let directory = std::env::temp_dir();
+
+        let error = validate_scanner_binary(directory.to_str().unwrap()).unwrap_err();
+
+        assert!(error.to_string().contains("is not a file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_scanner_binary_rejects_file_without_execute_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path =
+            std::env::temp_dir().join(format!("scanner-rs-not-executable-{}", std::process::id()));
+        std::fs::write(&path, b"not executable").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = validate_scanner_binary(path.to_str().unwrap()).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(error.to_string().contains("is not executable"));
+    }
 
     #[test]
     fn test_parse_discovered() {
