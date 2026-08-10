@@ -1,13 +1,29 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-pub(crate) fn init_logging(debug_enabled: bool) -> Result<(), std::io::Error> {
-    let log_dir = Path::new("./logs");
-    if !log_dir.exists() {
-        std::fs::create_dir_all(log_dir)?;
-    }
+pub(crate) struct LoggingGuard {
+    _file_guard: WorkerGuard,
+    directory: PathBuf,
+}
 
-    let file_appender = tracing_appender::rolling::daily("./logs", "scanner.log");
+impl LoggingGuard {
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+}
+
+pub(crate) fn init_logging(
+    debug_enabled: bool,
+    log_directory: &Path,
+) -> Result<LoggingGuard, std::io::Error> {
+    std::fs::create_dir_all(log_directory)?;
+    let log_directory = log_directory.canonicalize()?;
+
+    let file_appender = tracing_appender::rolling::daily(&log_directory, "scanner.log");
+    let (file_writer, file_guard) = NonBlockingBuilder::default()
+        .lossy(false)
+        .finish(file_appender);
 
     let default_level = if debug_enabled { "debug" } else { "info" };
     let env_filter =
@@ -20,10 +36,12 @@ pub(crate) fn init_logging(debug_enabled: bool) -> Result<(), std::io::Error> {
 
     let file = fmt::layer()
         .json()
-        .with_writer(file_appender)
+        .with_writer(file_writer)
         .with_target(true)
         .with_file(true)
-        .with_line_number(true);
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_thread_names(true);
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -34,11 +52,16 @@ pub(crate) fn init_logging(debug_enabled: bool) -> Result<(), std::io::Error> {
     tracing::debug!(
         debug_flag = debug_enabled,
         rust_log = ?std::env::var_os("RUST_LOG"),
-        log_directory = %log_dir.display(),
+        log_directory = %log_directory.display(),
+        log_file_pattern = "scanner.log.YYYY-MM-DD",
+        lossless_file_logging = true,
         "logging initialized"
     );
 
-    Ok(())
+    Ok(LoggingGuard {
+        _file_guard: file_guard,
+        directory: log_directory,
+    })
 }
 
 /// Convenience macro wrapping `tracing` field-value syntax for structured log events.

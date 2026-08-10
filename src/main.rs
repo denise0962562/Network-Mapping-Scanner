@@ -22,6 +22,7 @@ use crate::sysinfo::SystemInfo;
 use crate::types::{CacheManager, TargetParams};
 use crate::upload::Uploader;
 use clap::Parser;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
@@ -58,6 +59,10 @@ struct Cli {
     /// Path to config file (default: config.toml)
     #[arg(short = 'f', long, default_value = "config.toml")]
     config: String,
+
+    /// Directory for daily JSON log files
+    #[arg(long, default_value = "./logs")]
+    log_directory: PathBuf,
 }
 
 // ---- globals ------------------------------------------------------------
@@ -85,7 +90,7 @@ async fn main() {
 async fn run() -> Result<(), ScannerError> {
     let cli = Cli::parse();
 
-    init_logging(cli.debug)?;
+    let logging_guard = init_logging(cli.debug, &cli.log_directory)?;
 
     tracing::debug!(
         version = env!("CARGO_PKG_VERSION"),
@@ -94,6 +99,7 @@ async fn run() -> Result<(), ScannerError> {
         health_check = cli.health_check,
         system_info_only = cli.get_system_info,
         registration_requested = cli.id.is_some() || cli.token.is_some(),
+        log_directory = %logging_guard.directory().display(),
         "command-line options parsed"
     );
 
