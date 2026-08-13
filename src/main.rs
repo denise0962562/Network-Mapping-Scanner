@@ -20,7 +20,8 @@ use crate::http_client::{FetchTaskOutcome, fetch_task};
 use crate::logging::{LogLevel, init_logging};
 use crate::network::{NetworkDetector, SharedNetworkCapabilities};
 use crate::scan::{
-    ScanOutcome, ScanPlan, run_scan, validate_scanner_binary, validate_zgrab_binary,
+    ScanCapabilities, ScanOutcome, ScanPlan, run_scan, validate_scanner_binary,
+    validate_zgrab_binary,
 };
 use crate::sysinfo::SystemInfo;
 use crate::types::{CacheManager, TargetParams};
@@ -263,6 +264,7 @@ async fn run() -> Result<(), ScannerError> {
     );
     let network_detector = NetworkDetector::new(cfg.network.clone(), cfg.scanner.verify_tls)?;
     let network_capabilities = SharedNetworkCapabilities::new(network_detector.detect().await);
+    let scan_capabilities = ScanCapabilities::from_config(&cfg.service_detection);
     let network_probe_handle = network_detector.spawn(network_capabilities.clone());
     let heartbeat_client = HeartbeatClient::new(
         cfg.scanner.heartbeat_url(),
@@ -272,6 +274,7 @@ async fn run() -> Result<(), ScannerError> {
         cfg.scanner.runtime_token.clone(),
         scanner_id,
         network_capabilities,
+        scan_capabilities,
     )?;
     let active_task = ActiveTask::default();
     let heartbeat_handle = spawn_heartbeat(

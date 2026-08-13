@@ -83,6 +83,10 @@ pub(crate) async fn run_scan(
 `service_inventory` 三种 profile；没有 `scan_plan` 的旧服务端任务会按本地配置生成
 兼容计划。计划只描述白名单阶段，不接收二进制路径或任意 CLI 参数。
 
+心跳通过 `scan_capabilities` 上报支持的计划版本、profile 和阶段。本地关闭 zgrab2 时仅
+声明 `legacy`、`port_only` 和 `port_discovery`；启用并验证 zgrab2 后才声明
+`service_inventory` 与 `service_detection`，供服务端能力调度使用。
+
 Masscan 输出行解析：
 - `Discovered <port> <protocol> <ip>` → `ScanResult { service: None, banner: None }`
 - `open <protocol> <port> <ip> <timestamp>` → 标准 masscan list 格式

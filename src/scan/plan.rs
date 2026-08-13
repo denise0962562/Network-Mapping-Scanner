@@ -24,6 +24,29 @@ pub(crate) enum ScanStageKind {
     ServiceDetection,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ScanCapabilities {
+    pub(crate) plan_versions: Vec<u16>,
+    pub(crate) profiles: Vec<&'static str>,
+    pub(crate) stages: Vec<&'static str>,
+}
+
+impl ScanCapabilities {
+    pub(crate) fn from_config(service: &ServiceDetectionConfig) -> Self {
+        let mut profiles = vec!["legacy", "port_only"];
+        let mut stages = vec!["port_discovery"];
+        if service.enabled {
+            profiles.push("service_inventory");
+            stages.push("service_detection");
+        }
+        Self {
+            plan_versions: vec![SCAN_PLAN_VERSION],
+            profiles,
+            stages,
+        }
+    }
+}
+
 impl ScanPlan {
     pub(crate) fn legacy(service: &ServiceDetectionConfig) -> Self {
         let mut stages = vec![ScanStageSpec {
@@ -107,5 +130,19 @@ mod tests {
         assert!(plan.validate().is_err());
         plan.version = 1;
         assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn capabilities_follow_local_engine_configuration() {
+        let ports = ScanCapabilities::from_config(&ServiceDetectionConfig::default());
+        assert!(ports.profiles.contains(&"port_only"));
+        assert!(!ports.profiles.contains(&"service_inventory"));
+
+        let service = ServiceDetectionConfig {
+            enabled: true,
+            ..ServiceDetectionConfig::default()
+        };
+        let inventory = ScanCapabilities::from_config(&service);
+        assert!(inventory.profiles.contains(&"service_inventory"));
     }
 }

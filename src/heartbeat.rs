@@ -1,5 +1,6 @@
 use crate::error::ScannerError;
 use crate::network::{NetworkCapabilities, SharedNetworkCapabilities};
+use crate::scan::ScanCapabilities;
 use crate::sysinfo::SystemInfo;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,7 @@ struct HeartbeatPayload {
     scanner_version: &'static str,
     system: SystemInfo,
     network_capabilities: NetworkCapabilities,
+    scan_capabilities: ScanCapabilities,
 }
 
 #[derive(Serialize)]
@@ -94,6 +96,7 @@ pub(crate) struct HeartbeatClient {
     runtime_token: String,
     scanner_id: Uuid,
     network_capabilities: SharedNetworkCapabilities,
+    scan_capabilities: ScanCapabilities,
 }
 
 impl HeartbeatClient {
@@ -112,6 +115,7 @@ impl HeartbeatClient {
         runtime_token: String,
         scanner_id: Uuid,
         network_capabilities: SharedNetworkCapabilities,
+        scan_capabilities: ScanCapabilities,
     ) -> Result<Self, ScannerError> {
         let client = Client::builder()
             .user_agent(USER_AGENT)
@@ -125,6 +129,7 @@ impl HeartbeatClient {
             runtime_token,
             scanner_id,
             network_capabilities,
+            scan_capabilities,
         })
     }
 
@@ -147,6 +152,7 @@ impl HeartbeatClient {
             scanner_version: env!("CARGO_PKG_VERSION"),
             system: SystemInfo::gather()?,
             network_capabilities: self.network_capabilities.get().await,
+            scan_capabilities: self.scan_capabilities.clone(),
         };
         tracing::debug!(
             scanner_id = %self.scanner_id,
