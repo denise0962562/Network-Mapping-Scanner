@@ -66,6 +66,8 @@ pub(crate) struct AssignedTask {
     pub(crate) task_port: String,
     #[serde(default = "default_address_family")]
     pub(crate) address_family: String,
+    #[serde(default)]
+    pub(crate) scan_plan: Option<crate::scan::ScanPlan>,
 }
 
 fn default_address_family() -> String {

@@ -19,7 +19,9 @@ use crate::heartbeat::{ActiveTask, HeartbeatClient};
 use crate::http_client::{FetchTaskOutcome, fetch_task};
 use crate::logging::{LogLevel, init_logging};
 use crate::network::{NetworkDetector, SharedNetworkCapabilities};
-use crate::scan::{ScanOutcome, run_scan, validate_scanner_binary, validate_zgrab_binary};
+use crate::scan::{
+    ScanOutcome, ScanPlan, run_scan, validate_scanner_binary, validate_zgrab_binary,
+};
 use crate::sysinfo::SystemInfo;
 use crate::types::{CacheManager, TargetParams};
 use crate::upload::Uploader;
@@ -572,6 +574,10 @@ async fn scan_loop(
             source_port: config.source_port,
             address_family: assigned_task.address_family.clone(),
         };
+        let scan_plan = assigned_task
+            .scan_plan
+            .clone()
+            .unwrap_or_else(|| ScanPlan::legacy(config.service_detection));
 
         tracing::info!(
             "scanning {}:{} rate={} sport={}",
@@ -585,6 +591,7 @@ async fn scan_loop(
         let results = match run_scan(
             config.scanner_path,
             config.service_detection,
+            &scan_plan,
             &target,
             &cancel_flag,
         )

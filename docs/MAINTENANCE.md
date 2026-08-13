@@ -18,6 +18,7 @@ src/
 ├── config.rs        # TOML 配置加载/验证/回写（注释保留）
 ├── scan/            # 扫描流水线、阶段编排与扫描引擎适配器
 │   ├── orchestrator.rs # 阶段顺序、取消传播和失败策略
+│   ├── plan.rs       # 版本化扫描计划与阶段白名单校验
 │   └── engines/
 │       ├── masscan.rs # masscan 端口发现、进程控制与输出解析
 │       └── zgrab2.rs  # zgrab2 服务识别、进程控制与 JSON 归一化
@@ -77,6 +78,10 @@ pub(crate) async fn run_scan(
 ```
 
 先运行 `run_masscan()` 获取开放端口；服务识别启用时，再把 TCP 端点交给 zgrab2。
+
+任务可携带版本化 `scan_plan`。当前支持 `legacy`、`port_only` 和
+`service_inventory` 三种 profile；没有 `scan_plan` 的旧服务端任务会按本地配置生成
+兼容计划。计划只描述白名单阶段，不接收二进制路径或任意 CLI 参数。
 
 Masscan 输出行解析：
 - `Discovered <port> <protocol> <ip>` → `ScanResult { service: None, banner: None }`

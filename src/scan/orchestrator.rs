@@ -1,4 +1,5 @@
 use super::engines::{masscan, zgrab2};
+use super::plan::{ScanPlan, ScanStageKind};
 use crate::error::ScannerError;
 use crate::types::{ScanResult, ServiceDetectionConfig, TargetParams};
 use std::sync::atomic::AtomicBool;
@@ -15,34 +16,110 @@ pub(crate) enum ScanOutcome {
 pub(crate) async fn run_scan(
     scanner_path: &str,
     service_detection: &ServiceDetectionConfig,
+    plan: &ScanPlan,
     target: &TargetParams,
     cancel_requested: &AtomicBool,
 ) -> Result<ScanOutcome, ScannerError> {
-    let mut open_ports = match masscan::run(scanner_path, target, cancel_requested).await? {
-        masscan::EngineOutcome::Completed(results) => results,
-        masscan::EngineOutcome::Cancelled => return Ok(ScanOutcome::Cancelled),
-    };
-    if !service_detection.enabled || open_ports.is_empty() {
-        return Ok(ScanOutcome::Completed(open_ports));
-    }
-
-    match zgrab2::run(
-        service_detection,
-        &open_ports,
-        &target.address_family,
-        cancel_requested,
-    )
-    .await
-    {
-        Ok(zgrab2::EngineOutcome::Completed(mut enrichment)) => {
-            open_ports.append(&mut enrichment);
+    plan.validate()?;
+    let mut results = Vec::new();
+    for stage in &plan.stages {
+        match stage.kind {
+            ScanStageKind::PortDiscovery => {
+                results = match masscan::run(scanner_path, target, cancel_requested).await? {
+                    masscan::EngineOutcome::Completed(results) => results,
+                    masscan::EngineOutcome::Cancelled => return Ok(ScanOutcome::Cancelled),
+                };
+            }
+            ScanStageKind::ServiceDetection if results.is_empty() => {}
+            ScanStageKind::ServiceDetection if !service_detection.enabled => {
+                if plan.profile == "legacy" {
+                    tracing::debug!(
+                        "legacy service detection stage skipped by local configuration"
+                    );
+                    continue;
+                }
+                return Err(ScannerError::Scan(
+                    "task requires service_detection but this scanner has it disabled".into(),
+                ));
+            }
+            ScanStageKind::ServiceDetection => {
+                match zgrab2::run(
+                    service_detection,
+                    &results,
+                    &target.address_family,
+                    cancel_requested,
+                )
+                .await
+                {
+                    Ok(zgrab2::EngineOutcome::Completed(mut enrichment)) => {
+                        results.append(&mut enrichment);
+                    }
+                    Ok(zgrab2::EngineOutcome::Cancelled) => return Ok(ScanOutcome::Cancelled),
+                    Err(error) if stage.required => return Err(error),
+                    Err(error) => {
+                        tracing::warn!(%error, "optional service detection stage failed; preserving port results");
+                    }
+                }
+            }
         }
-        Ok(zgrab2::EngineOutcome::Cancelled) => return Ok(ScanOutcome::Cancelled),
-        Err(error) if service_detection.required => return Err(error),
-        Err(error) => {
-            tracing::warn!(%error, "service detection failed; preserving masscan port results");
-        }
     }
+    Ok(ScanOutcome::Completed(results))
+}
 
-    Ok(ScanOutcome::Completed(open_ports))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::plan::{SCAN_PLAN_VERSION, ScanStageSpec};
+    use std::sync::atomic::AtomicBool;
+    use uuid::Uuid;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn port_only_plan_never_invokes_service_engine() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "scanner-rs-port-only-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        std::fs::write(&path, "#!/bin/sh\nprintf 'open tcp 443 192.0.2.1 1\\n'\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = TargetParams {
+            ip: "192.0.2.1".into(),
+            port: "443".into(),
+            rate: 100,
+            source_port: 61_000,
+            address_family: "ipv4".into(),
+        };
+        let service = ServiceDetectionConfig {
+            enabled: true,
+            zgrab_path: "/definitely/not/invoked".into(),
+            ..ServiceDetectionConfig::default()
+        };
+        let plan = ScanPlan {
+            version: SCAN_PLAN_VERSION,
+            profile: "port_only".into(),
+            stages: vec![ScanStageSpec {
+                kind: ScanStageKind::PortDiscovery,
+                required: true,
+            }],
+        };
+
+        let outcome = run_scan(
+            path.to_str().unwrap(),
+            &service,
+            &plan,
+            &target,
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+        let ScanOutcome::Completed(results) = outcome else {
+            panic!("port-only scan must complete");
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].port, 443);
+    }
 }
