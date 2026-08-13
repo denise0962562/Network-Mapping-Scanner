@@ -62,6 +62,12 @@ pub(crate) struct AssignedTask {
     pub(crate) task_id: Uuid,
     pub(crate) task_target: Vec<String>,
     pub(crate) task_port: String,
+    #[serde(default = "default_address_family")]
+    pub(crate) address_family: String,
+}
+
+fn default_address_family() -> String {
+    "ipv4".into()
 }
 
 /// Parameters passed to masscan after applying local scanner settings.
@@ -98,6 +104,32 @@ pub(crate) struct ScannerResultUpload {
 pub(crate) struct AppConfig {
     pub(crate) scanner: ScannerConfig,
     pub(crate) upload: UploadConfig,
+    #[serde(default)]
+    pub(crate) network: NetworkConfig,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct NetworkConfig {
+    pub(crate) ipv4_enabled: bool,
+    pub(crate) ipv6_enabled: bool,
+    pub(crate) ipv4_probe_url: String,
+    pub(crate) ipv6_probe_url: String,
+    pub(crate) probe_interval_seconds: u64,
+    pub(crate) probe_timeout_seconds: u64,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            ipv4_enabled: true,
+            ipv6_enabled: true,
+            ipv4_probe_url: "https://api.ipify.org?format=json".into(),
+            ipv6_probe_url: "https://api6.ipify.org?format=json".into(),
+            probe_interval_seconds: 300,
+            probe_timeout_seconds: 5,
+        }
+    }
 }
 
 fn default_scanner_path() -> String {
@@ -189,6 +221,7 @@ mod tests {
 
         assert_eq!(task.task_target.len(), 2);
         assert_eq!(task.task_port, "80,443");
+        assert_eq!(task.address_family, "ipv4");
     }
 
     #[test]

@@ -25,7 +25,8 @@ src/
 ├── sysinfo.rs       # 系统信息采集（OS/CPU/RAM/uptime）
 ├── types.rs         # 全部数据结构与配置类型
 ├── error.rs         # 统一错误类型（thiserror）
-└── logging.rs       # 日志初始化（tracing）+ log_event! 宏
+├── logging.rs       # 日志初始化（tracing）+ log_event! 宏
+└── network.rs       # IPv4/IPv6 公网出口探测与共享能力状态
 ```
 
 ### 模块职责与接口
@@ -168,6 +169,88 @@ pub(crate) enum ScannerError {
 
 使用 `thiserror::Error` derive。
 
+## 网络协议自动探测
+
+`network.rs` 使用两个独立的 `reqwest::Client`：
+
+- IPv4 客户端绑定 `0.0.0.0`；
+- IPv6 客户端绑定 `::`。
+
+绑定未指定地址可以限制出站套接字的地址族，同时由操作系统选择具体接口地址。两个请求
+通过 `tokio::join!` 并行执行，因此某个协议超时不会串行阻塞另一个协议。
+
+```rust
+pub(crate) struct NetworkCapabilities {
+    ipv4: NetworkFamilyCapability,
+    ipv6: NetworkFamilyCapability,
+}
+```
+
+每个协议包含：
+
+| 字段 | 说明 |
+|---|---|
+| `supported` | 配置没有禁用该协议 |
+| `ready` | 最近一次探测成功且返回地址族正确 |
+| `public_ip` | API 返回的公网地址，失败时为空 |
+| `reason` | 禁用、请求失败、HTTP 状态异常、响应无效等原因 |
+
+探测 API 支持两种响应：
+
+```json
+{"ip":"203.0.113.10"}
+```
+
+或纯文本：
+
+```text
+203.0.113.10
+```
+
+响应必须能够解析为 IP，并与当前探测地址族一致。错误原因最多保留 256 个字符。
+
+### 生命周期
+
+1. 普通运行启动时，在创建心跳任务前完成首次并行探测。
+2. `SharedNetworkCapabilities` 使用 `Arc<RwLock<_>>` 在探测任务与心跳任务之间共享快照。
+3. 后台任务至少每 30 秒探测一次；实际周期来自 `probe_interval_seconds`。
+4. 每次心跳读取最新快照并发送给服务端。
+5. 任务响应中的 `address_family` 在执行前再次与本地快照匹配。
+6. 如果不匹配，扫描器立即发一次心跳刷新服务端状态，然后以可重试失败拒绝任务。
+
+心跳中的结构：
+
+```json
+{
+  "network_capabilities": {
+    "ipv4": {
+      "supported": true,
+      "ready": true,
+      "public_ip": "203.0.113.10",
+      "reason": null
+    },
+    "ipv6": {
+      "supported": true,
+      "ready": false,
+      "public_ip": null,
+      "reason": "probe_request_failed: ..."
+    }
+  }
+}
+```
+
+### 能力边界
+
+公网 API 探测验证的是操作系统 HTTPS 出站能力，不是完整扫描验收：
+
+- 不能证明特定私网/ULA 网段存在路由；
+- 不能证明防火墙允许扫描流量或返回包；
+- IPv4 NAT 出口地址通常不能直接作为 masscan 的接口源地址；
+- masscan 使用自己的网络栈，实际执行仍可能因接口、网关或权限失败。
+
+因此 `public_ip` 只用于能力展示和调度信号，不会自动传给 masscan 作为 `--adapter-ip`。
+受限环境应部署内部 IP 回显接口，并把两个 `probe_url` 指向符合实际路由边界的服务。
+
 ---
 
 ## 配置参考
@@ -193,6 +276,14 @@ scanner_id = "019eb66c-6ac6-7530-b73f-454037448fa2"
 # Runtime token — written automatically after successful one-time registration
 runtime_token = ""
 
+[network]
+ipv4_enabled = true
+ipv6_enabled = true
+ipv4_probe_url = "https://api.ipify.org?format=json"
+ipv6_probe_url = "https://api6.ipify.org?format=json"
+probe_interval_seconds = 300
+probe_timeout_seconds = 5
+
 [upload]
 # Endpoint for scan result upload (HTTPS POST JSON)
 endpoint = "https://example.com/api/scanner/result"
@@ -210,6 +301,12 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.scanner_path` | string | `"./a"` | 扫描器二进制路径；也可填写能从 `PATH` 解析的命令名 |
 | `scanner.scanner_id` | string | 自动生成 | UUIDv7，首次启动自动生成 |
 | `scanner.runtime_token` | string | `""` | 注册成功后由程序自动写入的运行令牌 |
+| `network.ipv4_enabled` | bool | `true` | 是否自动探测并接受 IPv4 任务 |
+| `network.ipv6_enabled` | bool | `true` | 是否自动探测并接受 IPv6 任务 |
+| `network.ipv4_probe_url` | string | ipify IPv4 API | IPv4 IP 回显接口 |
+| `network.ipv6_probe_url` | string | ipify IPv6 API | IPv6 IP 回显接口 |
+| `network.probe_interval_seconds` | int | `300` | 重新探测周期，范围 30-86400 秒 |
+| `network.probe_timeout_seconds` | int | `5` | 单次连接及总请求超时，范围 1-60 秒 |
 | `upload.endpoint` | string | — | 扫描结果上报地址 |
 
 ### 验证规则
@@ -221,6 +318,8 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.rate` | 1-2147483647 |
 | `scanner.source_port` | 1-65535 |
 | `scanner.scanner_path` | 普通扫描启动时必须能解析到存在且可执行的普通文件 |
+| `network.probe_interval_seconds` | 30-86400 |
+| `network.probe_timeout_seconds` | 1-60 |
 | `upload.endpoint` | 非空 |
 
 扫描器在启动扫描循环前检查 `scanner_path`。显式的相对路径或绝对路径会直接检查；不含目录的命令名（例如 `masscan`）会从 `PATH` 查找。注册、`--health-check` 和 `--get-system-info` 模式不执行扫描，因此跳过该检查。

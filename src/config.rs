@@ -85,6 +85,16 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
             !(5..=300).contains(&cfg.scanner.heartbeat_interval_seconds),
             "must be between 5 and 300",
         ),
+        (
+            "network.probe_interval_seconds",
+            !(30..=86400).contains(&cfg.network.probe_interval_seconds),
+            "must be between 30 and 86400",
+        ),
+        (
+            "network.probe_timeout_seconds",
+            !(1..=60).contains(&cfg.network.probe_timeout_seconds),
+            "must be between 1 and 60",
+        ),
     ];
 
     for &(field, failed, msg) in rules {
