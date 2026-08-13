@@ -15,7 +15,7 @@ mod upload;
 use crate::config::load;
 use crate::error::ScannerError;
 use crate::health::health_check;
-use crate::heartbeat::{ActiveTask, HeartbeatClient};
+use crate::heartbeat::{ActiveTask, HeartbeatClient, HeartbeatEndpoints};
 use crate::http_client::{FetchTaskOutcome, fetch_task};
 use crate::logging::{LogLevel, init_logging};
 use crate::network::{NetworkDetector, SharedNetworkCapabilities};
@@ -267,9 +267,11 @@ async fn run() -> Result<(), ScannerError> {
     let scan_capabilities = ScanCapabilities::from_config(&cfg.service_detection);
     let network_probe_handle = network_detector.spawn(network_capabilities.clone());
     let heartbeat_client = HeartbeatClient::new(
-        cfg.scanner.heartbeat_url(),
-        cfg.scanner.task_failure_url(),
-        cfg.scanner.task_cancelled_url(),
+        HeartbeatEndpoints {
+            heartbeat: cfg.scanner.heartbeat_url(),
+            failure: cfg.scanner.task_failure_url(),
+            cancelled: cfg.scanner.task_cancelled_url(),
+        },
         cfg.scanner.verify_tls,
         cfg.scanner.runtime_token.clone(),
         scanner_id,
@@ -427,13 +429,17 @@ async fn flush(
         return Ok(());
     }
 
-    let payload = cache.upload_payload(scanner_id)?;
+    let batches = cache.upload_batches(scanner_id)?;
     tracing::debug!(
-        task_id = %payload.task_id,
-        result_count = payload.results.len(),
-        "flushing cached scan results"
+        task_id = %batches[0].task_id,
+        upload_id = %batches[0].upload_id,
+        batch_count = batches.len(),
+        observation_count = cache.observations.len(),
+        "flushing cached scan observations"
     );
-    uploader.upload(&payload).await?;
+    for batch in &batches {
+        uploader.upload(batch).await?;
+    }
     log_event!(LogLevel::Info, "UPLOAD", "upload complete", "flush");
     cache.clear();
     Ok(())
@@ -658,7 +664,7 @@ async fn scan_loop(
             break;
         }
 
-        for r in &results {
+        for observation in &results {
             if stop_requested() {
                 log_event!(
                     LogLevel::Info,
@@ -674,14 +680,7 @@ async fn scan_loop(
                 }
             }
 
-            if let Err(e) = cache.insert(
-                &r.ip,
-                r.port,
-                r.service.as_deref(),
-                &r.protocol,
-                r.banner.as_deref(),
-                r.other.as_ref(),
-            ) {
+            if let Err(e) = cache.insert(observation) {
                 log_event!(
                     LogLevel::Error,
                     "CACHE-ERROR",

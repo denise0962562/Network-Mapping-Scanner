@@ -1,5 +1,6 @@
 use crate::error::ScannerError;
-use crate::types::{ScanResult, ServiceDetectionConfig};
+use crate::scan::{PortObservation, ServiceObservation};
+use crate::types::ServiceDetectionConfig;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ const MAX_ZGRAB_STDERR_CHARS: usize = 4096;
 const MAX_BANNER_CHARS: usize = 1024;
 
 pub(crate) enum EngineOutcome {
-    Completed(Vec<ScanResult>),
+    Completed(Vec<ServiceObservation>),
     Cancelled,
 }
 
@@ -87,7 +88,7 @@ fn is_executable(path: &Path) -> bool {
 
 pub(crate) async fn run(
     config: &ServiceDetectionConfig,
-    open_ports: &[ScanResult],
+    open_ports: &[PortObservation],
     address_family: &str,
     cancel_requested: &AtomicBool,
 ) -> Result<EngineOutcome, ScannerError> {
@@ -206,7 +207,7 @@ pub(crate) async fn run(
     Ok(EngineOutcome::Completed(results))
 }
 
-fn build_zgrab_input(open_ports: &[ScanResult]) -> String {
+fn build_zgrab_input(open_ports: &[PortObservation]) -> String {
     let mut seen = HashSet::new();
     let mut input = String::new();
     for result in open_ports {
@@ -242,7 +243,10 @@ fn probe_module_for_port(port: u16) -> &'static str {
     }
 }
 
-fn parse_zgrab_line(line: &str, max_result_bytes: usize) -> Result<Vec<ScanResult>, ScannerError> {
+fn parse_zgrab_line(
+    line: &str,
+    max_result_bytes: usize,
+) -> Result<Vec<ServiceObservation>, ScannerError> {
     let root: Value = serde_json::from_str(line)?;
     let ip = root
         .get("ip")
@@ -273,13 +277,14 @@ fn parse_zgrab_line(line: &str, max_result_bytes: usize) -> Result<Vec<ScanResul
             .flatten()
             .map(str::to_owned);
         let banner = success.then(|| extract_banner(module_data)).flatten();
-        results.push(ScanResult {
+        results.push(ServiceObservation {
             ip: ip.to_owned(),
             port,
             protocol: "tcp".into(),
             service,
             banner,
-            other: Some(bounded_detail(module, module_data, max_result_bytes)),
+            source: "zgrab2",
+            data: Some(bounded_detail(module, module_data, max_result_bytes)),
         });
     }
     Ok(results)
@@ -437,14 +442,13 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
-    fn open_port(ip: &str, port: u16, protocol: &str) -> ScanResult {
-        ScanResult {
+    fn open_port(ip: &str, port: u16, protocol: &str) -> PortObservation {
+        PortObservation {
             ip: ip.into(),
             port,
             protocol: protocol.into(),
-            service: None,
-            banner: None,
-            other: None,
+            state: "open",
+            source: "masscan",
         }
     }
 
@@ -466,7 +470,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].service.as_deref(), Some("http"));
         assert_eq!(results[0].banner.as_deref(), Some("HTTP/1.1 200 OK"));
-        assert_eq!(results[0].other.as_ref().unwrap()["source"], "zgrab2");
+        assert_eq!(results[0].data.as_ref().unwrap()["source"], "zgrab2");
     }
 
     #[test]
@@ -476,7 +480,7 @@ mod tests {
         assert_eq!(results[0].port, 22);
         assert!(results[0].service.is_none());
         assert_eq!(
-            results[0].other.as_ref().unwrap()["data"]["status"],
+            results[0].data.as_ref().unwrap()["data"]["status"],
             "connection-timeout"
         );
     }
@@ -488,7 +492,7 @@ mod tests {
             "x".repeat(2048)
         );
         let results = parse_zgrab_line(&line, 1024).unwrap();
-        assert_eq!(results[0].other.as_ref().unwrap()["truncated"], true);
+        assert_eq!(results[0].data.as_ref().unwrap()["truncated"], true);
         assert!(results[0].service.is_none());
     }
 

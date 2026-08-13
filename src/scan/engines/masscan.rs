@@ -1,5 +1,6 @@
 use crate::error::ScannerError;
-use crate::types::{ScanResult, TargetParams};
+use crate::scan::PortObservation;
+use crate::types::TargetParams;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -11,7 +12,7 @@ use tokio::time::{Duration, sleep};
 const MAX_SCANNER_STDERR_CHARS: usize = 4096;
 
 pub(crate) enum EngineOutcome {
-    Completed(Vec<ScanResult>),
+    Completed(Vec<PortObservation>),
     Cancelled,
 }
 
@@ -275,7 +276,7 @@ fn scanner_failure_detail(stdout_error: &str, stderr_output: &str) -> String {
 // ---- Masscan line parser ------------------------------------------------
 
 enum MasscanLine {
-    Discovered(ScanResult),
+    Discovered(PortObservation),
     Complete,
     DoneOk,
     Error,
@@ -296,7 +297,7 @@ impl MasscanLine {
     }
 }
 
-fn parse_discovered(line: &str) -> Option<ScanResult> {
+fn parse_discovered(line: &str) -> Option<PortObservation> {
     let (port, protocol, ip) = if line.starts_with("open ") {
         let mut parts = line.split_whitespace().skip(1);
         let protocol = parts.next()?.to_owned();
@@ -311,13 +312,12 @@ fn parse_discovered(line: &str) -> Option<ScanResult> {
         (port, protocol, ip)
     };
 
-    Some(ScanResult {
+    Some(PortObservation {
         ip,
         port,
         protocol,
-        service: None,
-        banner: None,
-        other: None,
+        state: "open",
+        source: "masscan",
     })
 }
 
@@ -417,7 +417,7 @@ mod tests {
         assert_eq!(r.port, 80);
         assert_eq!(r.protocol, "tcp");
         assert_eq!(r.ip, "192.168.1.1");
-        assert!(r.service.is_none());
+        assert_eq!(r.state, "open");
     }
 
     #[test]
@@ -426,6 +426,6 @@ mod tests {
         assert_eq!(r.port, 22);
         assert_eq!(r.protocol, "tcp");
         assert_eq!(r.ip, "192.168.1.1");
-        assert!(r.service.is_none());
+        assert_eq!(r.source, "masscan");
     }
 }

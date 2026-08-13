@@ -1,61 +1,21 @@
-use std::collections::HashMap;
 use uuid::Uuid;
 
 // ---- Cache data model ---------------------------------------------------
-
-/// A single service entry: service name and optional banner.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ServiceInfo {
-    pub(crate) name: Option<String>,
-    pub(crate) banner: Option<String>,
-    pub(crate) other: Option<serde_json::Value>,
-}
-
-impl ServiceInfo {
-    pub(crate) fn is_placeholder(&self) -> bool {
-        self.name.is_none()
-    }
-}
-
-/// Per-port information: port number, protocol, and associated services.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct PortInfo {
-    pub(crate) port: u16,
-    pub(crate) protocol: String,
-    pub(crate) services: Vec<ServiceInfo>,
-}
-
-/// An IP-scoped entry in the scan cache.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct IpEntry {
-    pub(crate) ports: Vec<PortInfo>,
-}
 
 /// In-memory scan result cache. Accumulates results until flushed.
 #[derive(Debug, Default)]
 pub(crate) struct CacheManager {
     pub(crate) task_id: Option<Uuid>,
-    pub(crate) ip_table: HashMap<String, IpEntry>,
-    pub(crate) total_records: u32,
+    pub(crate) upload_id: Option<Uuid>,
+    pub(crate) observations: Vec<crate::scan::ScanObservation>,
 }
 
 impl CacheManager {
     pub(crate) fn clear(&mut self) {
         self.task_id = None;
-        self.ip_table.clear();
-        self.total_records = 0;
+        self.upload_id = None;
+        self.observations.clear();
     }
-}
-
-/// A single parsed line from masscan stdout.
-#[derive(Debug, Clone)]
-pub(crate) struct ScanResult {
-    pub(crate) ip: String,
-    pub(crate) port: u16,
-    pub(crate) protocol: String,
-    pub(crate) service: Option<String>,
-    pub(crate) banner: Option<String>,
-    pub(crate) other: Option<serde_json::Value>,
 }
 
 /// Task assigned by the server.
@@ -87,20 +47,14 @@ pub(crate) struct TargetParams {
 // ---- Upload payload -----------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ScannerResultItem {
-    pub(crate) ip: String,
-    pub(crate) port: u16,
-    pub(crate) protocol: Option<String>,
-    pub(crate) service: Option<String>,
-    pub(crate) banner: Option<String>,
-    pub(crate) other: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ScannerResultUpload {
+pub(crate) struct ScannerResultBatchUpload {
+    pub(crate) protocol_version: u16,
     pub(crate) scanner_id: Uuid,
     pub(crate) task_id: Uuid,
-    pub(crate) results: Vec<ScannerResultItem>,
+    pub(crate) upload_id: Uuid,
+    pub(crate) batch_index: u32,
+    pub(crate) is_final: bool,
+    pub(crate) observations: Vec<crate::scan::ScanObservation>,
 }
 
 // ---- Configuration structures -------------------------------------------

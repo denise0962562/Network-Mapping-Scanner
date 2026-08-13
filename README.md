@@ -35,7 +35,7 @@ max_result_bytes = 65536
 ```
 
 - `required = false` 时，zgrab2 整体失败仍会上报 masscan 已发现的开放端口。
-- 单个协议握手超时或不匹配不会抹掉开放端口，只会在 `other` 中记录探测状态。
+- 单个协议握手超时或不匹配不会抹掉端口观察，只会在 service observation 的 `data` 中记录探测状态。
 - 未配置 `[service_detection]` 的旧配置默认关闭该功能。
 - zgrab2 使用系统 TCP 栈，`senders` 和 `server_rate_limit` 应从较低值开始压测，不能照搬
   masscan 的发包速率。

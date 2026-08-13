@@ -66,12 +66,13 @@ impl LoadedConfig {
 实现方式为重新解析原始文件内容 → 修改 `[scanner]` 段 → 序列化写回，
 **原有注释、空行、键顺序全部保留**。
 
-#### `scanner.rs`
+#### `scan/orchestrator.rs`
 
 ```rust
 pub(crate) async fn run_scan(
     scanner_path: &str,
     service_detection: &ServiceDetectionConfig,
+    plan: &ScanPlan,
     target: &TargetParams,
     cancel_requested: &AtomicBool,
 ) -> Result<ScanOutcome, ScannerError>
@@ -88,7 +89,7 @@ pub(crate) async fn run_scan(
 `service_inventory` 与 `service_detection`，供服务端能力调度使用。
 
 Masscan 输出行解析：
-- `Discovered <port> <protocol> <ip>` → `ScanResult { service: None, banner: None }`
+- `Discovered <port> <protocol> <ip>` → `PortObservation`
 - `open <protocol> <port> <ip> <timestamp>` → 标准 masscan list 格式
 - `ERROR` → 返回错误
 - `COMPLETE` / `DONE_OK` → 正常结束
@@ -105,7 +106,7 @@ zgrab2 使用 `multiple` 模式。扫描器把每个开放 TCP 端点编码成 `
 等模块；未映射端口使用 `banner`。
 
 - `status=success`：写入规范化 `service`，并提取可用的短 banner；
-- 超时、拒绝或协议错误：`service` 保持为空，结构化状态写入 `other`；
+- 超时、拒绝或协议错误：`service` 保持为空，结构化状态写入 observation 的 `data`；
 - 详细数据超过 `max_result_bytes`：只保留状态、错误、原大小和 `truncated=true`。
 
 若 `required=false`，zgrab2 进程启动失败或非零退出只记录警告，masscan 端口结果照常上报；
@@ -117,31 +118,28 @@ zgrab2 子进程。
 ```rust
 impl CacheManager {
     pub(crate) fn begin_task(&mut self, task_id: Uuid) -> Result
-    pub(crate) fn insert(&mut self, ip, port, service, protocol, banner, other) -> Result
-    pub(crate) fn upload_payload(&self, scanner_id: Uuid) -> Result<ScannerResultUpload, ScannerError>
+    pub(crate) fn insert(&mut self, observation: &ScanObservation) -> Result
+    pub(crate) fn upload_batches(&self, scanner_id: Uuid) -> Result<Vec<ScannerResultBatchUpload>, ScannerError>
     pub(crate) fn clear(&mut self)
 }
 ```
 
-三层聚合结构：`HashMap<IP, IpEntry { Vec<PortInfo { Vec<ServiceInfo> }> }>`
-
-去重规则：
-- 同一 IP + port + protocol 的重复 `Discovered` 行（service=None）→ 跳过
-- zgrab2 成功结果（service=Some）→ 查找首个 placeholder（name=None）填充，否则追加
-- zgrab2 失败或 generic banner（service=None、other/banner 非空）→ 丰富 placeholder，但不虚构服务名
-
-缓存始终绑定一个 `task_id`。存在待上传任务时拒绝开始新任务，避免多个任务的数据混合。`upload_payload()` 将缓存转换为服务端要求的 `ScannerResultUpload`。
+缓存保存类型化的 `Port` 与 `Service` observations，并按类型、IP、端口、协议、服务名和来源
+生成稳定身份去重。每个任务在 `begin_task()` 时生成一次 `upload_id`，重试期间保持不变。
+`upload_batches()` 每 500 条生成一批；空任务也生成一个最终空批，只有最后一批设置
+`is_final=true`。
 
 #### `upload.rs`
 
 ```rust
 impl Uploader {
     pub(crate) fn new(endpoint: String, verify_tls: bool, runtime_token: String) -> Self
-    pub(crate) async fn upload(&self, payload: &ScannerResultUpload) -> Result<(), ScannerError>
+    pub(crate) async fn upload(&self, payload: &ScannerResultBatchUpload) -> Result<(), ScannerError>
 }
 ```
 
-`upload()` 使用运行令牌作为 Bearer 凭据，将包含扫描器 ID、任务 ID和结果数组的 JSON 发送到 `endpoint`。失败时保留整个任务缓存并暂停领取新任务。
+`upload()` 使用运行令牌作为 Bearer 凭据，顺序发送版本 2 结果批。失败时保留任务、
+`upload_id` 和所有 observations；再次上传会产生相同批身份，由服务端幂等确认。
 
 扩展加密：在 `upload()` 中加密 payload 后再发送，调用方无需改动。
 
@@ -463,23 +461,37 @@ scanner-rs
 5. **port discovery** — masscan 仅执行 SYN/端口发现，输出 list 格式
 6. **service dispatch** — 按开放端口选择 zgrab2 module tag，仅处理 TCP
 7. **service detection** — zgrab2 受控并发执行应用层握手，逐行输出 JSON
-8. **normalize/cache** — 保留开放端口事实并合并服务、banner、状态和结构化详情
-9. **payload/upload** — 生成任务载荷并携带运行令牌 HTTPS POST 到 upload endpoint
+8. **normalize/cache** — 分别生成 port/service observations 并进行稳定身份去重
+9. **payload/upload** — 每 500 条分批上传，最终批确认后任务完成
 
 ### 上传 JSON 格式
 
 ```json
 {
+  "protocol_version": 2,
   "scanner_id": "019c0000-0000-7000-8000-000000000001",
   "task_id": "019c0000-0000-7000-8000-000000000002",
-  "results": [
+  "upload_id": "019c0000-0000-7000-8000-000000000003",
+  "batch_index": 0,
+  "is_final": true,
+  "observations": [
     {
+      "kind": "port",
+      "ip": "192.168.1.1",
+      "port": 80,
+      "protocol": "tcp",
+      "state": "open",
+      "source": "masscan"
+    },
+    {
+      "kind": "service",
       "ip": "192.168.1.1",
       "port": 80,
       "protocol": "tcp",
       "service": "http",
       "banner": "HTTP/1.1 200 OK",
-      "other": {
+      "source": "zgrab2",
+      "data": {
         "source": "zgrab2",
         "module": "http",
         "data": {
@@ -543,7 +555,7 @@ cargo test
 
 扫描流程扩展位于 `scan/orchestrator.rs`，具体工具适配器位于 `scan/engines/`：
 
-1. 添加 `run_nuclei(path: &str, target: &TargetParams) -> Result<Vec<ScanResult>, ScannerError>`
+1. 添加新的 engine，并返回对应的类型化 observation
 2. 在 `run_scan()` 中按路径/类型分发
 
 其他模块无需改动。

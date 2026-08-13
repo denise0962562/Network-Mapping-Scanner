@@ -1,41 +1,39 @@
 use crate::error::ScannerError;
-use crate::types::{
-    CacheManager, IpEntry, PortInfo, ScannerResultItem, ScannerResultUpload, ServiceInfo,
-};
-use std::collections::hash_map::Entry;
+use crate::scan::ScanObservation;
+use crate::types::{CacheManager, ScannerResultBatchUpload};
+#[cfg(test)]
+use std::collections::HashSet;
 use uuid::Uuid;
 
-impl CacheManager {
-    pub(crate) fn insert(
-        &mut self,
-        ip: &str,
-        port: u16,
-        service: Option<&str>,
-        protocol: &str,
-        banner: Option<&str>,
-        other: Option<&serde_json::Value>,
-    ) -> Result<(), ScannerError> {
-        match self.ip_table.entry(ip.to_owned()) {
-            Entry::Occupied(mut e) => {
-                add_or_fill(e.get_mut(), port, service, protocol, banner, other)?;
-            }
-            Entry::Vacant(e) => {
-                let mut entry = IpEntry { ports: Vec::new() };
-                add_or_fill(&mut entry, port, service, protocol, banner, other)?;
-                e.insert(entry);
-            }
-        }
-        self.total_records += 1;
-        Ok(())
-    }
+pub(crate) const UPLOAD_BATCH_SIZE: usize = 500;
+const RESULT_PROTOCOL_VERSION: u16 = 2;
 
+impl CacheManager {
     pub(crate) fn begin_task(&mut self, task_id: Uuid) -> Result<(), ScannerError> {
-        if self.task_id.is_some() || self.total_records > 0 {
+        if self.task_id.is_some() || !self.observations.is_empty() {
             return Err(ScannerError::Scan(
                 "cannot start a new task while results are pending".into(),
             ));
         }
         self.task_id = Some(task_id);
+        self.upload_id = Some(Uuid::now_v7());
+        Ok(())
+    }
+
+    pub(crate) fn insert(&mut self, observation: &ScanObservation) -> Result<(), ScannerError> {
+        if self.task_id.is_none() || self.upload_id.is_none() {
+            return Err(ScannerError::Scan(
+                "cannot cache an observation without task context".into(),
+            ));
+        }
+        let identity = observation.identity();
+        if !self
+            .observations
+            .iter()
+            .any(|existing| existing.identity() == identity)
+        {
+            self.observations.push(observation.clone());
+        }
         Ok(())
     }
 
@@ -43,175 +41,136 @@ impl CacheManager {
         self.task_id.is_some()
     }
 
-    pub(crate) fn upload_payload(
+    pub(crate) fn upload_batches(
         &self,
         scanner_id: Uuid,
-    ) -> Result<ScannerResultUpload, ScannerError> {
+    ) -> Result<Vec<ScannerResultBatchUpload>, ScannerError> {
         let task_id = self.task_id.ok_or_else(|| {
             ScannerError::Upload("missing task context for cached results".into())
         })?;
-        let mut entries = Vec::new();
+        let upload_id = self.upload_id.ok_or_else(|| {
+            ScannerError::Upload("missing upload identity for cached results".into())
+        })?;
 
-        for (ip, ip_entry) in &self.ip_table {
-            for port_info in &ip_entry.ports {
-                for svc in &port_info.services {
-                    entries.push(ScannerResultItem {
-                        ip: ip.clone(),
-                        port: port_info.port,
-                        protocol: Some(port_info.protocol.clone()),
-                        service: svc.name.clone(),
-                        banner: svc.banner.clone(),
-                        other: svc.other.clone(),
-                    });
-                }
-            }
+        if self.observations.is_empty() {
+            return Ok(vec![ScannerResultBatchUpload {
+                protocol_version: RESULT_PROTOCOL_VERSION,
+                scanner_id,
+                task_id,
+                upload_id,
+                batch_index: 0,
+                is_final: true,
+                observations: Vec::new(),
+            }]);
         }
 
-        Ok(ScannerResultUpload {
-            scanner_id,
-            task_id,
-            results: entries,
-        })
-    }
-}
-
-// ---- Internal helpers ---------------------------------------------------
-
-fn add_or_fill(
-    entry: &mut IpEntry,
-    port: u16,
-    service: Option<&str>,
-    protocol: &str,
-    banner: Option<&str>,
-    other: Option<&serde_json::Value>,
-) -> Result<(), ScannerError> {
-    if let Some(pi) = entry
-        .ports
-        .iter_mut()
-        .find(|pi| pi.port == port && pi.protocol == protocol)
-    {
-        if service.is_none() && banner.is_none() && other.is_none() {
-            return Ok(());
-        }
-        return upsert_service(pi, service, banner, other);
+        let chunk_count = self.observations.len().div_ceil(UPLOAD_BATCH_SIZE);
+        let batches = self
+            .observations
+            .chunks(UPLOAD_BATCH_SIZE)
+            .enumerate()
+            .map(|(index, observations)| ScannerResultBatchUpload {
+                protocol_version: RESULT_PROTOCOL_VERSION,
+                scanner_id,
+                task_id,
+                upload_id,
+                batch_index: u32::try_from(index).expect("observation batch index fits in u32"),
+                is_final: index + 1 == chunk_count,
+                observations: observations.to_vec(),
+            })
+            .collect();
+        Ok(batches)
     }
 
-    let mut pi = PortInfo {
-        port,
-        protocol: protocol.to_owned(),
-        services: Vec::new(),
-    };
-    upsert_service(&mut pi, service, banner, other)?;
-    entry.ports.push(pi);
-    Ok(())
-}
-
-fn upsert_service(
-    pi: &mut PortInfo,
-    service: Option<&str>,
-    banner: Option<&str>,
-    other: Option<&serde_json::Value>,
-) -> Result<(), ScannerError> {
-    if let Some(name) = service
-        && let Some(existing) = pi
-            .services
-            .iter_mut()
-            .find(|item| item.name.as_deref() == Some(name))
-    {
-        if existing.banner.is_none() {
-            existing.banner = banner.map(str::to_owned);
-        }
-        if existing.other.is_none() {
-            existing.other = other.cloned();
-        }
-        return Ok(());
+    #[cfg(test)]
+    fn observation_identities(&self) -> HashSet<String> {
+        self.observations
+            .iter()
+            .map(ScanObservation::identity)
+            .collect()
     }
-
-    if let Some(name) = service
-        && let Some(empty) = pi.services.iter_mut().find(|s| s.is_placeholder())
-    {
-        empty.name = Some(name.to_owned());
-        if banner.is_some() && empty.banner.is_none() {
-            empty.banner = banner.map(str::to_owned);
-        }
-        if other.is_some() && empty.other.is_none() {
-            empty.other = other.cloned();
-        }
-        return Ok(());
-    }
-
-    if service.is_none()
-        && let Some(empty) = pi.services.iter_mut().find(|s| s.is_placeholder())
-    {
-        if empty.banner.is_none() {
-            empty.banner = banner.map(str::to_owned);
-        }
-        if empty.other.is_none() {
-            empty.other = other.cloned();
-        }
-        return Ok(());
-    }
-
-    pi.services.push(ServiceInfo {
-        name: service.map(str::to_owned),
-        banner: banner.map(str::to_owned),
-        other: other.cloned(),
-    });
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::types::CacheManager;
-    use uuid::Uuid;
+    use super::*;
+    use crate::scan::{PortObservation, ServiceObservation};
 
     fn uuid(value: &str) -> Uuid {
         Uuid::parse_str(value).expect("valid test UUID")
     }
 
     #[test]
-    fn payload_keeps_scanner_and_task_context() {
+    fn batches_keep_stable_upload_identity_and_final_marker() {
         let scanner_id = uuid("019c0000-0000-7000-8000-000000000001");
         let task_id = uuid("019c0000-0000-7000-8000-000000000002");
         let mut cache = CacheManager::default();
-        cache.begin_task(task_id).expect("task must start");
+        cache.begin_task(task_id).unwrap();
         cache
-            .insert(
-                "192.0.2.1",
-                443,
-                Some("https"),
-                "tcp",
-                Some("banner"),
-                Some(&serde_json::json!({"source": "zgrab2"})),
-            )
-            .expect("result must be cached");
+            .insert(&ScanObservation::Port(PortObservation {
+                ip: "192.0.2.1".into(),
+                port: 443,
+                protocol: "tcp".into(),
+                state: "open",
+                source: "masscan",
+            }))
+            .unwrap();
+        cache
+            .insert(&ScanObservation::Service(ServiceObservation {
+                ip: "192.0.2.1".into(),
+                port: 443,
+                protocol: "tcp".into(),
+                service: Some("https".into()),
+                banner: None,
+                source: "zgrab2",
+                data: None,
+            }))
+            .unwrap();
 
-        let payload = cache
-            .upload_payload(scanner_id)
-            .expect("payload must be built");
-
-        assert_eq!(payload.scanner_id, scanner_id);
-        assert_eq!(payload.task_id, task_id);
-        assert_eq!(payload.results.len(), 1);
-        assert_eq!(payload.results[0].protocol.as_deref(), Some("tcp"));
-
-        let json = serde_json::to_value(payload).expect("payload must serialize");
-        assert_eq!(json["scanner_id"], scanner_id.to_string());
-        assert_eq!(json["task_id"], task_id.to_string());
-        assert_eq!(json["results"][0]["ip"], "192.0.2.1");
-        assert_eq!(json["results"][0]["other"]["source"], "zgrab2");
-        assert!(json["results"][0].get("scanner_name").is_none());
-        assert!(json["results"][0].get("scan_time").is_none());
+        let first = cache.upload_batches(scanner_id).unwrap();
+        let retry = cache.upload_batches(scanner_id).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].is_final);
+        assert_eq!(first[0].upload_id, retry[0].upload_id);
+        assert_eq!(first[0].observations.len(), 2);
+        assert_eq!(cache.observation_identities().len(), 2);
+        let json = serde_json::to_value(&first[0]).unwrap();
+        assert_eq!(json["protocol_version"], 2);
+        assert_eq!(json["observations"][0]["kind"], "port");
+        assert_eq!(json["observations"][1]["kind"], "service");
     }
 
     #[test]
-    fn pending_task_prevents_result_mixing() {
-        let first = uuid("019c0000-0000-7000-8000-000000000001");
-        let second = uuid("019c0000-0000-7000-8000-000000000002");
+    fn empty_task_still_produces_a_final_batch() {
         let mut cache = CacheManager::default();
+        cache.begin_task(Uuid::now_v7()).unwrap();
+        let batches = cache.upload_batches(Uuid::now_v7()).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].is_final);
+        assert!(batches[0].observations.is_empty());
+    }
 
-        cache.begin_task(first).expect("first task must start");
-
-        assert!(cache.begin_task(second).is_err());
+    #[test]
+    fn large_tasks_are_split_at_the_protocol_limit() {
+        let mut cache = CacheManager::default();
+        cache.begin_task(Uuid::now_v7()).unwrap();
+        for port in 1..=501 {
+            cache
+                .insert(&ScanObservation::Port(PortObservation {
+                    ip: "192.0.2.1".into(),
+                    port,
+                    protocol: "tcp".into(),
+                    state: "open",
+                    source: "masscan",
+                }))
+                .unwrap();
+        }
+        let batches = cache.upload_batches(Uuid::now_v7()).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].observations.len(), UPLOAD_BATCH_SIZE);
+        assert!(!batches[0].is_final);
+        assert_eq!(batches[1].observations.len(), 1);
+        assert!(batches[1].is_final);
+        assert_eq!(batches[0].upload_id, batches[1].upload_id);
     }
 }

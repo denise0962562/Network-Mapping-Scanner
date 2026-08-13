@@ -1,11 +1,12 @@
 use super::engines::{masscan, zgrab2};
+use super::observation::ScanObservation;
 use super::plan::{ScanPlan, ScanStageKind};
 use crate::error::ScannerError;
-use crate::types::{ScanResult, ServiceDetectionConfig, TargetParams};
+use crate::types::{ServiceDetectionConfig, TargetParams};
 use std::sync::atomic::AtomicBool;
 
 pub(crate) enum ScanOutcome {
-    Completed(Vec<ScanResult>),
+    Completed(Vec<ScanObservation>),
     Cancelled,
 }
 
@@ -21,16 +22,17 @@ pub(crate) async fn run_scan(
     cancel_requested: &AtomicBool,
 ) -> Result<ScanOutcome, ScannerError> {
     plan.validate()?;
-    let mut results = Vec::new();
+    let mut ports = Vec::new();
+    let mut services = Vec::new();
     for stage in &plan.stages {
         match stage.kind {
             ScanStageKind::PortDiscovery => {
-                results = match masscan::run(scanner_path, target, cancel_requested).await? {
+                ports = match masscan::run(scanner_path, target, cancel_requested).await? {
                     masscan::EngineOutcome::Completed(results) => results,
                     masscan::EngineOutcome::Cancelled => return Ok(ScanOutcome::Cancelled),
                 };
             }
-            ScanStageKind::ServiceDetection if results.is_empty() => {}
+            ScanStageKind::ServiceDetection if ports.is_empty() => {}
             ScanStageKind::ServiceDetection if !service_detection.enabled => {
                 if plan.profile == "legacy" {
                     tracing::debug!(
@@ -45,15 +47,13 @@ pub(crate) async fn run_scan(
             ScanStageKind::ServiceDetection => {
                 match zgrab2::run(
                     service_detection,
-                    &results,
+                    &ports,
                     &target.address_family,
                     cancel_requested,
                 )
                 .await
                 {
-                    Ok(zgrab2::EngineOutcome::Completed(mut enrichment)) => {
-                        results.append(&mut enrichment);
-                    }
+                    Ok(zgrab2::EngineOutcome::Completed(enrichment)) => services = enrichment,
                     Ok(zgrab2::EngineOutcome::Cancelled) => return Ok(ScanOutcome::Cancelled),
                     Err(error) if stage.required => return Err(error),
                     Err(error) => {
@@ -63,7 +63,10 @@ pub(crate) async fn run_scan(
             }
         }
     }
-    Ok(ScanOutcome::Completed(results))
+    let mut observations = Vec::with_capacity(ports.len() + services.len());
+    observations.extend(ports.into_iter().map(ScanObservation::Port));
+    observations.extend(services.into_iter().map(ScanObservation::Service));
+    Ok(ScanOutcome::Completed(observations))
 }
 
 #[cfg(test)]
@@ -120,6 +123,9 @@ mod tests {
             panic!("port-only scan must complete");
         };
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].port, 443);
+        let ScanObservation::Port(port) = &results[0] else {
+            panic!("port-only plan must produce a port observation");
+        };
+        assert_eq!(port.port, 443);
     }
 }

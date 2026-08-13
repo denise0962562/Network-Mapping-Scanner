@@ -99,6 +99,12 @@ pub(crate) struct HeartbeatClient {
     scan_capabilities: ScanCapabilities,
 }
 
+pub(crate) struct HeartbeatEndpoints {
+    pub(crate) heartbeat: String,
+    pub(crate) failure: String,
+    pub(crate) cancelled: String,
+}
+
 impl HeartbeatClient {
     pub(crate) async fn can_scan(&self, address_family: &str) -> bool {
         self.network_capabilities
@@ -108,9 +114,7 @@ impl HeartbeatClient {
     }
 
     pub(crate) fn new(
-        heartbeat_url: String,
-        failure_url: String,
-        cancelled_url: String,
+        endpoints: HeartbeatEndpoints,
         verify_tls: bool,
         runtime_token: String,
         scanner_id: Uuid,
@@ -123,9 +127,9 @@ impl HeartbeatClient {
             .build()?;
         Ok(Self {
             client,
-            heartbeat_url,
-            failure_url,
-            cancelled_url,
+            heartbeat_url: endpoints.heartbeat,
+            failure_url: endpoints.failure,
+            cancelled_url: endpoints.cancelled,
             runtime_token,
             scanner_id,
             network_capabilities,
