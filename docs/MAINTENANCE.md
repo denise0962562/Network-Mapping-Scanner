@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-`scanner-rs` 是一个网络扫描编排器。支持扫描器注册认证、从 HTTP API 获取扫描目标、调用外部扫描器（masscan）执行端口扫描与 banner 抓取、解析输出并以 JSON 格式通过 HTTPS POST 上报结果。
+`scanner-rs` 是一个网络扫描编排器。支持扫描器注册认证、从 HTTP API 获取扫描目标、调用 masscan 发现开放端口、调用 zgrab2 执行应用层服务识别，并以 JSON 格式通过 HTTPS POST 上报结果。
 
 - **语言**：Rust（edition 2024）
 - **运行时**：tokio 异步
@@ -16,7 +16,8 @@
 src/
 ├── main.rs          # 入口、CLI、编排主循环、身份注册
 ├── config.rs        # TOML 配置加载/验证/回写（注释保留）
-├── scanner.rs       # 扫描器调度 + Masscan 实现
+├── scanner.rs       # 两阶段扫描调度 + masscan 端口发现
+├── service_detection.rs # zgrab2 模块调度、进程控制与 JSON 归一化
 ├── cache.rs         # 按任务隔离的内存结果缓存
 ├── upload.rs        # 结果上报：HTTPS POST JSON
 ├── register.rs      # 扫描器注册：POST /api/scanner/register
@@ -66,26 +67,45 @@ impl LoadedConfig {
 ```rust
 pub(crate) async fn run_scan(
     scanner_path: &str,
+    service_detection: &ServiceDetectionConfig,
     target: &TargetParams,
-) -> Result<Vec<ScanResult>, ScannerError>
+    cancel_requested: &AtomicBool,
+) -> Result<ScanOutcome, ScannerError>
 ```
 
-当前分发至 `run_masscan()`。扩展新扫描器时在此函数中增加分发逻辑。
+先运行 `run_masscan()` 获取开放端口；服务识别启用时，再把 TCP 端点交给 zgrab2。
 
 Masscan 输出行解析：
 - `Discovered <port> <protocol> <ip>` → `ScanResult { service: None, banner: None }`
-- `Banner <port> <protocol> <ip> <service> <banner>` → `ScanResult { service: Some, banner: Some }`
+- `open <protocol> <port> <ip> <timestamp>` → 标准 masscan list 格式
 - `ERROR` → 返回错误
 - `COMPLETE` / `DONE_OK` → 正常结束
 
 masscan 只有在进程退出码为 0 时才算执行成功。非零退出码会连同最多 4096 个字符的 stderr 作为扫描错误上报，任务不会上传空结果并误标为成功；退出码为 0 且没有发现开放端口仍属于合法的空结果。
+
+masscan 始终使用机器可读的 list 输出，不启用 `--banner`。旧的 `Discovered` 行仍保留解析兼容，
+但不再接收 masscan 的服务识别结果。
+
+#### `service_detection.rs`
+
+zgrab2 使用 `multiple` 模式。扫描器把每个开放 TCP 端点编码成 `IP,,TAG,PORT`。
+`TAG` 根据端口映射为 `ssh`、`http`、`https`、`tls`、`smtp`、`mysql`、`postgres`
+等模块；未映射端口使用 `banner`。
+
+- `status=success`：写入规范化 `service`，并提取可用的短 banner；
+- 超时、拒绝或协议错误：`service` 保持为空，结构化状态写入 `other`；
+- 详细数据超过 `max_result_bytes`：只保留状态、错误、原大小和 `truncated=true`。
+
+若 `required=false`，zgrab2 进程启动失败或非零退出只记录警告，masscan 端口结果照常上报；
+若 `required=true`，此类错误使任务按现有可重试失败流程处理。任务取消会终止当前 masscan 或
+zgrab2 子进程。
 
 #### `cache.rs`
 
 ```rust
 impl CacheManager {
     pub(crate) fn begin_task(&mut self, task_id: Uuid) -> Result
-    pub(crate) fn insert(&mut self, ip, port, service, protocol, banner) -> Result
+    pub(crate) fn insert(&mut self, ip, port, service, protocol, banner, other) -> Result
     pub(crate) fn upload_payload(&self, scanner_id: Uuid) -> Result<ScannerResultUpload, ScannerError>
     pub(crate) fn clear(&mut self)
 }
@@ -95,7 +115,8 @@ impl CacheManager {
 
 去重规则：
 - 同一 IP + port + protocol 的重复 `Discovered` 行（service=None）→ 跳过
-- `Banner` 行（service=Some）→ 查找首个 placeholder（name=None）填充，否则追加
+- zgrab2 成功结果（service=Some）→ 查找首个 placeholder（name=None）填充，否则追加
+- zgrab2 失败或 generic banner（service=None、other/banner 非空）→ 丰富 placeholder，但不虚构服务名
 
 缓存始终绑定一个 `task_id`。存在待上传任务时拒绝开始新任务，避免多个任务的数据混合。`upload_payload()` 将缓存转换为服务端要求的 `ScannerResultUpload`。
 
@@ -276,6 +297,16 @@ scanner_id = "019eb66c-6ac6-7530-b73f-454037448fa2"
 # Runtime token — written automatically after successful one-time registration
 runtime_token = ""
 
+[service_detection]
+enabled = true
+required = false
+zgrab_path = "zgrab2"
+senders = 200
+server_rate_limit = 20
+connect_timeout_seconds = 5
+target_timeout_seconds = 15
+max_result_bytes = 65536
+
 [network]
 ipv4_enabled = true
 ipv6_enabled = true
@@ -301,6 +332,14 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.scanner_path` | string | `"./a"` | 扫描器二进制路径；也可填写能从 `PATH` 解析的命令名 |
 | `scanner.scanner_id` | string | 自动生成 | UUIDv7，首次启动自动生成 |
 | `scanner.runtime_token` | string | `""` | 注册成功后由程序自动写入的运行令牌 |
+| `service_detection.enabled` | bool | `false` | 是否在端口发现后运行 zgrab2 |
+| `service_detection.required` | bool | `false` | zgrab2 整体失败时是否使任务失败 |
+| `service_detection.zgrab_path` | string | `"zgrab2"` | zgrab2 二进制路径或 PATH 中的命令名 |
+| `service_detection.senders` | int | `200` | zgrab2 并发发送协程数，范围 1-10000 |
+| `service_detection.server_rate_limit` | int | `20` | 单个目标 IP 每秒连接上限，范围 1-10000 |
+| `service_detection.connect_timeout_seconds` | int | `5` | 建连超时，范围 1-60 秒 |
+| `service_detection.target_timeout_seconds` | int | `15` | 单目标探测总超时，不小于建连超时且不超过 300 秒 |
+| `service_detection.max_result_bytes` | int | `65536` | 单服务结构化详情上限，范围 1024-1048576 字节 |
 | `network.ipv4_enabled` | bool | `true` | 是否自动探测并接受 IPv4 任务 |
 | `network.ipv6_enabled` | bool | `true` | 是否自动探测并接受 IPv6 任务 |
 | `network.ipv4_probe_url` | string | ipify IPv4 API | IPv4 IP 回显接口 |
@@ -318,11 +357,12 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.rate` | 1-2147483647 |
 | `scanner.source_port` | 1-65535 |
 | `scanner.scanner_path` | 普通扫描启动时必须能解析到存在且可执行的普通文件 |
+| `service_detection.zgrab_path` | enabled=true 时必须能解析到存在且可执行的普通文件 |
 | `network.probe_interval_seconds` | 30-86400 |
 | `network.probe_timeout_seconds` | 1-60 |
 | `upload.endpoint` | 非空 |
 
-扫描器在启动扫描循环前检查 `scanner_path`。显式的相对路径或绝对路径会直接检查；不含目录的命令名（例如 `masscan`）会从 `PATH` 查找。注册、`--health-check` 和 `--get-system-info` 模式不执行扫描，因此跳过该检查。
+扫描器在启动扫描循环前检查 `scanner_path`，启用服务识别时还会检查 `zgrab_path`。显式的相对路径或绝对路径会直接检查；不含目录的命令名会从 `PATH` 查找。注册、`--health-check` 和 `--get-system-info` 模式不执行扫描，因此跳过该检查。
 
 ### 配置回写（注释保留）
 
@@ -381,12 +421,16 @@ scanner-rs
 │  (c_server) │ ──────── JSON ────────────► │              │
 └─────────────┘                             │  ① fetch     │
                                             │  ② deserialize│
-┌─────────────┐                             │  ③ run_scan  │
+┌─────────────┐                             │  ③ masscan   │
 │   masscan   │ ◄── spawn ───────────────── │              │
-│   binary    │ ──── stdout ──────────────► │  ④ parse     │
-└─────────────┘                             │  ⑤ cache     │
-                                            │  ⑥ payload   │
-┌─────────────┐ POST /api/scanner/result   │  ⑦ upload    │
+│   binary    │ ─── open ports ───────────► │  ④ dispatch  │
+└─────────────┘                             │              │
+┌─────────────┐                             │  ⑤ zgrab2    │
+│   zgrab2    │ ◄── tagged targets ──────── │              │
+│   binary    │ ─── JSON results ─────────► │  ⑥ normalize │
+└─────────────┘                             │  ⑦ cache     │
+                                            │  ⑧ payload   │
+┌─────────────┐ POST /api/scanner/result   │  ⑨ upload    │
 │  upload API │ ◄──── JSON ─────────────── │              │
 │  (endpoint) │                             │              │
 └─────────────┘                             └──────────────┘
@@ -404,11 +448,11 @@ scanner-rs
 2. **sysinfo** — 采集并打印系统信息
 3. **fetch** — 使用运行令牌领取真实任务；404 时等待并继续轮询
 4. **deserialize** — 解析 task_id、task_target 和 task_port
-5. **run_scan** — 启动 masscan 子进程，传递目标参数
-6. **parse** — 逐行解析 masscan stdout（Discovered / Banner / ERROR / COMPLETE / DONE_OK）
-7. **cache** — 按 IP → port → service 三层去重聚合到 `CacheManager`
-8. **payload** — 生成包含 scanner_id、task_id 和 results 的载荷
-9. **upload** — 携带运行令牌 HTTPS POST 到 upload endpoint
+5. **port discovery** — masscan 仅执行 SYN/端口发现，输出 list 格式
+6. **service dispatch** — 按开放端口选择 zgrab2 module tag，仅处理 TCP
+7. **service detection** — zgrab2 受控并发执行应用层握手，逐行输出 JSON
+8. **normalize/cache** — 保留开放端口事实并合并服务、banner、状态和结构化详情
+9. **payload/upload** — 生成任务载荷并携带运行令牌 HTTPS POST 到 upload endpoint
 
 ### 上传 JSON 格式
 
@@ -422,8 +466,17 @@ scanner-rs
       "port": 80,
       "protocol": "tcp",
       "service": "http",
-      "banner": "Apache/2.4.29",
-      "other": null
+      "banner": "HTTP/1.1 200 OK",
+      "other": {
+        "source": "zgrab2",
+        "module": "http",
+        "data": {
+          "status": "success",
+          "protocol": "http",
+          "port": 80,
+          "result": {}
+        }
+      }
     }
   ]
 }
@@ -436,7 +489,8 @@ scanner-rs
 ### 前置依赖
 
 - Rust 工具链 ≥ 1.85（edition 2024）
-- masscan 二进制（或等效扫描器）
+- masscan 二进制
+- zgrab2 二进制（仅 `service_detection.enabled=true` 时需要）
 
 ### 构建
 
@@ -475,7 +529,7 @@ cargo test
 
 ### 添加新扫描器（如 nuclei）
 
-改动仅限 `scanner.rs`：
+端口发现扩展位于 `scanner.rs`，应用层探测扩展位于 `service_detection.rs`：
 
 1. 添加 `run_nuclei(path: &str, target: &TargetParams) -> Result<Vec<ScanResult>, ScannerError>`
 2. 在 `run_scan()` 中按路径/类型分发

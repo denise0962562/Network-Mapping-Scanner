@@ -1,5 +1,6 @@
 use crate::error::ScannerError;
-use crate::types::{ScanResult, TargetParams};
+use crate::service_detection::{ServiceDetectionOutcome, run_service_detection};
+use crate::types::{ScanResult, ServiceDetectionConfig, TargetParams};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -106,11 +107,37 @@ fn is_executable(path: &Path) -> bool {
 /// nuclei binary for vulnerability scanning.
 pub(crate) async fn run_scan(
     scanner_path: &str,
+    service_detection: &ServiceDetectionConfig,
     target: &TargetParams,
     cancel_requested: &AtomicBool,
 ) -> Result<ScanOutcome, ScannerError> {
-    // Future: match on scanner type / path to dispatch
-    run_masscan(scanner_path, target, cancel_requested).await
+    let mut open_ports = match run_masscan(scanner_path, target, cancel_requested).await? {
+        ScanOutcome::Completed(results) => results,
+        ScanOutcome::Cancelled => return Ok(ScanOutcome::Cancelled),
+    };
+    if !service_detection.enabled || open_ports.is_empty() {
+        return Ok(ScanOutcome::Completed(open_ports));
+    }
+
+    match run_service_detection(
+        service_detection,
+        &open_ports,
+        &target.address_family,
+        cancel_requested,
+    )
+    .await
+    {
+        Ok(ServiceDetectionOutcome::Completed(mut enrichment)) => {
+            open_ports.append(&mut enrichment);
+        }
+        Ok(ServiceDetectionOutcome::Cancelled) => return Ok(ScanOutcome::Cancelled),
+        Err(error) if service_detection.required => return Err(error),
+        Err(error) => {
+            tracing::warn!(%error, "service detection failed; preserving masscan port results");
+        }
+    }
+
+    Ok(ScanOutcome::Completed(open_ports))
 }
 
 // ---- Masscan implementation ---------------------------------------------
@@ -126,7 +153,7 @@ async fn run_masscan(
         ports = %target.port,
         rate = target.rate,
         source_port = target.source_port,
-        banner_scan = true,
+        banner_scan = false,
         "spawning masscan process"
     );
     let started_at = Instant::now();
@@ -134,8 +161,9 @@ async fn run_masscan(
         .arg(&target.ip)
         .args(["-p", &target.port])
         .args(["--rate", &target.rate.to_string()])
-        .arg("--banner")
         .args(["--source-port", &target.source_port.to_string()])
+        .args(["--output-format", "list"])
+        .args(["--output-filename", "-"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -156,7 +184,6 @@ async fn run_masscan(
     let mut lines = BufReader::new(stdout).lines();
     let mut results = Vec::new();
     let mut discovered_count = 0usize;
-    let mut banner_count = 0usize;
     let mut unknown_count = 0usize;
 
     loop {
@@ -184,10 +211,6 @@ async fn run_masscan(
         match MasscanLine::parse(trimmed) {
             MasscanLine::Discovered(r) => {
                 discovered_count += 1;
-                results.push(r);
-            }
-            MasscanLine::Banner(r) => {
-                banner_count += 1;
                 results.push(r);
             }
             MasscanLine::Error => {
@@ -223,7 +246,6 @@ async fn run_masscan(
         success = status.success(),
         elapsed_ms = started_at.elapsed().as_millis(),
         discovered_count,
-        banner_count,
         unknown_count,
         result_count = results.len(),
         "masscan process finished"
@@ -304,7 +326,6 @@ fn scanner_failure_detail(stdout_error: &str, stderr_output: &str) -> String {
 
 enum MasscanLine {
     Discovered(ScanResult),
-    Banner(ScanResult),
     Complete,
     DoneOk,
     Error,
@@ -313,11 +334,8 @@ enum MasscanLine {
 
 impl MasscanLine {
     fn parse(line: &str) -> Self {
-        if line.starts_with("Discovered") {
+        if line.starts_with("open ") || line.starts_with("Discovered") {
             return parse_discovered(line).map_or(Self::Unknown, Self::Discovered);
-        }
-        if line.starts_with("Banner") {
-            return parse_banner(line).map_or(Self::Unknown, Self::Banner);
         }
         match line {
             s if s.starts_with("COMPLETE") => Self::Complete,
@@ -329,10 +347,19 @@ impl MasscanLine {
 }
 
 fn parse_discovered(line: &str) -> Option<ScanResult> {
-    let mut parts = line.split_whitespace().skip(1);
-    let port: u16 = parts.next()?.parse().ok()?;
-    let protocol = parts.next()?.to_owned();
-    let ip = parts.next()?.to_owned();
+    let (port, protocol, ip) = if line.starts_with("open ") {
+        let mut parts = line.split_whitespace().skip(1);
+        let protocol = parts.next()?.to_owned();
+        let port = parts.next()?.parse().ok()?;
+        let ip = parts.next()?.to_owned();
+        (port, protocol, ip)
+    } else {
+        let mut parts = line.split_whitespace().skip(1);
+        let port = parts.next()?.parse().ok()?;
+        let protocol = parts.next()?.to_owned();
+        let ip = parts.next()?.to_owned();
+        (port, protocol, ip)
+    };
 
     Some(ScanResult {
         ip,
@@ -340,23 +367,7 @@ fn parse_discovered(line: &str) -> Option<ScanResult> {
         protocol,
         service: None,
         banner: None,
-    })
-}
-
-fn parse_banner(line: &str) -> Option<ScanResult> {
-    let mut parts = line.splitn(6, char::is_whitespace).skip(1);
-    let port: u16 = parts.next()?.parse().ok()?;
-    let protocol = parts.next()?.to_owned();
-    let ip = parts.next()?.to_owned();
-    let service = parts.next()?.to_owned();
-    let banner = parts.next().map(|s| s.trim().to_owned());
-
-    Some(ScanResult {
-        ip,
-        port,
-        protocol,
-        service: Some(service),
-        banner,
+        other: None,
     })
 }
 
@@ -390,6 +401,7 @@ mod tests {
             port: "80".into(),
             rate: 100,
             source_port: 61_000,
+            address_family: "ipv4".into(),
         };
         let cancel_requested = AtomicBool::new(false);
         let result = run_masscan(path.to_str().unwrap(), &target, &cancel_requested).await;
@@ -459,17 +471,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_banner() {
-        let r = parse_banner("Banner 22 tcp 192.168.1.1 SSH OpenSSH_8.9p1").unwrap();
+    fn test_parse_masscan_list_output() {
+        let r = parse_discovered("open tcp 22 192.168.1.1 1720000000").unwrap();
         assert_eq!(r.port, 22);
-        assert_eq!(r.service.as_deref(), Some("SSH"));
-        assert!(r.banner.unwrap().contains("OpenSSH"));
-    }
-
-    #[test]
-    fn test_parse_banner_no_trailing_text() {
-        let r = parse_banner("Banner 443 tcp 10.0.0.1 https").unwrap();
-        assert_eq!(r.service.as_deref(), Some("https"));
-        assert!(r.banner.is_none());
+        assert_eq!(r.protocol, "tcp");
+        assert_eq!(r.ip, "192.168.1.1");
+        assert!(r.service.is_none());
     }
 }

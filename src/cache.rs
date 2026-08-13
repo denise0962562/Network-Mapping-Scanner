@@ -13,14 +13,15 @@ impl CacheManager {
         service: Option<&str>,
         protocol: &str,
         banner: Option<&str>,
+        other: Option<&serde_json::Value>,
     ) -> Result<(), ScannerError> {
         match self.ip_table.entry(ip.to_owned()) {
             Entry::Occupied(mut e) => {
-                add_or_fill(e.get_mut(), port, service, protocol, banner)?;
+                add_or_fill(e.get_mut(), port, service, protocol, banner, other)?;
             }
             Entry::Vacant(e) => {
                 let mut entry = IpEntry { ports: Vec::new() };
-                add_or_fill(&mut entry, port, service, protocol, banner)?;
+                add_or_fill(&mut entry, port, service, protocol, banner, other)?;
                 e.insert(entry);
             }
         }
@@ -60,7 +61,7 @@ impl CacheManager {
                         protocol: Some(port_info.protocol.clone()),
                         service: svc.name.clone(),
                         banner: svc.banner.clone(),
-                        other: None,
+                        other: svc.other.clone(),
                     });
                 }
             }
@@ -82,16 +83,17 @@ fn add_or_fill(
     service: Option<&str>,
     protocol: &str,
     banner: Option<&str>,
+    other: Option<&serde_json::Value>,
 ) -> Result<(), ScannerError> {
     if let Some(pi) = entry
         .ports
         .iter_mut()
         .find(|pi| pi.port == port && pi.protocol == protocol)
     {
-        if service.is_none() && banner.is_none() {
+        if service.is_none() && banner.is_none() && other.is_none() {
             return Ok(());
         }
-        return upsert_service(pi, service, banner);
+        return upsert_service(pi, service, banner, other);
     }
 
     let mut pi = PortInfo {
@@ -99,7 +101,7 @@ fn add_or_fill(
         protocol: protocol.to_owned(),
         services: Vec::new(),
     };
-    upsert_service(&mut pi, service, banner)?;
+    upsert_service(&mut pi, service, banner, other)?;
     entry.ports.push(pi);
     Ok(())
 }
@@ -108,7 +110,23 @@ fn upsert_service(
     pi: &mut PortInfo,
     service: Option<&str>,
     banner: Option<&str>,
+    other: Option<&serde_json::Value>,
 ) -> Result<(), ScannerError> {
+    if let Some(name) = service
+        && let Some(existing) = pi
+            .services
+            .iter_mut()
+            .find(|item| item.name.as_deref() == Some(name))
+    {
+        if existing.banner.is_none() {
+            existing.banner = banner.map(str::to_owned);
+        }
+        if existing.other.is_none() {
+            existing.other = other.cloned();
+        }
+        return Ok(());
+    }
+
     if let Some(name) = service
         && let Some(empty) = pi.services.iter_mut().find(|s| s.is_placeholder())
     {
@@ -116,12 +134,28 @@ fn upsert_service(
         if banner.is_some() && empty.banner.is_none() {
             empty.banner = banner.map(str::to_owned);
         }
+        if other.is_some() && empty.other.is_none() {
+            empty.other = other.cloned();
+        }
+        return Ok(());
+    }
+
+    if service.is_none()
+        && let Some(empty) = pi.services.iter_mut().find(|s| s.is_placeholder())
+    {
+        if empty.banner.is_none() {
+            empty.banner = banner.map(str::to_owned);
+        }
+        if empty.other.is_none() {
+            empty.other = other.cloned();
+        }
         return Ok(());
     }
 
     pi.services.push(ServiceInfo {
         name: service.map(str::to_owned),
         banner: banner.map(str::to_owned),
+        other: other.cloned(),
     });
     Ok(())
 }
@@ -142,7 +176,14 @@ mod tests {
         let mut cache = CacheManager::default();
         cache.begin_task(task_id).expect("task must start");
         cache
-            .insert("192.0.2.1", 443, Some("https"), "tcp", Some("banner"))
+            .insert(
+                "192.0.2.1",
+                443,
+                Some("https"),
+                "tcp",
+                Some("banner"),
+                Some(&serde_json::json!({"source": "zgrab2"})),
+            )
             .expect("result must be cached");
 
         let payload = cache
@@ -158,6 +199,7 @@ mod tests {
         assert_eq!(json["scanner_id"], scanner_id.to_string());
         assert_eq!(json["task_id"], task_id.to_string());
         assert_eq!(json["results"][0]["ip"], "192.0.2.1");
+        assert_eq!(json["results"][0]["other"]["source"], "zgrab2");
         assert!(json["results"][0].get("scanner_name").is_none());
         assert!(json["results"][0].get("scan_time").is_none());
     }

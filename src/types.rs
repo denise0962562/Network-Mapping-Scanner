@@ -8,6 +8,7 @@ use uuid::Uuid;
 pub(crate) struct ServiceInfo {
     pub(crate) name: Option<String>,
     pub(crate) banner: Option<String>,
+    pub(crate) other: Option<serde_json::Value>,
 }
 
 impl ServiceInfo {
@@ -54,6 +55,7 @@ pub(crate) struct ScanResult {
     pub(crate) protocol: String,
     pub(crate) service: Option<String>,
     pub(crate) banner: Option<String>,
+    pub(crate) other: Option<serde_json::Value>,
 }
 
 /// Task assigned by the server.
@@ -77,6 +79,7 @@ pub(crate) struct TargetParams {
     pub(crate) port: String,
     pub(crate) rate: i32,
     pub(crate) source_port: i32,
+    pub(crate) address_family: String,
 }
 
 // ---- Upload payload -----------------------------------------------------
@@ -106,6 +109,36 @@ pub(crate) struct AppConfig {
     pub(crate) upload: UploadConfig,
     #[serde(default)]
     pub(crate) network: NetworkConfig,
+    #[serde(default)]
+    pub(crate) service_detection: ServiceDetectionConfig,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct ServiceDetectionConfig {
+    pub(crate) enabled: bool,
+    pub(crate) required: bool,
+    pub(crate) zgrab_path: String,
+    pub(crate) senders: u32,
+    pub(crate) server_rate_limit: u32,
+    pub(crate) connect_timeout_seconds: u64,
+    pub(crate) target_timeout_seconds: u64,
+    pub(crate) max_result_bytes: usize,
+}
+
+impl Default for ServiceDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            required: false,
+            zgrab_path: "zgrab2".into(),
+            senders: 200,
+            server_rate_limit: 20,
+            connect_timeout_seconds: 5,
+            target_timeout_seconds: 15,
+            max_result_bytes: 65_536,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

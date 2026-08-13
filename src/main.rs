@@ -8,6 +8,7 @@ mod logging;
 mod network;
 mod register;
 mod scanner;
+mod service_detection;
 mod sysinfo;
 mod types;
 mod upload;
@@ -20,6 +21,7 @@ use crate::http_client::{FetchTaskOutcome, fetch_task};
 use crate::logging::{LogLevel, init_logging};
 use crate::network::{NetworkDetector, SharedNetworkCapabilities};
 use crate::scanner::{ScanOutcome, run_scan, validate_scanner_binary};
+use crate::service_detection::validate_zgrab_binary;
 use crate::sysinfo::SystemInfo;
 use crate::types::{CacheManager, TargetParams};
 use crate::upload::Uploader;
@@ -159,6 +161,9 @@ async fn run() -> Result<(), ScannerError> {
         runtime_token_configured = !cfg.scanner.runtime_token.is_empty(),
         upload_endpoint = %cfg.upload.endpoint,
         heartbeat_interval_seconds = cfg.scanner.heartbeat_interval_seconds,
+        service_detection_enabled = cfg.service_detection.enabled,
+        zgrab_path = %cfg.service_detection.zgrab_path,
+        zgrab_senders = cfg.service_detection.senders,
         "effective scanner configuration"
     );
 
@@ -178,6 +183,18 @@ async fn run() -> Result<(), ScannerError> {
         }
     );
     println!("upload.endpoint    = {}", cfg.upload.endpoint);
+    println!(
+        "service detection  = {}",
+        if cfg.service_detection.enabled {
+            "zgrab2"
+        } else {
+            "disabled"
+        }
+    );
+    if cfg.service_detection.enabled {
+        println!("zgrab.path         = {}", cfg.service_detection.zgrab_path);
+        println!("zgrab.senders      = {}", cfg.service_detection.senders);
+    }
     println!(
         "heartbeat.interval = {}s",
         cfg.scanner.heartbeat_interval_seconds
@@ -225,6 +242,9 @@ async fn run() -> Result<(), ScannerError> {
     }
 
     validate_scanner_binary(&cfg.scanner.scanner_path)?;
+    if cfg.service_detection.enabled {
+        validate_zgrab_binary(&cfg.service_detection.zgrab_path)?;
+    }
 
     println!("starting...");
 
@@ -276,6 +296,7 @@ async fn run() -> Result<(), ScannerError> {
                 scanner_id,
                 rate: cfg.scanner.rate as i32,
                 source_port: cfg.scanner.source_port,
+                service_detection: &cfg.service_detection,
             },
             &uploader,
             &heartbeat_client,
@@ -425,6 +446,7 @@ struct ScanLoopConfig<'a> {
     scanner_id: Uuid,
     rate: i32,
     source_port: i32,
+    service_detection: &'a crate::types::ServiceDetectionConfig,
 }
 
 async fn scan_loop(
@@ -550,6 +572,7 @@ async fn scan_loop(
             port: assigned_task.task_port.clone(),
             rate: config.rate,
             source_port: config.source_port,
+            address_family: assigned_task.address_family.clone(),
         };
 
         tracing::info!(
@@ -561,7 +584,14 @@ async fn scan_loop(
         );
 
         let cancel_flag = active_task.cancellation_flag();
-        let results = match run_scan(config.scanner_path, &target, &cancel_flag).await {
+        let results = match run_scan(
+            config.scanner_path,
+            config.service_detection,
+            &target,
+            &cancel_flag,
+        )
+        .await
+        {
             Ok(ScanOutcome::Completed(results)) => results,
             Ok(ScanOutcome::Cancelled) => {
                 match heartbeat_client
@@ -642,6 +672,7 @@ async fn scan_loop(
                 r.service.as_deref(),
                 &r.protocol,
                 r.banner.as_deref(),
+                r.other.as_ref(),
             ) {
                 log_event!(
                     LogLevel::Error,
