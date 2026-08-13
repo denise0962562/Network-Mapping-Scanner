@@ -101,6 +101,23 @@ impl ScanPlan {
                 "scan plan must start with exactly one port_discovery stage and contain at most one service_detection stage".into(),
             ));
         }
+        match self.profile.as_str() {
+            "port_only" if self.stages.len() != 1 => {
+                return Err(ScannerError::Scan(
+                    "port_only profile may contain only port_discovery".into(),
+                ));
+            }
+            "service_inventory"
+                if self.stages.len() != 2
+                    || self.stages[1].kind != ScanStageKind::ServiceDetection
+                    || !self.stages[1].required =>
+            {
+                return Err(ScannerError::Scan(
+                    "service_inventory profile requires port_discovery followed by required service_detection".into(),
+                ));
+            }
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -129,6 +146,19 @@ mod tests {
         };
         assert!(plan.validate().is_err());
         plan.version = 1;
+        assert!(plan.validate().is_err());
+
+        plan.profile = "port_only".into();
+        plan.stages = vec![
+            ScanStageSpec {
+                kind: ScanStageKind::PortDiscovery,
+                required: true,
+            },
+            ScanStageSpec {
+                kind: ScanStageKind::ServiceDetection,
+                required: false,
+            },
+        ];
         assert!(plan.validate().is_err());
     }
 
