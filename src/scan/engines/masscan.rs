@@ -1,6 +1,5 @@
 use crate::error::ScannerError;
-use crate::service_detection::{ServiceDetectionOutcome, run_service_detection};
-use crate::types::{ScanResult, ServiceDetectionConfig, TargetParams};
+use crate::types::{ScanResult, TargetParams};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -11,7 +10,7 @@ use tokio::time::{Duration, sleep};
 
 const MAX_SCANNER_STDERR_CHARS: usize = 4096;
 
-pub(crate) enum ScanOutcome {
+pub(crate) enum EngineOutcome {
     Completed(Vec<ScanResult>),
     Cancelled,
 }
@@ -93,60 +92,11 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-// ---- Scanner abstraction ------------------------------------------------
-//
-// To add a new scanner (e.g. nuclei for vulnerability scanning):
-//   1. Add a new module under scanner/ (e.g. scanner/nuclei.rs)
-//   2. Implement a `run_xxx()` function following the same signature
-//   3. Dispatch here based on config or CLI flag
-
-/// Run a scan against `target` using the configured scanner binary.
-///
-/// Currently dispatches to masscan. The scanner type is determined by
-/// the binary path — pass a masscan binary for port scanning, or a
-/// nuclei binary for vulnerability scanning.
-pub(crate) async fn run_scan(
-    scanner_path: &str,
-    service_detection: &ServiceDetectionConfig,
-    target: &TargetParams,
-    cancel_requested: &AtomicBool,
-) -> Result<ScanOutcome, ScannerError> {
-    let mut open_ports = match run_masscan(scanner_path, target, cancel_requested).await? {
-        ScanOutcome::Completed(results) => results,
-        ScanOutcome::Cancelled => return Ok(ScanOutcome::Cancelled),
-    };
-    if !service_detection.enabled || open_ports.is_empty() {
-        return Ok(ScanOutcome::Completed(open_ports));
-    }
-
-    match run_service_detection(
-        service_detection,
-        &open_ports,
-        &target.address_family,
-        cancel_requested,
-    )
-    .await
-    {
-        Ok(ServiceDetectionOutcome::Completed(mut enrichment)) => {
-            open_ports.append(&mut enrichment);
-        }
-        Ok(ServiceDetectionOutcome::Cancelled) => return Ok(ScanOutcome::Cancelled),
-        Err(error) if service_detection.required => return Err(error),
-        Err(error) => {
-            tracing::warn!(%error, "service detection failed; preserving masscan port results");
-        }
-    }
-
-    Ok(ScanOutcome::Completed(open_ports))
-}
-
-// ---- Masscan implementation ---------------------------------------------
-
-async fn run_masscan(
+pub(crate) async fn run(
     path: &str,
     target: &TargetParams,
     cancel_requested: &AtomicBool,
-) -> Result<ScanOutcome, ScannerError> {
+) -> Result<EngineOutcome, ScannerError> {
     tracing::debug!(
         scanner_path = path,
         targets = %target.ip,
@@ -199,7 +149,7 @@ async fn run_masscan(
                 elapsed_ms = started_at.elapsed().as_millis(),
                 "masscan cancelled"
             );
-            return Ok(ScanOutcome::Cancelled);
+            return Ok(EngineOutcome::Cancelled);
         }
         let line = tokio::select! {
             line = lines.next_line() => line.map_err(|e| ScannerError::Scan(format!("read error: {e}")))?,
@@ -263,7 +213,7 @@ async fn run_masscan(
         )));
     }
 
-    Ok(ScanOutcome::Completed(results))
+    Ok(EngineOutcome::Completed(results))
 }
 
 async fn log_scanner_stderr(stderr: ChildStderr) -> String {
@@ -404,7 +354,7 @@ mod tests {
             address_family: "ipv4".into(),
         };
         let cancel_requested = AtomicBool::new(false);
-        let result = run_masscan(path.to_str().unwrap(), &target, &cancel_requested).await;
+        let result = run(path.to_str().unwrap(), &target, &cancel_requested).await;
         std::fs::remove_file(&path).unwrap();
 
         let error = match result {

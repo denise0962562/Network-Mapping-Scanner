@@ -14,12 +14,12 @@ use uuid::Uuid;
 const MAX_ZGRAB_STDERR_CHARS: usize = 4096;
 const MAX_BANNER_CHARS: usize = 1024;
 
-pub(crate) enum ServiceDetectionOutcome {
+pub(crate) enum EngineOutcome {
     Completed(Vec<ScanResult>),
     Cancelled,
 }
 
-pub(crate) fn validate_zgrab_binary(path: &str) -> Result<(), ScannerError> {
+pub(crate) fn validate_binary(path: &str) -> Result<(), ScannerError> {
     if path.trim().is_empty() {
         return Err(ScannerError::Config(
             "service_detection.zgrab_path must not be empty".into(),
@@ -85,16 +85,16 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-pub(crate) async fn run_service_detection(
+pub(crate) async fn run(
     config: &ServiceDetectionConfig,
     open_ports: &[ScanResult],
     address_family: &str,
     cancel_requested: &AtomicBool,
-) -> Result<ServiceDetectionOutcome, ScannerError> {
+) -> Result<EngineOutcome, ScannerError> {
     let input = build_zgrab_input(open_ports);
     if input.is_empty() {
         tracing::debug!("zgrab2 skipped; masscan found no TCP endpoints");
-        return Ok(ServiceDetectionOutcome::Completed(Vec::new()));
+        return Ok(EngineOutcome::Completed(Vec::new()));
     }
 
     let config_file = TempZgrabConfig::create(config).await?;
@@ -156,7 +156,7 @@ pub(crate) async fn run_service_detection(
             let _ = child.wait().await;
             input_handle.abort();
             let _ = finish_zgrab_stderr(stderr_handle).await;
-            return Ok(ServiceDetectionOutcome::Cancelled);
+            return Ok(EngineOutcome::Cancelled);
         }
 
         let line = tokio::select! {
@@ -203,7 +203,7 @@ pub(crate) async fn run_service_detection(
         )));
     }
 
-    Ok(ServiceDetectionOutcome::Completed(results))
+    Ok(EngineOutcome::Completed(results))
 }
 
 fn build_zgrab_input(open_ports: &[ScanResult]) -> String {
@@ -527,7 +527,7 @@ done
             zgrab_path: path.to_string_lossy().into_owned(),
             ..ServiceDetectionConfig::default()
         };
-        let outcome = run_service_detection(
+        let outcome = run(
             &config,
             &[
                 open_port("192.0.2.10", 22, "tcp"),
@@ -540,7 +540,7 @@ done
         .unwrap();
         std::fs::remove_file(&path).unwrap();
 
-        let ServiceDetectionOutcome::Completed(results) = outcome else {
+        let EngineOutcome::Completed(results) = outcome else {
             panic!("service detection must complete");
         };
         assert_eq!(results.len(), 2);

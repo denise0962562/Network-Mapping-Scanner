@@ -16,8 +16,11 @@
 src/
 ├── main.rs          # 入口、CLI、编排主循环、身份注册
 ├── config.rs        # TOML 配置加载/验证/回写（注释保留）
-├── scanner.rs       # 两阶段扫描调度 + masscan 端口发现
-├── service_detection.rs # zgrab2 模块调度、进程控制与 JSON 归一化
+├── scan/            # 扫描流水线、阶段编排与扫描引擎适配器
+│   ├── orchestrator.rs # 阶段顺序、取消传播和失败策略
+│   └── engines/
+│       ├── masscan.rs # masscan 端口发现、进程控制与输出解析
+│       └── zgrab2.rs  # zgrab2 服务识别、进程控制与 JSON 归一化
 ├── cache.rs         # 按任务隔离的内存结果缓存
 ├── upload.rs        # 结果上报：HTTPS POST JSON
 ├── register.rs      # 扫描器注册：POST /api/scanner/register
@@ -86,7 +89,7 @@ masscan 只有在进程退出码为 0 时才算执行成功。非零退出码会
 masscan 始终使用机器可读的 list 输出，不启用 `--banner`。旧的 `Discovered` 行仍保留解析兼容，
 但不再接收 masscan 的服务识别结果。
 
-#### `service_detection.rs`
+#### `scan/engines/zgrab2.rs`
 
 zgrab2 使用 `multiple` 模式。扫描器把每个开放 TCP 端点编码成 `IP,,TAG,PORT`。
 `TAG` 根据端口映射为 `ssh`、`http`、`https`、`tls`、`smtp`、`mysql`、`postgres`
@@ -529,7 +532,7 @@ cargo test
 
 ### 添加新扫描器（如 nuclei）
 
-端口发现扩展位于 `scanner.rs`，应用层探测扩展位于 `service_detection.rs`：
+扫描流程扩展位于 `scan/orchestrator.rs`，具体工具适配器位于 `scan/engines/`：
 
 1. 添加 `run_nuclei(path: &str, target: &TargetParams) -> Result<Vec<ScanResult>, ScannerError>`
 2. 在 `run_scan()` 中按路径/类型分发
