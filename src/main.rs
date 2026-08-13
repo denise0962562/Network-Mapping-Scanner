@@ -5,6 +5,7 @@ mod health;
 mod heartbeat;
 mod http_client;
 mod logging;
+mod network;
 mod register;
 mod scanner;
 mod sysinfo;
@@ -17,6 +18,7 @@ use crate::health::health_check;
 use crate::heartbeat::{ActiveTask, HeartbeatClient};
 use crate::http_client::{FetchTaskOutcome, fetch_task};
 use crate::logging::{LogLevel, init_logging};
+use crate::network::{NetworkDetector, SharedNetworkCapabilities};
 use crate::scanner::{ScanOutcome, run_scan, validate_scanner_binary};
 use crate::sysinfo::SystemInfo;
 use crate::types::{CacheManager, TargetParams};
@@ -239,6 +241,9 @@ async fn run() -> Result<(), ScannerError> {
         cfg.scanner.verify_tls,
         cfg.scanner.runtime_token.clone(),
     );
+    let network_detector = NetworkDetector::new(cfg.network.clone(), cfg.scanner.verify_tls)?;
+    let network_capabilities = SharedNetworkCapabilities::new(network_detector.detect().await);
+    let network_probe_handle = network_detector.spawn(network_capabilities.clone());
     let heartbeat_client = HeartbeatClient::new(
         cfg.scanner.heartbeat_url(),
         cfg.scanner.task_failure_url(),
@@ -246,6 +251,7 @@ async fn run() -> Result<(), ScannerError> {
         cfg.scanner.verify_tls,
         cfg.scanner.runtime_token.clone(),
         scanner_id,
+        network_capabilities,
     )?;
     let active_task = ActiveTask::default();
     let heartbeat_handle = spawn_heartbeat(
@@ -289,6 +295,7 @@ async fn run() -> Result<(), ScannerError> {
         tracing::warn!("final heartbeat failed: {}", error);
     }
     heartbeat_handle.abort();
+    network_probe_handle.abort();
 
     log_event!(LogLevel::Info, "CLEANUP", "shutdown complete", "main");
     println!("shutdown complete");
@@ -510,6 +517,31 @@ async fn scan_loop(
                     continue;
                 }
             };
+        if !heartbeat_client
+            .can_scan(&assigned_task.address_family)
+            .await
+        {
+            let message = format!(
+                "{} network is no longer available on this scanner",
+                assigned_task.address_family
+            );
+            tracing::warn!(
+                task_id = %assigned_task.task_id,
+                address_family = %assigned_task.address_family,
+                "rejecting incompatible scan task"
+            );
+            if let Err(error) = heartbeat_client.send(None, false).await {
+                tracing::warn!(%error, "failed to refresh network capability before rejecting task");
+            }
+            if let Err(error) = heartbeat_client
+                .report_failure(assigned_task.task_id, &message)
+                .await
+            {
+                tracing::error!(%error, "failed to report incompatible task");
+                break;
+            }
+            continue;
+        }
         active_task.set(assigned_task.task_id).await;
         tracing::debug!(task_id = %assigned_task.task_id, "task marked active");
 

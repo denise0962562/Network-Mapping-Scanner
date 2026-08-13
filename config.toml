@@ -16,6 +16,15 @@ scanner_id = ""
 # Runtime token — written automatically after successful one-time registration
 runtime_token = ""
 
+[network]
+# 自动探测协议公网出口；可关闭某个地址族或替换为自建的 IP 回显 API。
+ipv4_enabled = true
+ipv6_enabled = true
+ipv4_probe_url = "https://api.ipify.org?format=json"
+ipv6_probe_url = "https://api6.ipify.org?format=json"
+probe_interval_seconds = 300
+probe_timeout_seconds = 5
+
 [upload]
 # Endpoint for scan result upload (HTTPS POST JSON)
 endpoint = "https://example.com/api/scanner/result"
