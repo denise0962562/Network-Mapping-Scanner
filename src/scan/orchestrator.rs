@@ -45,6 +45,11 @@ pub(crate) async fn run_scan(
                 ));
             }
             ScanStageKind::ServiceDetection => {
+                let required = if plan.profile == "legacy" {
+                    service_detection.required
+                } else {
+                    stage.required
+                };
                 match zgrab2::run(
                     service_detection,
                     &ports,
@@ -55,7 +60,7 @@ pub(crate) async fn run_scan(
                 {
                     Ok(zgrab2::EngineOutcome::Completed(enrichment)) => services = enrichment,
                     Ok(zgrab2::EngineOutcome::Cancelled) => return Ok(ScanOutcome::Cancelled),
-                    Err(error) if stage.required => return Err(error),
+                    Err(error) if required => return Err(error),
                     Err(error) => {
                         tracing::warn!(%error, "optional service detection stage failed; preserving port results");
                     }
@@ -127,5 +132,52 @@ mod tests {
             panic!("port-only plan must produce a port observation");
         };
         assert_eq!(port.port, 443);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_plan_preserves_local_required_failure_policy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "scanner-rs-legacy-required-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        std::fs::write(&path, "#!/bin/sh\nprintf 'open tcp 443 192.0.2.1 1\\n'\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = TargetParams {
+            ip: "192.0.2.1".into(),
+            port: "443".into(),
+            rate: 100,
+            source_port: 61_000,
+            address_family: "ipv4".into(),
+        };
+        let service = ServiceDetectionConfig {
+            enabled: true,
+            required: true,
+            zgrab_path: "/definitely/missing/zgrab2".into(),
+            ..ServiceDetectionConfig::default()
+        };
+        let plan: ScanPlan = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "profile": "legacy",
+            "stages": [
+                {"type": "port_discovery", "required": true},
+                {"type": "service_detection", "required": false}
+            ]
+        }))
+        .unwrap();
+
+        let result = run_scan(
+            path.to_str().unwrap(),
+            &service,
+            &plan,
+            &target,
+            &AtomicBool::new(false),
+        )
+        .await;
+        std::fs::remove_file(path).unwrap();
+        assert!(result.is_err());
     }
 }
