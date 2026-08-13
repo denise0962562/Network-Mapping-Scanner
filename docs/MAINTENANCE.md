@@ -127,7 +127,8 @@ impl CacheManager {
 缓存保存类型化的 `Port` 与 `Service` observations，并按类型、IP、端口、协议、服务名和来源
 生成稳定身份去重。每个任务在 `begin_task()` 时生成一次 `upload_id`，重试期间保持不变。
 `upload_batches()` 每 500 条生成一批；空任务也生成一个最终空批，只有最后一批设置
-`is_final=true`。
+`is_final=true`。缓存同时记录下一待确认批次，重试时跳过已收到成功响应的批次；若响应
+丢失，则用相同批身份重试当前批。
 
 #### `upload.rs`
 

@@ -17,6 +17,7 @@ impl CacheManager {
         }
         self.task_id = Some(task_id);
         self.upload_id = Some(Uuid::now_v7());
+        self.next_batch_index = 0;
         Ok(())
     }
 
@@ -53,7 +54,7 @@ impl CacheManager {
         })?;
 
         if self.observations.is_empty() {
-            return Ok(vec![ScannerResultBatchUpload {
+            let batch = ScannerResultBatchUpload {
                 protocol_version: RESULT_PROTOCOL_VERSION,
                 scanner_id,
                 task_id,
@@ -61,7 +62,12 @@ impl CacheManager {
                 batch_index: 0,
                 is_final: true,
                 observations: Vec::new(),
-            }]);
+            };
+            return Ok(if self.next_batch_index == 0 {
+                vec![batch]
+            } else {
+                Vec::new()
+            });
         }
 
         let chunk_count = self.observations.len().div_ceil(UPLOAD_BATCH_SIZE);
@@ -69,6 +75,7 @@ impl CacheManager {
             .observations
             .chunks(UPLOAD_BATCH_SIZE)
             .enumerate()
+            .skip(self.next_batch_index as usize)
             .map(|(index, observations)| ScannerResultBatchUpload {
                 protocol_version: RESULT_PROTOCOL_VERSION,
                 scanner_id,
@@ -80,6 +87,19 @@ impl CacheManager {
             })
             .collect();
         Ok(batches)
+    }
+
+    pub(crate) fn mark_batch_uploaded(&mut self, batch_index: u32) -> Result<(), ScannerError> {
+        if batch_index != self.next_batch_index {
+            return Err(ScannerError::Upload(format!(
+                "cannot acknowledge batch {batch_index}; expected {}",
+                self.next_batch_index
+            )));
+        }
+        self.next_batch_index = self.next_batch_index.checked_add(1).ok_or_else(|| {
+            ScannerError::Upload("uploaded batch index exceeded protocol limit".into())
+        })?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -172,5 +192,9 @@ mod tests {
         assert_eq!(batches[1].observations.len(), 1);
         assert!(batches[1].is_final);
         assert_eq!(batches[0].upload_id, batches[1].upload_id);
+        cache.mark_batch_uploaded(0).unwrap();
+        let remaining = cache.upload_batches(Uuid::now_v7()).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].batch_index, 1);
     }
 }

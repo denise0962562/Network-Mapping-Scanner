@@ -430,15 +430,18 @@ async fn flush(
     }
 
     let batches = cache.upload_batches(scanner_id)?;
-    tracing::debug!(
-        task_id = %batches[0].task_id,
-        upload_id = %batches[0].upload_id,
-        batch_count = batches.len(),
-        observation_count = cache.observations.len(),
-        "flushing cached scan observations"
-    );
+    if let Some(first) = batches.first() {
+        tracing::debug!(
+            task_id = %first.task_id,
+            upload_id = %first.upload_id,
+            pending_batch_count = batches.len(),
+            observation_count = cache.observations.len(),
+            "flushing cached scan observations"
+        );
+    }
     for batch in &batches {
         uploader.upload(batch).await?;
+        cache.mark_batch_uploaded(batch.batch_index)?;
     }
     log_event!(LogLevel::Info, "UPLOAD", "upload complete", "flush");
     cache.clear();

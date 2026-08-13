@@ -8,6 +8,7 @@ pub(crate) struct CacheManager {
     pub(crate) task_id: Option<Uuid>,
     pub(crate) upload_id: Option<Uuid>,
     pub(crate) observations: Vec<crate::scan::ScanObservation>,
+    pub(crate) next_batch_index: u32,
 }
 
 impl CacheManager {
@@ -15,6 +16,7 @@ impl CacheManager {
         self.task_id = None;
         self.upload_id = None;
         self.observations.clear();
+        self.next_batch_index = 0;
     }
 }
 
