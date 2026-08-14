@@ -190,13 +190,30 @@ impl HeartbeatClient {
         task_id: Uuid,
         error: &str,
     ) -> Result<(), ScannerError> {
+        self.report_task_failure(task_id, error, true).await
+    }
+
+    pub(crate) async fn report_terminal_failure(
+        &self,
+        task_id: Uuid,
+        error: &str,
+    ) -> Result<(), ScannerError> {
+        self.report_task_failure(task_id, error, false).await
+    }
+
+    async fn report_task_failure(
+        &self,
+        task_id: Uuid,
+        error: &str,
+        retryable: bool,
+    ) -> Result<(), ScannerError> {
         let payload = TaskFailurePayload {
             scanner_id: self.scanner_id,
             task_id,
             error,
-            retryable: true,
+            retryable,
         };
-        tracing::debug!(%task_id, "reporting scan task failure");
+        tracing::debug!(%task_id, retryable, "reporting scan task failure");
         let response = self
             .client
             .post(&self.failure_url)
