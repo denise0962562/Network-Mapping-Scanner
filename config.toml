@@ -5,8 +5,6 @@ c_server = "example.com"
 c_port = 443
 # Masscan packet rate
 rate = 10000000
-# Masscan source port
-source_port = 61000
 # Verify TLS certificates (set to false for self-signed certs)
 verify_tls = true
 # Path to masscan binary (port discovery only)

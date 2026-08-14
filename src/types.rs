@@ -63,7 +63,6 @@ pub(crate) struct TargetParams {
     pub(crate) ip: String,
     pub(crate) port: String,
     pub(crate) rate: i32,
-    pub(crate) source_port: i32,
     pub(crate) address_family: String,
 }
 
@@ -157,8 +156,6 @@ pub(crate) struct ScannerConfig {
     pub(crate) c_server: String,
     pub(crate) c_port: i64,
     pub(crate) rate: i64,
-    #[serde(default = "default_source_port")]
-    pub(crate) source_port: i32,
     #[serde(default)]
     pub(crate) verify_tls: bool,
     #[serde(default = "default_scanner_path")]
@@ -207,10 +204,6 @@ impl ScannerConfig {
     }
 }
 
-fn default_source_port() -> i32 {
-    61_000
-}
-
 fn default_heartbeat_interval() -> u64 {
     30
 }
@@ -242,7 +235,6 @@ mod tests {
             c_server: "scanner.example".into(),
             c_port: 443,
             rate: 1_000,
-            source_port: 61_000,
             verify_tls: true,
             scanner_path: "masscan".into(),
             scanner_id: "019c0000-0000-7000-8000-000000000001".into(),
@@ -271,6 +263,7 @@ mod tests {
                 "c_server": "scanner.example",
                 "c_port": 443,
                 "rate": 1000,
+                "source_port": 61000,
                 "scanner_id": "019c0000-0000-7000-8000-000000000001",
                 "token": "one-time-secret"
             }"#,

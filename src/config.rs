@@ -71,11 +71,6 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
             "must be between 1 and 2147483647",
         ),
         (
-            "scanner.source_port",
-            !(1..=65535).contains(&cfg.scanner.source_port),
-            "must be between 1 and 65535",
-        ),
-        (
             "upload.endpoint",
             cfg.upload.endpoint.is_empty(),
             "must not be empty",

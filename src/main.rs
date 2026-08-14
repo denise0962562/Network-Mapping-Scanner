@@ -155,7 +155,6 @@ async fn run() -> Result<(), ScannerError> {
         server = %cfg.scanner.c_server,
         server_port = cfg.scanner.c_port,
         scan_rate = cfg.scanner.rate,
-        source_port = cfg.scanner.source_port,
         verify_tls = cfg.scanner.verify_tls,
         scanner_path = %cfg.scanner.scanner_path,
         scanner_id = %cfg.scanner.scanner_id,
@@ -171,7 +170,6 @@ async fn run() -> Result<(), ScannerError> {
     println!("scanner.c_server   = {}", cfg.scanner.c_server);
     println!("scanner.c_port     = {}", cfg.scanner.c_port);
     println!("scanner.rate       = {}", cfg.scanner.rate);
-    println!("scanner.source_port = {}", cfg.scanner.source_port);
     println!("scanner.verify_tls = {}", cfg.scanner.verify_tls);
     println!("scanner.path       = {}", cfg.scanner.scanner_path);
     println!("scanner.id         = {}", cfg.scanner.scanner_id);
@@ -300,7 +298,6 @@ async fn run() -> Result<(), ScannerError> {
                 runtime_token: &cfg.scanner.runtime_token,
                 scanner_id,
                 rate: cfg.scanner.rate as i32,
-                source_port: cfg.scanner.source_port,
                 service_detection: &cfg.service_detection,
             },
             &uploader,
@@ -457,7 +454,6 @@ struct ScanLoopConfig<'a> {
     runtime_token: &'a str,
     scanner_id: Uuid,
     rate: i32,
-    source_port: i32,
     service_detection: &'a crate::types::ServiceDetectionConfig,
 }
 
@@ -474,7 +470,6 @@ async fn scan_loop(
         scanner_id = %config.scanner_id,
         task_url = %config.task_url,
         scan_rate = config.rate,
-        source_port = config.source_port,
         "scan loop started"
     );
 
@@ -598,7 +593,6 @@ async fn scan_loop(
             ip: assigned_task.task_target.join(","),
             port: assigned_task.task_port.clone(),
             rate: config.rate,
-            source_port: config.source_port,
             address_family: assigned_task.address_family.clone(),
         };
         let scan_plan = assigned_task
@@ -607,11 +601,10 @@ async fn scan_loop(
             .unwrap_or_else(|| ScanPlan::legacy(config.service_detection));
 
         tracing::info!(
-            "scanning {}:{} rate={} sport={}",
+            "scanning {}:{} rate={}",
             target.ip,
             target.port,
-            target.rate,
-            target.source_port
+            target.rate
         );
 
         let cancel_flag = active_task.cancellation_flag();
