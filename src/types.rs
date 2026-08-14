@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use uuid::Uuid;
 
 // ---- Cache data model ---------------------------------------------------
@@ -30,6 +31,26 @@ pub(crate) struct AssignedTask {
     pub(crate) address_family: String,
     #[serde(default)]
     pub(crate) scan_plan: Option<crate::scan::ScanPlan>,
+}
+
+impl AssignedTask {
+    pub(crate) fn validate_targets(&self) -> Result<(), String> {
+        for target in &self.task_target {
+            let address = target
+                .split_once('/')
+                .map_or(target.as_str(), |(address, _)| address)
+                .trim();
+            if address
+                .parse::<Ipv4Addr>()
+                .is_ok_and(|address| address.octets()[0] == 0)
+            {
+                return Err(format!(
+                    "task target {target} belongs to the non-routable 0.0.0.0/8 network"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_address_family() -> String {
@@ -257,6 +278,22 @@ mod tests {
         .expect("legacy scanner config must remain readable");
 
         assert!(config.runtime_token.is_empty());
+    }
+
+    #[test]
+    fn assigned_task_rejects_zero_network_targets() {
+        let mut task: AssignedTask = serde_json::from_str(
+            r#"{
+                "task_id": "019c0000-0000-7000-8000-000000000001",
+                "task_target": ["0.0.17.0/24"],
+                "task_port": "80"
+            }"#,
+        )
+        .unwrap();
+
+        assert!(task.validate_targets().is_err());
+        task.task_target = vec!["1.0.0.0/24".into()];
+        assert!(task.validate_targets().is_ok());
     }
 }
 

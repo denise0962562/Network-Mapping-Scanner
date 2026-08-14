@@ -551,6 +551,21 @@ async fn scan_loop(
                     continue;
                 }
             };
+        if let Err(message) = assigned_task.validate_targets() {
+            tracing::error!(
+                task_id = %assigned_task.task_id,
+                error = %message,
+                "rejecting unsafe scan target"
+            );
+            if let Err(error) = heartbeat_client
+                .report_terminal_failure(assigned_task.task_id, &message)
+                .await
+            {
+                tracing::error!(%error, "failed to report unsafe scan target");
+                break;
+            }
+            continue;
+        }
         if !heartbeat_client
             .can_scan(&assigned_task.address_family)
             .await
