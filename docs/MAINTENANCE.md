@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-`scanner-rs` 是一个网络扫描编排器。支持扫描器注册认证、从 HTTP API 获取扫描目标、调用外部扫描器（masscan）执行端口扫描与 banner 抓取、解析输出并以 JSON 格式通过 HTTPS POST 上报结果。
+`scanner-rs` 是一个网络扫描编排器。支持扫描器注册认证、从 HTTP API 获取扫描目标、调用 masscan 发现开放端口、调用 zgrab2 执行应用层服务识别，并以 JSON 格式通过 HTTPS POST 上报结果。
 
 - **语言**：Rust（edition 2024）
 - **运行时**：tokio 异步
@@ -16,7 +16,12 @@
 src/
 ├── main.rs          # 入口、CLI、编排主循环、身份注册
 ├── config.rs        # TOML 配置加载/验证/回写（注释保留）
-├── scanner.rs       # 扫描器调度 + Masscan 实现
+├── scan/            # 扫描流水线、阶段编排与扫描引擎适配器
+│   ├── orchestrator.rs # 阶段顺序、取消传播和失败策略
+│   ├── plan.rs       # 版本化扫描计划与阶段白名单校验
+│   └── engines/
+│       ├── masscan.rs # masscan 端口发现、进程控制与输出解析
+│       └── zgrab2.rs  # zgrab2 服务识别、进程控制与 JSON 归一化
 ├── cache.rs         # 按任务隔离的内存结果缓存
 ├── upload.rs        # 结果上报：HTTPS POST JSON
 ├── register.rs      # 扫描器注册：POST /api/scanner/register
@@ -61,54 +66,81 @@ impl LoadedConfig {
 实现方式为重新解析原始文件内容 → 修改 `[scanner]` 段 → 序列化写回，
 **原有注释、空行、键顺序全部保留**。
 
-#### `scanner.rs`
+#### `scan/orchestrator.rs`
 
 ```rust
 pub(crate) async fn run_scan(
     scanner_path: &str,
+    service_detection: &ServiceDetectionConfig,
+    plan: &ScanPlan,
     target: &TargetParams,
-) -> Result<Vec<ScanResult>, ScannerError>
+    cancel_requested: &AtomicBool,
+) -> Result<ScanOutcome, ScannerError>
 ```
 
-当前分发至 `run_masscan()`。扩展新扫描器时在此函数中增加分发逻辑。
+先运行 `run_masscan()` 获取开放端口；服务识别启用时，再把 TCP 端点交给 zgrab2。
+
+任务可携带版本化 `scan_plan`。当前支持 `legacy`、`port_only` 和
+`service_inventory` 三种 profile；没有 `scan_plan` 的旧服务端任务会按本地配置生成
+兼容计划。计划只描述白名单阶段，不接收二进制路径或任意 CLI 参数。
+
+心跳通过 `scan_capabilities` 上报支持的计划版本、profile 和阶段。本地关闭 zgrab2 时仅
+声明 `legacy`、`port_only` 和 `port_discovery`；启用并验证 zgrab2 后才声明
+`service_inventory` 与 `service_detection`，供服务端能力调度使用。
 
 Masscan 输出行解析：
-- `Discovered <port> <protocol> <ip>` → `ScanResult { service: None, banner: None }`
-- `Banner <port> <protocol> <ip> <service> <banner>` → `ScanResult { service: Some, banner: Some }`
+- `Discovered <port> <protocol> <ip>` → `PortObservation`
+- `open <protocol> <port> <ip> <timestamp>` → 标准 masscan list 格式
 - `ERROR` → 返回错误
 - `COMPLETE` / `DONE_OK` → 正常结束
 
 masscan 只有在进程退出码为 0 时才算执行成功。非零退出码会连同最多 4096 个字符的 stderr 作为扫描错误上报，任务不会上传空结果并误标为成功；退出码为 0 且没有发现开放端口仍属于合法的空结果。
+
+masscan 始终使用机器可读的 list 输出，不启用 `--banner`。旧的 `Discovered` 行仍保留解析兼容，
+但不再接收 masscan 的服务识别结果。
+
+#### `scan/engines/zgrab2.rs`
+
+zgrab2 使用 `multiple` 模式。扫描器把每个开放 TCP 端点编码成 `IP,,TAG,PORT`。
+`TAG` 根据端口映射为 `ssh`、`http`、`https`、`tls`、`smtp`、`mysql`、`postgres`
+等模块；未映射端口使用 `banner`。
+
+- `status=success`：写入规范化 `service`，并提取可用的短 banner；
+- 超时、拒绝或协议错误：`service` 保持为空，结构化状态写入 observation 的 `data`；
+- 详细数据超过 `max_result_bytes`：只保留状态、错误、原大小和 `truncated=true`。
+
+若 `required=false`，zgrab2 进程启动失败或非零退出只记录警告，masscan 端口结果照常上报；
+若 `required=true`，此类错误使任务按现有可重试失败流程处理。任务取消会终止当前 masscan 或
+zgrab2 子进程。
 
 #### `cache.rs`
 
 ```rust
 impl CacheManager {
     pub(crate) fn begin_task(&mut self, task_id: Uuid) -> Result
-    pub(crate) fn insert(&mut self, ip, port, service, protocol, banner) -> Result
-    pub(crate) fn upload_payload(&self, scanner_id: Uuid) -> Result<ScannerResultUpload, ScannerError>
+    pub(crate) fn insert(&mut self, observation: &ScanObservation) -> Result
+    pub(crate) fn upload_batches(&self, scanner_id: Uuid) -> Result<Vec<ScannerResultBatchUpload>, ScannerError>
     pub(crate) fn clear(&mut self)
 }
 ```
 
-三层聚合结构：`HashMap<IP, IpEntry { Vec<PortInfo { Vec<ServiceInfo> }> }>`
-
-去重规则：
-- 同一 IP + port + protocol 的重复 `Discovered` 行（service=None）→ 跳过
-- `Banner` 行（service=Some）→ 查找首个 placeholder（name=None）填充，否则追加
-
-缓存始终绑定一个 `task_id`。存在待上传任务时拒绝开始新任务，避免多个任务的数据混合。`upload_payload()` 将缓存转换为服务端要求的 `ScannerResultUpload`。
+缓存保存类型化的 `Port` 与 `Service` observations，并按类型、IP、端口、协议、服务名和来源
+生成稳定身份去重。每个任务在 `begin_task()` 时生成一次 `upload_id`，重试期间保持不变。
+`upload_batches()` 每 500 条生成一批；空任务也生成一个最终空批，只有最后一批设置
+`is_final=true`。缓存同时记录下一待确认批次，重试时跳过已收到成功响应的批次；若响应
+丢失，则用相同批身份重试当前批。
 
 #### `upload.rs`
 
 ```rust
 impl Uploader {
     pub(crate) fn new(endpoint: String, verify_tls: bool, runtime_token: String) -> Self
-    pub(crate) async fn upload(&self, payload: &ScannerResultUpload) -> Result<(), ScannerError>
+    pub(crate) async fn upload(&self, payload: &ScannerResultBatchUpload) -> Result<(), ScannerError>
 }
 ```
 
-`upload()` 使用运行令牌作为 Bearer 凭据，将包含扫描器 ID、任务 ID和结果数组的 JSON 发送到 `endpoint`。失败时保留整个任务缓存并暂停领取新任务。
+`upload()` 使用运行令牌作为 Bearer 凭据，顺序发送版本 2 结果批。失败时保留任务、
+`upload_id` 和所有 observations；再次上传会产生相同批身份，由服务端幂等确认。
 
 扩展加密：在 `upload()` 中加密 payload 后再发送，调用方无需改动。
 
@@ -276,6 +308,16 @@ scanner_id = "019eb66c-6ac6-7530-b73f-454037448fa2"
 # Runtime token — written automatically after successful one-time registration
 runtime_token = ""
 
+[service_detection]
+enabled = true
+required = false
+zgrab_path = "zgrab2"
+senders = 200
+server_rate_limit = 20
+connect_timeout_seconds = 5
+target_timeout_seconds = 15
+max_result_bytes = 65536
+
 [network]
 ipv4_enabled = true
 ipv6_enabled = true
@@ -301,6 +343,14 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.scanner_path` | string | `"./a"` | 扫描器二进制路径；也可填写能从 `PATH` 解析的命令名 |
 | `scanner.scanner_id` | string | 自动生成 | UUIDv7，首次启动自动生成 |
 | `scanner.runtime_token` | string | `""` | 注册成功后由程序自动写入的运行令牌 |
+| `service_detection.enabled` | bool | `false` | 是否在端口发现后运行 zgrab2 |
+| `service_detection.required` | bool | `false` | zgrab2 整体失败时是否使任务失败 |
+| `service_detection.zgrab_path` | string | `"zgrab2"` | zgrab2 二进制路径或 PATH 中的命令名 |
+| `service_detection.senders` | int | `200` | zgrab2 并发发送协程数，范围 1-10000 |
+| `service_detection.server_rate_limit` | int | `20` | 单个目标 IP 每秒连接上限，范围 1-10000 |
+| `service_detection.connect_timeout_seconds` | int | `5` | 建连超时，范围 1-60 秒 |
+| `service_detection.target_timeout_seconds` | int | `15` | 单目标探测总超时，不小于建连超时且不超过 300 秒 |
+| `service_detection.max_result_bytes` | int | `65536` | 单服务结构化详情上限，范围 1024-1048576 字节 |
 | `network.ipv4_enabled` | bool | `true` | 是否自动探测并接受 IPv4 任务 |
 | `network.ipv6_enabled` | bool | `true` | 是否自动探测并接受 IPv6 任务 |
 | `network.ipv4_probe_url` | string | ipify IPv4 API | IPv4 IP 回显接口 |
@@ -318,11 +368,12 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.rate` | 1-2147483647 |
 | `scanner.source_port` | 1-65535 |
 | `scanner.scanner_path` | 普通扫描启动时必须能解析到存在且可执行的普通文件 |
+| `service_detection.zgrab_path` | enabled=true 时必须能解析到存在且可执行的普通文件 |
 | `network.probe_interval_seconds` | 30-86400 |
 | `network.probe_timeout_seconds` | 1-60 |
 | `upload.endpoint` | 非空 |
 
-扫描器在启动扫描循环前检查 `scanner_path`。显式的相对路径或绝对路径会直接检查；不含目录的命令名（例如 `masscan`）会从 `PATH` 查找。注册、`--health-check` 和 `--get-system-info` 模式不执行扫描，因此跳过该检查。
+扫描器在启动扫描循环前检查 `scanner_path`，启用服务识别时还会检查 `zgrab_path`。显式的相对路径或绝对路径会直接检查；不含目录的命令名会从 `PATH` 查找。注册、`--health-check` 和 `--get-system-info` 模式不执行扫描，因此跳过该检查。
 
 ### 配置回写（注释保留）
 
@@ -381,12 +432,16 @@ scanner-rs
 │  (c_server) │ ──────── JSON ────────────► │              │
 └─────────────┘                             │  ① fetch     │
                                             │  ② deserialize│
-┌─────────────┐                             │  ③ run_scan  │
+┌─────────────┐                             │  ③ masscan   │
 │   masscan   │ ◄── spawn ───────────────── │              │
-│   binary    │ ──── stdout ──────────────► │  ④ parse     │
-└─────────────┘                             │  ⑤ cache     │
-                                            │  ⑥ payload   │
-┌─────────────┐ POST /api/scanner/result   │  ⑦ upload    │
+│   binary    │ ─── open ports ───────────► │  ④ dispatch  │
+└─────────────┘                             │              │
+┌─────────────┐                             │  ⑤ zgrab2    │
+│   zgrab2    │ ◄── tagged targets ──────── │              │
+│   binary    │ ─── JSON results ─────────► │  ⑥ normalize │
+└─────────────┘                             │  ⑦ cache     │
+                                            │  ⑧ payload   │
+┌─────────────┐ POST /api/scanner/result   │  ⑨ upload    │
 │  upload API │ ◄──── JSON ─────────────── │              │
 │  (endpoint) │                             │              │
 └─────────────┘                             └──────────────┘
@@ -404,26 +459,49 @@ scanner-rs
 2. **sysinfo** — 采集并打印系统信息
 3. **fetch** — 使用运行令牌领取真实任务；404 时等待并继续轮询
 4. **deserialize** — 解析 task_id、task_target 和 task_port
-5. **run_scan** — 启动 masscan 子进程，传递目标参数
-6. **parse** — 逐行解析 masscan stdout（Discovered / Banner / ERROR / COMPLETE / DONE_OK）
-7. **cache** — 按 IP → port → service 三层去重聚合到 `CacheManager`
-8. **payload** — 生成包含 scanner_id、task_id 和 results 的载荷
-9. **upload** — 携带运行令牌 HTTPS POST 到 upload endpoint
+5. **port discovery** — masscan 仅执行 SYN/端口发现，输出 list 格式
+6. **service dispatch** — 按开放端口选择 zgrab2 module tag，仅处理 TCP
+7. **service detection** — zgrab2 受控并发执行应用层握手，逐行输出 JSON
+8. **normalize/cache** — 分别生成 port/service observations 并进行稳定身份去重
+9. **payload/upload** — 每 500 条分批上传，最终批确认后任务完成
 
 ### 上传 JSON 格式
 
 ```json
 {
+  "protocol_version": 2,
   "scanner_id": "019c0000-0000-7000-8000-000000000001",
   "task_id": "019c0000-0000-7000-8000-000000000002",
-  "results": [
+  "upload_id": "019c0000-0000-7000-8000-000000000003",
+  "batch_index": 0,
+  "is_final": true,
+  "observations": [
     {
+      "kind": "port",
+      "ip": "192.168.1.1",
+      "port": 80,
+      "protocol": "tcp",
+      "state": "open",
+      "source": "masscan"
+    },
+    {
+      "kind": "service",
       "ip": "192.168.1.1",
       "port": 80,
       "protocol": "tcp",
       "service": "http",
-      "banner": "Apache/2.4.29",
-      "other": null
+      "banner": "HTTP/1.1 200 OK",
+      "source": "zgrab2",
+      "data": {
+        "source": "zgrab2",
+        "module": "http",
+        "data": {
+          "status": "success",
+          "protocol": "http",
+          "port": 80,
+          "result": {}
+        }
+      }
     }
   ]
 }
@@ -436,7 +514,8 @@ scanner-rs
 ### 前置依赖
 
 - Rust 工具链 ≥ 1.85（edition 2024）
-- masscan 二进制（或等效扫描器）
+- masscan 二进制
+- zgrab2 二进制（仅 `service_detection.enabled=true` 时需要）
 
 ### 构建
 
@@ -475,9 +554,9 @@ cargo test
 
 ### 添加新扫描器（如 nuclei）
 
-改动仅限 `scanner.rs`：
+扫描流程扩展位于 `scan/orchestrator.rs`，具体工具适配器位于 `scan/engines/`：
 
-1. 添加 `run_nuclei(path: &str, target: &TargetParams) -> Result<Vec<ScanResult>, ScannerError>`
+1. 添加新的 engine，并返回对应的类型化 observation
 2. 在 `run_scan()` 中按路径/类型分发
 
 其他模块无需改动。

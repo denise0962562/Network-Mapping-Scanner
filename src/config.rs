@@ -95,6 +95,38 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
             !(1..=60).contains(&cfg.network.probe_timeout_seconds),
             "must be between 1 and 60",
         ),
+        (
+            "service_detection.zgrab_path",
+            cfg.service_detection.enabled && cfg.service_detection.zgrab_path.trim().is_empty(),
+            "must not be empty when service detection is enabled",
+        ),
+        (
+            "service_detection.senders",
+            !(1..=10_000).contains(&cfg.service_detection.senders),
+            "must be between 1 and 10000",
+        ),
+        (
+            "service_detection.server_rate_limit",
+            !(1..=10_000).contains(&cfg.service_detection.server_rate_limit),
+            "must be between 1 and 10000",
+        ),
+        (
+            "service_detection.connect_timeout_seconds",
+            !(1..=60).contains(&cfg.service_detection.connect_timeout_seconds),
+            "must be between 1 and 60",
+        ),
+        (
+            "service_detection.target_timeout_seconds",
+            cfg.service_detection.target_timeout_seconds
+                < cfg.service_detection.connect_timeout_seconds
+                || cfg.service_detection.target_timeout_seconds > 300,
+            "must be at least connect_timeout_seconds and at most 300",
+        ),
+        (
+            "service_detection.max_result_bytes",
+            !(1_024..=1_048_576).contains(&cfg.service_detection.max_result_bytes),
+            "must be between 1024 and 1048576",
+        ),
     ];
 
     for &(field, failed, msg) in rules {

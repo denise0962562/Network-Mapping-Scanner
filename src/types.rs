@@ -1,59 +1,23 @@
-use std::collections::HashMap;
 use uuid::Uuid;
 
 // ---- Cache data model ---------------------------------------------------
-
-/// A single service entry: service name and optional banner.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ServiceInfo {
-    pub(crate) name: Option<String>,
-    pub(crate) banner: Option<String>,
-}
-
-impl ServiceInfo {
-    pub(crate) fn is_placeholder(&self) -> bool {
-        self.name.is_none()
-    }
-}
-
-/// Per-port information: port number, protocol, and associated services.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct PortInfo {
-    pub(crate) port: u16,
-    pub(crate) protocol: String,
-    pub(crate) services: Vec<ServiceInfo>,
-}
-
-/// An IP-scoped entry in the scan cache.
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct IpEntry {
-    pub(crate) ports: Vec<PortInfo>,
-}
 
 /// In-memory scan result cache. Accumulates results until flushed.
 #[derive(Debug, Default)]
 pub(crate) struct CacheManager {
     pub(crate) task_id: Option<Uuid>,
-    pub(crate) ip_table: HashMap<String, IpEntry>,
-    pub(crate) total_records: u32,
+    pub(crate) upload_id: Option<Uuid>,
+    pub(crate) observations: Vec<crate::scan::ScanObservation>,
+    pub(crate) next_batch_index: u32,
 }
 
 impl CacheManager {
     pub(crate) fn clear(&mut self) {
         self.task_id = None;
-        self.ip_table.clear();
-        self.total_records = 0;
+        self.upload_id = None;
+        self.observations.clear();
+        self.next_batch_index = 0;
     }
-}
-
-/// A single parsed line from masscan stdout.
-#[derive(Debug, Clone)]
-pub(crate) struct ScanResult {
-    pub(crate) ip: String,
-    pub(crate) port: u16,
-    pub(crate) protocol: String,
-    pub(crate) service: Option<String>,
-    pub(crate) banner: Option<String>,
 }
 
 /// Task assigned by the server.
@@ -64,6 +28,8 @@ pub(crate) struct AssignedTask {
     pub(crate) task_port: String,
     #[serde(default = "default_address_family")]
     pub(crate) address_family: String,
+    #[serde(default)]
+    pub(crate) scan_plan: Option<crate::scan::ScanPlan>,
 }
 
 fn default_address_family() -> String {
@@ -77,25 +43,20 @@ pub(crate) struct TargetParams {
     pub(crate) port: String,
     pub(crate) rate: i32,
     pub(crate) source_port: i32,
+    pub(crate) address_family: String,
 }
 
 // ---- Upload payload -----------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ScannerResultItem {
-    pub(crate) ip: String,
-    pub(crate) port: u16,
-    pub(crate) protocol: Option<String>,
-    pub(crate) service: Option<String>,
-    pub(crate) banner: Option<String>,
-    pub(crate) other: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ScannerResultUpload {
+pub(crate) struct ScannerResultBatchUpload {
+    pub(crate) protocol_version: u16,
     pub(crate) scanner_id: Uuid,
     pub(crate) task_id: Uuid,
-    pub(crate) results: Vec<ScannerResultItem>,
+    pub(crate) upload_id: Uuid,
+    pub(crate) batch_index: u32,
+    pub(crate) is_final: bool,
+    pub(crate) observations: Vec<crate::scan::ScanObservation>,
 }
 
 // ---- Configuration structures -------------------------------------------
@@ -106,6 +67,36 @@ pub(crate) struct AppConfig {
     pub(crate) upload: UploadConfig,
     #[serde(default)]
     pub(crate) network: NetworkConfig,
+    #[serde(default)]
+    pub(crate) service_detection: ServiceDetectionConfig,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct ServiceDetectionConfig {
+    pub(crate) enabled: bool,
+    pub(crate) required: bool,
+    pub(crate) zgrab_path: String,
+    pub(crate) senders: u32,
+    pub(crate) server_rate_limit: u32,
+    pub(crate) connect_timeout_seconds: u64,
+    pub(crate) target_timeout_seconds: u64,
+    pub(crate) max_result_bytes: usize,
+}
+
+impl Default for ServiceDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            required: false,
+            zgrab_path: "zgrab2".into(),
+            senders: 200,
+            server_rate_limit: 20,
+            connect_timeout_seconds: 5,
+            target_timeout_seconds: 15,
+            max_result_bytes: 65_536,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

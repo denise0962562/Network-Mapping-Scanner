@@ -18,6 +18,28 @@ cd Network-Mapping-Scanner
 cargo build --release
 ```
 
+普通扫描需要同时安装 `masscan` 和 `zgrab2`。masscan 只负责发现开放端口，zgrab2
+按端口映射执行 SSH、HTTP(S)、TLS、邮件、数据库等应用层握手。可在配置中关闭服务识别，
+以兼容只部署 masscan 的节点：
+
+```toml
+[service_detection]
+enabled = true
+required = false
+zgrab_path = "zgrab2"
+senders = 200
+server_rate_limit = 20
+connect_timeout_seconds = 5
+target_timeout_seconds = 15
+max_result_bytes = 65536
+```
+
+- `required = false` 时，zgrab2 整体失败仍会上报 masscan 已发现的开放端口。
+- 单个协议握手超时或不匹配不会抹掉端口观察，只会在 service observation 的 `data` 中记录探测状态。
+- 未配置 `[service_detection]` 的旧配置默认关闭该功能。
+- zgrab2 使用系统 TCP 栈，`senders` 和 `server_rate_limit` 应从较低值开始压测，不能照搬
+  masscan 的发包速率。
+
 运行时会将结构化 JSON 日志按天写入 `./logs/scanner.log.YYYY-MM-DD`，同时保留终端输出。可以使用 `--log-directory` 指定其他目录，使用 `--debug` 将终端和文件日志级别切换为 debug：
 
 ```sh

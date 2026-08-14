@@ -1,5 +1,5 @@
 use crate::error::ScannerError;
-use crate::types::ScannerResultUpload;
+use crate::types::ScannerResultBatchUpload;
 use reqwest::Client;
 
 const USER_AGENT: &str = "Scanner/1.0";
@@ -24,13 +24,19 @@ impl Uploader {
     }
 
     /// POST a batch of scan entries as JSON to the configured endpoint.
-    pub(crate) async fn upload(&self, payload: &ScannerResultUpload) -> Result<(), ScannerError> {
+    pub(crate) async fn upload(
+        &self,
+        payload: &ScannerResultBatchUpload,
+    ) -> Result<(), ScannerError> {
         tracing::debug!(
             endpoint = %self.endpoint,
             verify_tls = self.verify_tls,
             scanner_id = %payload.scanner_id,
             task_id = %payload.task_id,
-            result_count = payload.results.len(),
+            upload_id = %payload.upload_id,
+            batch_index = payload.batch_index,
+            is_final = payload.is_final,
+            observation_count = payload.observations.len(),
             "starting result upload"
         );
         let client = Client::builder()
@@ -62,9 +68,10 @@ impl Uploader {
         }
 
         tracing::info!(
-            "uploaded {} entries for task {} to {}",
-            payload.results.len(),
+            "uploaded {} observations for task {} batch {} to {}",
+            payload.observations.len(),
             payload.task_id,
+            payload.batch_index,
             self.endpoint
         );
         Ok(())
