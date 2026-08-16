@@ -1,37 +1,198 @@
-use crate::error::ScannerError;
+use crate::error::ServerError;
 use crate::types::AssignedTask;
-use reqwest::{Client, Response, StatusCode};
+use reqwest::header::RETRY_AFTER;
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use serde::Serialize;
+use std::time::Duration;
 
 const USER_AGENT: &str = "Scanner/1.0";
 
 pub(crate) enum FetchTaskOutcome {
     Task(AssignedTask),
     NoTask,
-    Unauthorized { detail: String },
-    Forbidden { detail: String },
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum TaskResponseStatus {
-    Task,
-    NoTask,
-    Unauthorized,
-    Forbidden,
-    Other(StatusCode),
+#[derive(Clone)]
+pub(crate) struct ServerHttpClient {
+    client: Client,
+    runtime_token: String,
 }
 
-fn classify_task_status(status: StatusCode) -> TaskResponseStatus {
-    match status {
-        StatusCode::OK => TaskResponseStatus::Task,
-        StatusCode::NOT_FOUND => TaskResponseStatus::NoTask,
-        StatusCode::UNAUTHORIZED => TaskResponseStatus::Unauthorized,
-        StatusCode::FORBIDDEN => TaskResponseStatus::Forbidden,
-        status => TaskResponseStatus::Other(status),
+impl ServerHttpClient {
+    pub(crate) fn new(
+        verify_tls: bool,
+        runtime_token: String,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, ServerError> {
+        let client = Client::builder()
+            .user_agent(USER_AGENT)
+            .danger_accept_invalid_certs(!verify_tls)
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
+            .build()
+            .map_err(|error| ServerError::ClientBuild(error.to_string()))?;
+        Ok(Self {
+            client,
+            runtime_token,
+        })
+    }
+
+    pub(crate) async fn get(
+        &self,
+        url: &str,
+        operation: &'static str,
+    ) -> Result<Response, ServerError> {
+        self.execute(
+            self.client.get(url).bearer_auth(&self.runtime_token),
+            operation,
+        )
+        .await
+    }
+
+    pub(crate) async fn post_json<T: Serialize + ?Sized>(
+        &self,
+        url: &str,
+        payload: &T,
+        operation: &'static str,
+    ) -> Result<Response, ServerError> {
+        self.execute(
+            self.client
+                .post(url)
+                .bearer_auth(&self.runtime_token)
+                .json(payload),
+            operation,
+        )
+        .await
+    }
+
+    async fn execute(
+        &self,
+        request: RequestBuilder,
+        operation: &'static str,
+    ) -> Result<Response, ServerError> {
+        request
+            .send()
+            .await
+            .map_err(|error| request_error(error, operation))
     }
 }
 
-async fn response_detail(response: Response) -> String {
-    let body = response.text().await.unwrap_or_default();
+pub(crate) async fn fetch_task(
+    client: &ServerHttpClient,
+    url: &str,
+) -> Result<FetchTaskOutcome, ServerError> {
+    tracing::debug!(url, "requesting scan task");
+    let response = client.get(url, "fetch task").await?;
+    let status = response.status();
+    tracing::debug!(%status, "task endpoint responded");
+
+    match status {
+        StatusCode::OK => {
+            let task = response
+                .json::<AssignedTask>()
+                .await
+                .map_err(|error| response_decode_error(error, "fetch task"))?;
+            tracing::debug!(
+                task_id = %task.task_id,
+                target_count = task.task_target.len(),
+                ports = %task.task_port,
+                "task response decoded"
+            );
+            Ok(FetchTaskOutcome::Task(task))
+        }
+        StatusCode::NOT_FOUND => Ok(FetchTaskOutcome::NoTask),
+        _ => Err(response_error(response, "fetch task").await),
+    }
+}
+
+pub(crate) async fn validate_credentials(
+    client: &ServerHttpClient,
+    url: &str,
+) -> Result<(), ServerError> {
+    tracing::debug!(url, "validating runtime credentials");
+    let response = client.get(url, "validate credentials").await?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(response_error(response, "validate credentials").await)
+    }
+}
+
+pub(crate) async fn response_error(response: Response, operation: &'static str) -> ServerError {
+    let status = response.status();
+    let retry_after = parse_retry_after(response.headers());
+    let detail = response_detail(response).await;
+    classify_status(status, detail, retry_after, operation)
+}
+
+pub(crate) fn response_decode_error(error: reqwest::Error, operation: &'static str) -> ServerError {
+    let detail = error.to_string();
+    if error.is_timeout() {
+        ServerError::Timeout { operation, detail }
+    } else if error.is_connect() {
+        ServerError::Connect { operation, detail }
+    } else {
+        ServerError::InvalidResponse { operation, detail }
+    }
+}
+
+fn request_error(error: reqwest::Error, operation: &'static str) -> ServerError {
+    let detail = error.to_string();
+    if error.is_builder() {
+        ServerError::InvalidRequest { operation, detail }
+    } else if error.is_timeout() {
+        ServerError::Timeout { operation, detail }
+    } else if error.is_connect() {
+        ServerError::Connect { operation, detail }
+    } else {
+        ServerError::Transport { operation, detail }
+    }
+}
+
+fn classify_status(
+    status: StatusCode,
+    detail: String,
+    retry_after: Option<Duration>,
+    operation: &'static str,
+) -> ServerError {
+    match status {
+        StatusCode::UNAUTHORIZED => ServerError::AuthRejected { operation, detail },
+        StatusCode::FORBIDDEN => ServerError::PolicyBlocked { operation, detail },
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS => {
+            ServerError::RetryableStatus {
+                operation,
+                status,
+                detail,
+                retry_after,
+            }
+        }
+        status if status.is_server_error() => ServerError::RetryableStatus {
+            operation,
+            status,
+            detail,
+            retry_after,
+        },
+        status => ServerError::Rejected {
+            operation,
+            status,
+            detail,
+        },
+    }
+}
+
+async fn response_detail(mut response: Response) -> String {
+    const DETAIL_BODY_LIMIT: usize = 1_024;
+    let mut body = Vec::new();
+    while body.len() < DETAIL_BODY_LIMIT {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) | Err(_) => break,
+        };
+        let remaining = DETAIL_BODY_LIMIT - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    let body = String::from_utf8_lossy(&body);
     let detail: String = body
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -46,126 +207,68 @@ async fn response_detail(response: Response) -> String {
     }
 }
 
-fn client(verify_tls: bool) -> Result<Client, ScannerError> {
-    tracing::debug!(
-        verify_tls,
-        user_agent = USER_AGENT,
-        "building task HTTP client"
-    );
-    Client::builder()
-        .user_agent(USER_AGENT)
-        .danger_accept_invalid_certs(!verify_tls)
-        .build()
-        .map_err(ScannerError::from)
-}
-
-pub(crate) async fn fetch_task(
-    url: &str,
-    verify_tls: bool,
-    runtime_token: &str,
-) -> Result<FetchTaskOutcome, ScannerError> {
-    tracing::debug!(url, verify_tls, "requesting scan task");
-    let response = client(verify_tls)?
-        .get(url)
-        .bearer_auth(runtime_token)
-        .send()
-        .await?;
-
-    tracing::debug!(status = %response.status(), "task endpoint responded");
-
-    match classify_task_status(response.status()) {
-        TaskResponseStatus::Task => {
-            let task = response
-                .json::<AssignedTask>()
-                .await
-                .map_err(|error| ScannerError::Http(format!("invalid task response: {error}")))?;
-            tracing::debug!(
-                task_id = %task.task_id,
-                target_count = task.task_target.len(),
-                ports = %task.task_port,
-                "task response decoded"
-            );
-            Ok(FetchTaskOutcome::Task(task))
-        }
-        TaskResponseStatus::NoTask => Ok(FetchTaskOutcome::NoTask),
-        TaskResponseStatus::Unauthorized => Ok(FetchTaskOutcome::Unauthorized {
-            detail: response_detail(response).await,
-        }),
-        TaskResponseStatus::Forbidden => Ok(FetchTaskOutcome::Forbidden {
-            detail: response_detail(response).await,
-        }),
-        TaskResponseStatus::Other(status) => {
-            let detail = response_detail(response).await;
-            Err(ScannerError::Http(format!(
-                "task endpoint returned {status}: {detail}"
-            )))
-        }
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
     }
-}
-
-pub(crate) async fn validate_credentials(
-    url: &str,
-    verify_tls: bool,
-    runtime_token: &str,
-) -> Result<(), ScannerError> {
-    tracing::debug!(url, verify_tls, "validating runtime credentials");
-    let response = client(verify_tls)?
-        .get(url)
-        .bearer_auth(runtime_token)
-        .send()
-        .await?;
-
-    let status = response.status();
-    tracing::debug!(status = %status, "credential endpoint responded");
-    match status {
-        StatusCode::OK => Ok(()),
-        StatusCode::UNAUTHORIZED => {
-            let detail = response_detail(response).await;
-            Err(ScannerError::HealthCheck(format!(
-                "runtime credentials were rejected: {detail}"
-            )))
-        }
-        StatusCode::FORBIDDEN => {
-            let detail = response_detail(response).await;
-            Err(ScannerError::HealthCheck(format!(
-                "credential check was blocked by server security middleware: {detail}"
-            )))
-        }
-        status => {
-            let detail = response_detail(response).await;
-            Err(ScannerError::HealthCheck(format!(
-                "credential check returned {status}: {detail}"
-            )))
-        }
-    }
+    let retry_at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let seconds = retry_at
+        .signed_duration_since(chrono::Utc::now())
+        .num_seconds();
+    (seconds > 0).then(|| Duration::from_secs(seconds as u64))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TaskResponseStatus, classify_task_status};
+    use super::{ServerHttpClient, classify_status, parse_retry_after};
+    use crate::error::ServerError;
     use reqwest::StatusCode;
+    use reqwest::header::RETRY_AFTER;
+    use std::time::Duration;
 
     #[test]
-    fn task_http_statuses_are_classified_for_actionable_errors() {
-        assert_eq!(
-            classify_task_status(StatusCode::OK),
-            TaskResponseStatus::Task
-        );
-        assert_eq!(
-            classify_task_status(StatusCode::NOT_FOUND),
-            TaskResponseStatus::NoTask
-        );
-        assert_eq!(
-            classify_task_status(StatusCode::UNAUTHORIZED),
-            TaskResponseStatus::Unauthorized
-        );
-        assert_eq!(
-            classify_task_status(StatusCode::FORBIDDEN),
-            TaskResponseStatus::Forbidden
-        );
-        assert_eq!(
-            classify_task_status(StatusCode::INTERNAL_SERVER_ERROR),
-            TaskResponseStatus::Other(StatusCode::INTERNAL_SERVER_ERROR)
-        );
+    fn retry_after_delta_seconds_are_parsed() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(RETRY_AFTER, "17".parse().unwrap());
+
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(17)));
+    }
+
+    #[test]
+    fn response_statuses_have_actionable_retry_classes() {
+        assert!(matches!(
+            classify_status(StatusCode::UNAUTHORIZED, "bad token".into(), None, "test"),
+            ServerError::AuthRejected { .. }
+        ));
+        assert!(matches!(
+            classify_status(
+                StatusCode::TOO_MANY_REQUESTS,
+                "slow down".into(),
+                Some(Duration::from_secs(7)),
+                "test"
+            ),
+            ServerError::RetryableStatus {
+                retry_after: Some(delay),
+                ..
+            } if delay == Duration::from_secs(7)
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::CONFLICT, "lease lost".into(), None, "test"),
+            ServerError::Rejected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_urls_are_not_classified_as_transient_transport_errors() {
+        let client = ServerHttpClient::new(
+            true,
+            "token".into(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let error = client.get(":not-a-url", "test").await.unwrap_err();
+        assert!(matches!(error, ServerError::InvalidRequest { .. }));
     }
 }

@@ -26,6 +26,7 @@ src/
 ├── upload.rs        # 结果上报：HTTPS POST JSON
 ├── register.rs      # 扫描器注册：POST /api/scanner/register
 ├── http_client.rs   # 底层 HTTP GET / POST
+├── reconnect.rs     # 连接状态与带抖动的指数退避
 ├── health.rs        # 运行凭据健康检查
 ├── sysinfo.rs       # 系统信息采集（OS/CPU/RAM/uptime）
 ├── types.rs         # 全部数据结构与配置类型
@@ -134,8 +135,8 @@ impl CacheManager {
 
 ```rust
 impl Uploader {
-    pub(crate) fn new(endpoint: String, verify_tls: bool, runtime_token: String) -> Self
-    pub(crate) async fn upload(&self, payload: &ScannerResultBatchUpload) -> Result<(), ScannerError>
+    pub(crate) fn new(endpoint: String, client: ServerHttpClient) -> Self
+    pub(crate) async fn upload(&self, payload: &ScannerResultBatchUpload) -> Result<(), ServerError>
 }
 ```
 
@@ -151,6 +152,8 @@ pub(crate) async fn register(
     c_server: &str,
     c_port: i64,
     verify_tls: bool,
+    connect_timeout_seconds: u64,
+    request_timeout_seconds: u64,
     scanner_id: &str,
     token: &str,
 ) -> Result<RegisterOutcome, ScannerError>
@@ -169,13 +172,49 @@ pub(crate) fn gather() -> Result<SystemInfo, ScannerError>
 #### `http_client.rs`
 
 ```rust
-pub(crate) async fn fetch_task(url: &str, verify_tls: bool, runtime_token: &str) -> Result<FetchTaskOutcome, ScannerError>
+pub(crate) async fn fetch_task(client: &ServerHttpClient, url: &str) -> Result<FetchTaskOutcome, ServerError>
 ```
+
+任务领取、心跳、任务状态上报和结果上传共享一个 `reqwest::Client`。客户端统一设置建连与
+全请求超时，并把网络错误和 HTTP 响应分类为可重试故障、认证拒绝、策略拒绝及任务语义
+冲突。408、429 和 5xx 可重试；429 会读取 `Retry-After`。
+
+#### `reconnect.rs`
+
+`ConnectionState` 通过 Tokio `watch` 通道向扫描主循环发布 `Connecting`、`Online`、
+`Reconnecting`、`AuthRejected` 和 `PolicyBlocked`。主循环只在 `Online` 时领取新任务。
+`Backoff` 使用带抖动的指数退避，成功心跳会清零连续失败次数；所有等待都可被停止信号
+打断。
+
+### 自动重连与任务租约
+
+服务端领取任务响应包含 `lease_expires_at_ms` 和 `lease_ttl_ms`。心跳响应对活动任务返回：
+
+```json
+{
+  "lease": {
+    "task_id": "019c0000-0000-7000-8000-000000000001",
+    "status": "renewed",
+    "expires_at_ms": 1770000000000,
+    "ttl_ms": 90000
+  }
+}
+```
+
+- `renewed`：扫描端按 `ttl_ms` 刷新本地单调时钟截止时间；
+- `lost`：立即以 `LeaseLost` 原因取消本地任务，不发送服务端取消确认，也不上传结果；
+- 旧服务端不返回 `lease` 时，扫描端为兼容现有部署，将成功心跳视为按领取任务时的 TTL
+  续租；
+- 活动任务重连等待受 `active_task_reconnect_max_delay_seconds` 限制；等待或请求本身不能越过
+  `lease_safety_margin_seconds` 定义的安全线。
+
+任务取消原因区分为服务端主动取消、租约丢失和本地关闭，防止把断线导致的租约丢失误报为
+用户取消。
 
 #### `health.rs`
 
 ```rust
-pub(crate) async fn health_check(url: &str, verify_tls: bool, runtime_token: &str) -> Result<(), ScannerError>
+pub(crate) async fn health_check(client: &ServerHttpClient, url: &str) -> Result<(), ScannerError>
 ```
 
 健康检查调用任务接口的 `dryrun=true` 模式，只验证 scanner_id 和运行令牌，不领取任务。
@@ -307,6 +346,12 @@ scanner_path = "./a"
 scanner_id = "019eb66c-6ac6-7530-b73f-454037448fa2"
 # Runtime token — written automatically after successful one-time registration
 runtime_token = ""
+connect_timeout_seconds = 5
+request_timeout_seconds = 15
+reconnect_initial_delay_seconds = 1
+reconnect_max_delay_seconds = 60
+active_task_reconnect_max_delay_seconds = 10
+lease_safety_margin_seconds = 10
 
 [service_detection]
 enabled = true
@@ -343,6 +388,12 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.scanner_path` | string | `"./a"` | 扫描器二进制路径；也可填写能从 `PATH` 解析的命令名 |
 | `scanner.scanner_id` | string | 自动生成 | UUIDv7，首次启动自动生成 |
 | `scanner.runtime_token` | string | `""` | 注册成功后由程序自动写入的运行令牌 |
+| `scanner.connect_timeout_seconds` | int | `5` | 建立服务端连接的超时，范围 1-60 秒 |
+| `scanner.request_timeout_seconds` | int | `15` | 单次请求总超时，不小于建连超时且不超过 300 秒 |
+| `scanner.reconnect_initial_delay_seconds` | int | `1` | 首次自动重连退避，范围 1-60 秒 |
+| `scanner.reconnect_max_delay_seconds` | int | `60` | 空闲状态最大重连退避，不超过 600 秒 |
+| `scanner.active_task_reconnect_max_delay_seconds` | int | `10` | 活动任务最大重连退避，不超过普通最大退避 |
+| `scanner.lease_safety_margin_seconds` | int | `10` | 租约到期前停止未确认任务的安全窗口，范围 1-60 秒 |
 | `service_detection.enabled` | bool | `false` | 是否在端口发现后运行 zgrab2 |
 | `service_detection.required` | bool | `false` | zgrab2 整体失败时是否使任务失败 |
 | `service_detection.zgrab_path` | string | `"zgrab2"` | zgrab2 二进制路径或 PATH 中的命令名 |

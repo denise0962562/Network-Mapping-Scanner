@@ -97,7 +97,6 @@ mod tests {
             ip: "192.0.2.1".into(),
             port: "443".into(),
             rate: 100,
-            source_port: 61_000,
             address_family: "ipv4".into(),
         };
         let service = ServiceDetectionConfig {
@@ -150,7 +149,6 @@ mod tests {
             ip: "192.0.2.1".into(),
             port: "443".into(),
             rate: 100,
-            source_port: 61_000,
             address_family: "ipv4".into(),
         };
         let service = ServiceDetectionConfig {

@@ -103,7 +103,6 @@ pub(crate) async fn run(
         targets = %target.ip,
         ports = %target.port,
         rate = target.rate,
-        source_port = target.source_port,
         banner_scan = false,
         "spawning masscan process"
     );
@@ -112,7 +111,6 @@ pub(crate) async fn run(
         .arg(&target.ip)
         .args(["-p", &target.port])
         .args(["--rate", &target.rate.to_string()])
-        .args(["--source-port", &target.source_port.to_string()])
         .args(["--output-format", "list"])
         .args(["--output-filename", "-"])
         .stdout(std::process::Stdio::piped())
@@ -341,7 +339,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            b"#!/bin/sh\nprintf 'permission denied by test scanner\\n' >&2\nexit 1\n",
+            b"#!/bin/sh\nprintf 'args:%s\\n' \"$*\" >&2\nprintf 'permission denied by test scanner\\n' >&2\nexit 1\n",
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -350,7 +348,6 @@ mod tests {
             ip: "192.0.2.1/32".into(),
             port: "80".into(),
             rate: 100,
-            source_port: 61_000,
             address_family: "ipv4".into(),
         };
         let cancel_requested = AtomicBool::new(false);
@@ -363,6 +360,7 @@ mod tests {
         };
         assert!(error.contains("exit status: 1"));
         assert!(error.contains("permission denied by test scanner"));
+        assert!(!error.contains("--source-port"));
     }
 
     #[test]

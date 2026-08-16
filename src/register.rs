@@ -1,7 +1,6 @@
-use crate::error::ScannerError;
-use reqwest::Client;
-
-const USER_AGENT: &str = "Scanner/1.0";
+use crate::error::{ScannerError, ServerError};
+use crate::http_client::{ServerHttpClient, response_decode_error, response_error};
+use std::time::Duration;
 
 #[derive(Debug, serde::Serialize)]
 struct RegisterRequest {
@@ -22,6 +21,8 @@ pub(crate) async fn register(
     c_server: &str,
     c_port: i64,
     verify_tls: bool,
+    connect_timeout_seconds: u64,
+    request_timeout_seconds: u64,
     scanner_id: &str,
     token: &str,
 ) -> Result<RegisterOutcome, ScannerError> {
@@ -32,29 +33,29 @@ pub(crate) async fn register(
 
     tracing::debug!(url, scanner_id, verify_tls, "starting scanner registration");
 
-    let client = Client::builder()
-        .user_agent(USER_AGENT)
-        .danger_accept_invalid_certs(!verify_tls)
-        .build()?;
+    let client = ServerHttpClient::new(
+        verify_tls,
+        token.to_owned(),
+        Duration::from_secs(connect_timeout_seconds),
+        Duration::from_secs(request_timeout_seconds),
+    )?;
 
-    let response = client
-        .post(&url)
-        .bearer_auth(token)
-        .json(&body)
-        .send()
-        .await?;
+    let response = client.post_json(&url, &body, "register scanner").await?;
 
     tracing::debug!(status = %response.status(), "registration endpoint responded");
 
     match response.status().as_u16() {
         200 => {
-            let response: RegisterResponse = response.json().await.map_err(|error| {
-                ScannerError::Http(format!("invalid registration response: {error}"))
-            })?;
+            let response: RegisterResponse = response
+                .json()
+                .await
+                .map_err(|error| response_decode_error(error, "register scanner"))?;
             if response.runtime_token.is_empty() {
-                return Err(ScannerError::Http(
-                    "registration response contained an empty runtime token".into(),
-                ));
+                return Err(ServerError::InvalidResponse {
+                    operation: "register scanner",
+                    detail: "registration response contained an empty runtime token".into(),
+                }
+                .into());
             }
             tracing::info!("scanner registered successfully (id={})", scanner_id);
             Ok(RegisterOutcome::Registered {
@@ -65,11 +66,6 @@ pub(crate) async fn register(
             tracing::warn!("registration rejected: invalid credentials (401)");
             Ok(RegisterOutcome::Unauthorized)
         }
-        status => {
-            let body = response.text().await.unwrap_or_default();
-            Err(ScannerError::Http(format!(
-                "registration failed with status {status}: {body}"
-            )))
-        }
+        _ => Err(response_error(response, "register scanner").await.into()),
     }
 }
