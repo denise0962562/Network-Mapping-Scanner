@@ -31,6 +31,10 @@ pub(crate) struct AssignedTask {
     pub(crate) address_family: String,
     #[serde(default)]
     pub(crate) scan_plan: Option<crate::scan::ScanPlan>,
+    #[serde(default)]
+    pub(crate) lease_expires_at_ms: Option<i64>,
+    #[serde(default = "default_task_lease_ttl_ms")]
+    pub(crate) lease_ttl_ms: u64,
 }
 
 impl AssignedTask {
@@ -55,6 +59,10 @@ impl AssignedTask {
 
 fn default_address_family() -> String {
     "ipv4".into()
+}
+
+fn default_task_lease_ttl_ms() -> u64 {
+    90_000
 }
 
 /// Parameters passed to masscan after applying local scanner settings.
@@ -168,6 +176,18 @@ pub(crate) struct ScannerConfig {
     pub(crate) runtime_token: String,
     #[serde(default = "default_heartbeat_interval")]
     pub(crate) heartbeat_interval_seconds: u64,
+    #[serde(default = "default_connect_timeout")]
+    pub(crate) connect_timeout_seconds: u64,
+    #[serde(default = "default_request_timeout")]
+    pub(crate) request_timeout_seconds: u64,
+    #[serde(default = "default_reconnect_initial_delay")]
+    pub(crate) reconnect_initial_delay_seconds: u64,
+    #[serde(default = "default_reconnect_max_delay")]
+    pub(crate) reconnect_max_delay_seconds: u64,
+    #[serde(default = "default_active_task_reconnect_max_delay")]
+    pub(crate) active_task_reconnect_max_delay_seconds: u64,
+    #[serde(default = "default_lease_safety_margin")]
+    pub(crate) lease_safety_margin_seconds: u64,
 }
 
 impl ScannerConfig {
@@ -208,6 +228,30 @@ fn default_heartbeat_interval() -> u64 {
     30
 }
 
+fn default_connect_timeout() -> u64 {
+    5
+}
+
+fn default_request_timeout() -> u64 {
+    15
+}
+
+fn default_reconnect_initial_delay() -> u64 {
+    1
+}
+
+fn default_reconnect_max_delay() -> u64 {
+    60
+}
+
+fn default_active_task_reconnect_max_delay() -> u64 {
+    10
+}
+
+fn default_lease_safety_margin() -> u64 {
+    10
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AssignedTask, ScannerConfig};
@@ -227,6 +271,25 @@ mod tests {
         assert_eq!(task.task_target.len(), 2);
         assert_eq!(task.task_port, "80,443");
         assert_eq!(task.address_family, "ipv4");
+        assert_eq!(task.lease_ttl_ms, 90_000);
+        assert_eq!(task.lease_expires_at_ms, None);
+    }
+
+    #[test]
+    fn assigned_task_accepts_explicit_server_lease() {
+        let task: AssignedTask = serde_json::from_str(
+            r#"{
+                "task_id": "019c0000-0000-7000-8000-000000000001",
+                "task_target": ["192.0.2.1"],
+                "task_port": "443",
+                "lease_expires_at_ms": 1770000000000,
+                "lease_ttl_ms": 120000
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(task.lease_expires_at_ms, Some(1_770_000_000_000));
+        assert_eq!(task.lease_ttl_ms, 120_000);
     }
 
     #[test]
@@ -240,6 +303,12 @@ mod tests {
             scanner_id: "019c0000-0000-7000-8000-000000000001".into(),
             runtime_token: "secret".into(),
             heartbeat_interval_seconds: 30,
+            connect_timeout_seconds: 5,
+            request_timeout_seconds: 15,
+            reconnect_initial_delay_seconds: 1,
+            reconnect_max_delay_seconds: 60,
+            active_task_reconnect_max_delay_seconds: 10,
+            lease_safety_margin_seconds: 10,
         };
 
         assert_eq!(
@@ -271,6 +340,9 @@ mod tests {
         .expect("legacy scanner config must remain readable");
 
         assert!(config.runtime_token.is_empty());
+        assert_eq!(config.connect_timeout_seconds, 5);
+        assert_eq!(config.request_timeout_seconds, 15);
+        assert_eq!(config.reconnect_max_delay_seconds, 60);
     }
 
     #[test]

@@ -13,6 +13,14 @@ scanner_path = "./a"
 scanner_id = ""
 # Runtime token — written automatically after successful one-time registration
 runtime_token = ""
+# HTTP and automatic reconnect settings
+connect_timeout_seconds = 5
+request_timeout_seconds = 15
+reconnect_initial_delay_seconds = 1
+reconnect_max_delay_seconds = 60
+active_task_reconnect_max_delay_seconds = 10
+# Stop local work before an unconfirmed server lease can expire
+lease_safety_margin_seconds = 10
 
 [service_detection]
 # Run zgrab2 after masscan to identify selected TCP services.

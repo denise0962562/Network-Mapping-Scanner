@@ -81,6 +81,40 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
             "must be between 5 and 300",
         ),
         (
+            "scanner.connect_timeout_seconds",
+            !(1..=60).contains(&cfg.scanner.connect_timeout_seconds),
+            "must be between 1 and 60",
+        ),
+        (
+            "scanner.request_timeout_seconds",
+            cfg.scanner.request_timeout_seconds < cfg.scanner.connect_timeout_seconds
+                || cfg.scanner.request_timeout_seconds > 300,
+            "must be at least connect_timeout_seconds and at most 300",
+        ),
+        (
+            "scanner.reconnect_initial_delay_seconds",
+            !(1..=60).contains(&cfg.scanner.reconnect_initial_delay_seconds),
+            "must be between 1 and 60",
+        ),
+        (
+            "scanner.reconnect_max_delay_seconds",
+            cfg.scanner.reconnect_max_delay_seconds < cfg.scanner.reconnect_initial_delay_seconds
+                || cfg.scanner.reconnect_max_delay_seconds > 600,
+            "must be at least reconnect_initial_delay_seconds and at most 600",
+        ),
+        (
+            "scanner.active_task_reconnect_max_delay_seconds",
+            cfg.scanner.active_task_reconnect_max_delay_seconds == 0
+                || cfg.scanner.active_task_reconnect_max_delay_seconds
+                    > cfg.scanner.reconnect_max_delay_seconds,
+            "must be between 1 and reconnect_max_delay_seconds",
+        ),
+        (
+            "scanner.lease_safety_margin_seconds",
+            !(1..=60).contains(&cfg.scanner.lease_safety_margin_seconds),
+            "must be between 1 and 60",
+        ),
+        (
             "network.probe_interval_seconds",
             !(30..=86400).contains(&cfg.network.probe_interval_seconds),
             "must be between 30 and 86400",

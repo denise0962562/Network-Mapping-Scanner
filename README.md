@@ -48,6 +48,30 @@ cargo run -- --config config.toml --log-directory /var/log/network-mapping-scann
 
 相对日志目录以启动扫描器时的当前工作目录为基准。程序退出时会刷新尚未写入磁盘的日志。
 
+## 服务端自动重连
+
+扫描器启动后会先通过心跳确认服务端可用，再开始领取任务。DNS、建连、请求超时、HTTP
+408/429 和 5xx 会触发带抖动的指数退避；连接恢复并成功发送心跳后会自动恢复领取任务和
+结果上传。401 表示运行令牌失效，需要重新注册；403 或其他协议错误不会无限重试。
+
+```toml
+[scanner]
+connect_timeout_seconds = 5
+request_timeout_seconds = 15
+reconnect_initial_delay_seconds = 1
+reconnect_max_delay_seconds = 60
+active_task_reconnect_max_delay_seconds = 10
+lease_safety_margin_seconds = 10
+```
+
+活动任务通过心跳续租。短暂断线期间本地扫描可以继续，心跳会以较短退避间隔恢复；如果
+服务端明确返回租约已丢失，或扫描端在租约到期前的安全窗口仍无法确认续租，当前
+masscan/zgrab2 进程会被取消，过期结果不会上传。已经生成的上传批次在租约仍有效时使用
+原有 `upload_id` 和 `batch_index` 重试，因此响应丢失不会造成重复入库。
+
+自动重连只负责当前进程生命周期内的恢复。尚未上传的结果缓存仍位于内存中，主机重启或
+进程被强制终止后的持久化恢复不在本功能范围内。
+
 ## IPv4/IPv6 自动探测
 
 扫描器启动时会分别绑定 IPv4 和 IPv6 发起公网 IP 探测，此后按配置周期刷新。探测结果、

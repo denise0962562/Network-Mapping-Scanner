@@ -6,6 +6,7 @@ mod heartbeat;
 mod http_client;
 mod logging;
 mod network;
+mod reconnect;
 mod register;
 mod scan;
 mod sysinfo;
@@ -13,12 +14,13 @@ mod types;
 mod upload;
 
 use crate::config::load;
-use crate::error::ScannerError;
+use crate::error::{ScannerError, ServerError};
 use crate::health::health_check;
-use crate::heartbeat::{ActiveTask, HeartbeatClient, HeartbeatEndpoints};
-use crate::http_client::{FetchTaskOutcome, fetch_task};
+use crate::heartbeat::{ActiveTask, HeartbeatClient, HeartbeatEndpoints, TaskCancellationReason};
+use crate::http_client::{FetchTaskOutcome, ServerHttpClient, fetch_task};
 use crate::logging::{LogLevel, init_logging};
 use crate::network::{NetworkDetector, SharedNetworkCapabilities};
+use crate::reconnect::{Backoff, ConnectionState, RetryPolicy};
 use crate::scan::{
     ScanCapabilities, ScanOutcome, ScanPlan, run_scan, validate_scanner_binary,
     validate_zgrab_binary,
@@ -28,7 +30,9 @@ use crate::types::{CacheManager, TargetParams};
 use crate::upload::Uploader;
 use clap::Parser;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::watch;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
@@ -73,6 +77,12 @@ struct Cli {
 // ---- globals ------------------------------------------------------------
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN: OnceLock<watch::Sender<bool>> = OnceLock::new();
+
+fn init_shutdown() {
+    let (sender, _) = watch::channel(false);
+    let _ = SHUTDOWN.set(sender);
+}
 
 fn stop_requested() -> bool {
     STOP.load(Ordering::Relaxed)
@@ -80,6 +90,16 @@ fn stop_requested() -> bool {
 
 fn request_stop() {
     STOP.store(true, Ordering::Relaxed);
+    if let Some(sender) = SHUTDOWN.get() {
+        let _ = sender.send(true);
+    }
+}
+
+fn shutdown_receiver() -> watch::Receiver<bool> {
+    SHUTDOWN
+        .get()
+        .expect("shutdown channel must be initialized")
+        .subscribe()
 }
 
 // ---- entry point --------------------------------------------------------
@@ -94,6 +114,7 @@ async fn main() {
 
 async fn run() -> Result<(), ScannerError> {
     let cli = Cli::parse();
+    init_shutdown();
 
     let logging_guard = init_logging(cli.debug, &cli.log_directory)?;
 
@@ -161,6 +182,12 @@ async fn run() -> Result<(), ScannerError> {
         runtime_token_configured = !cfg.scanner.runtime_token.is_empty(),
         upload_endpoint = %cfg.upload.endpoint,
         heartbeat_interval_seconds = cfg.scanner.heartbeat_interval_seconds,
+        connect_timeout_seconds = cfg.scanner.connect_timeout_seconds,
+        request_timeout_seconds = cfg.scanner.request_timeout_seconds,
+        reconnect_initial_delay_seconds = cfg.scanner.reconnect_initial_delay_seconds,
+        reconnect_max_delay_seconds = cfg.scanner.reconnect_max_delay_seconds,
+        active_task_reconnect_max_delay_seconds = cfg.scanner.active_task_reconnect_max_delay_seconds,
+        lease_safety_margin_seconds = cfg.scanner.lease_safety_margin_seconds,
         service_detection_enabled = cfg.service_detection.enabled,
         zgrab_path = %cfg.service_detection.zgrab_path,
         zgrab_senders = cfg.service_detection.senders,
@@ -211,13 +238,13 @@ async fn run() -> Result<(), ScannerError> {
             ));
         }
         println!("HEALTH CHECKING");
-        match health_check(
-            &cfg.scanner.task_url(true),
+        let client = ServerHttpClient::new(
             cfg.scanner.verify_tls,
-            &cfg.scanner.runtime_token,
-        )
-        .await
-        {
+            cfg.scanner.runtime_token.clone(),
+            Duration::from_secs(cfg.scanner.connect_timeout_seconds),
+            Duration::from_secs(cfg.scanner.request_timeout_seconds),
+        )?;
+        match health_check(&client, &cfg.scanner.task_url(true)).await {
             Ok(()) => {
                 log_event!(
                     LogLevel::Info,
@@ -254,33 +281,47 @@ async fn run() -> Result<(), ScannerError> {
     }
     let scanner_id = Uuid::parse_str(&cfg.scanner.scanner_id)
         .map_err(|error| ScannerError::Config(format!("invalid scanner.scanner_id: {error}")))?;
-
-    let uploader = Uploader::new(
-        cfg.upload.endpoint.clone(),
+    let server_client = ServerHttpClient::new(
         cfg.scanner.verify_tls,
         cfg.scanner.runtime_token.clone(),
-    );
+        Duration::from_secs(cfg.scanner.connect_timeout_seconds),
+        Duration::from_secs(cfg.scanner.request_timeout_seconds),
+    )?;
+
+    let uploader = Uploader::new(cfg.upload.endpoint.clone(), server_client.clone());
     let network_detector = NetworkDetector::new(cfg.network.clone(), cfg.scanner.verify_tls)?;
     let network_capabilities = SharedNetworkCapabilities::new(network_detector.detect().await);
     let scan_capabilities = ScanCapabilities::from_config(&cfg.service_detection);
     let network_probe_handle = network_detector.spawn(network_capabilities.clone());
     let heartbeat_client = HeartbeatClient::new(
+        server_client.clone(),
         HeartbeatEndpoints {
             heartbeat: cfg.scanner.heartbeat_url(),
             failure: cfg.scanner.task_failure_url(),
             cancelled: cfg.scanner.task_cancelled_url(),
         },
-        cfg.scanner.verify_tls,
-        cfg.scanner.runtime_token.clone(),
         scanner_id,
         network_capabilities,
         scan_capabilities,
-    )?;
+    );
     let active_task = ActiveTask::default();
+    let stop_bridge_handle = spawn_active_task_stop_bridge(active_task.clone());
+    let (connection_tx, connection_rx) = watch::channel(ConnectionState::Connecting);
     let heartbeat_handle = spawn_heartbeat(
         heartbeat_client.clone(),
         active_task.clone(),
-        cfg.scanner.heartbeat_interval_seconds,
+        connection_tx,
+        HeartbeatLoopConfig {
+            interval: Duration::from_secs(cfg.scanner.heartbeat_interval_seconds),
+            retry_policy: RetryPolicy::new(
+                Duration::from_secs(cfg.scanner.reconnect_initial_delay_seconds),
+                Duration::from_secs(cfg.scanner.reconnect_max_delay_seconds),
+            ),
+            active_retry_max: Duration::from_secs(
+                cfg.scanner.active_task_reconnect_max_delay_seconds,
+            ),
+            lease_safety_margin: Duration::from_secs(cfg.scanner.lease_safety_margin_seconds),
+        },
     );
     tracing::debug!(
         scanner_id = %scanner_id,
@@ -294,16 +335,21 @@ async fn run() -> Result<(), ScannerError> {
             ScanLoopConfig {
                 scanner_path: &cfg.scanner.scanner_path,
                 task_url: &task_url,
-                verify_tls: cfg.scanner.verify_tls,
-                runtime_token: &cfg.scanner.runtime_token,
+                server_client: &server_client,
                 scanner_id,
                 rate: cfg.scanner.rate as i32,
                 service_detection: &cfg.service_detection,
+                retry_policy: RetryPolicy::new(
+                    Duration::from_secs(cfg.scanner.reconnect_initial_delay_seconds),
+                    Duration::from_secs(cfg.scanner.reconnect_max_delay_seconds),
+                ),
+                lease_safety_margin: Duration::from_secs(cfg.scanner.lease_safety_margin_seconds),
             },
             &uploader,
             &heartbeat_client,
             &active_task,
             &mut cache,
+            connection_rx,
         )
         .await;
         println!("scan complete");
@@ -318,6 +364,7 @@ async fn run() -> Result<(), ScannerError> {
         tracing::warn!("final heartbeat failed: {}", error);
     }
     heartbeat_handle.abort();
+    stop_bridge_handle.abort();
     network_probe_handle.abort();
 
     log_event!(LogLevel::Info, "CLEANUP", "shutdown complete", "main");
@@ -358,6 +405,8 @@ async fn handle_identity(
         &loaded.app.scanner.c_server,
         loaded.app.scanner.c_port,
         loaded.app.scanner.verify_tls,
+        loaded.app.scanner.connect_timeout_seconds,
+        loaded.app.scanner.request_timeout_seconds,
         scanner_id,
         registration_token,
     )
@@ -388,30 +437,196 @@ fn spawn_signal_handler() {
     });
 }
 
+fn spawn_active_task_stop_bridge(active_task: ActiveTask) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        wait_for_stop().await;
+        active_task.request_shutdown().await;
+    })
+}
+
+async fn wait_for_stop() {
+    if stop_requested() {
+        return;
+    }
+    let mut shutdown = shutdown_receiver();
+    while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
+}
+
+async fn sleep_or_stop(duration: Duration) -> bool {
+    if stop_requested() {
+        return true;
+    }
+    let mut shutdown = shutdown_receiver();
+    tokio::select! {
+        _ = sleep(duration) => false,
+        _ = shutdown.changed() => true,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HeartbeatLoopConfig {
+    interval: Duration,
+    retry_policy: RetryPolicy,
+    active_retry_max: Duration,
+    lease_safety_margin: Duration,
+}
+
 fn spawn_heartbeat(
     client: HeartbeatClient,
     active_task: ActiveTask,
-    interval_seconds: u64,
+    connection_tx: watch::Sender<ConnectionState>,
+    config: HeartbeatLoopConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        tracing::debug!(interval_seconds, "heartbeat loop started");
-        loop {
-            let active_task_id = active_task.get().await;
+        let mut backoff = Backoff::new(config.retry_policy);
+        let mut shutdown = shutdown_receiver();
+        tracing::debug!(
+            interval_seconds = config.interval.as_secs(),
+            "heartbeat loop started"
+        );
+        while !stop_requested() {
+            let active_task_id =
+                if active_task.cancellation_reason() == Some(TaskCancellationReason::LeaseLost) {
+                    None
+                } else {
+                    active_task.get().await
+                };
             tracing::debug!(?active_task_id, "sending periodic heartbeat");
-            match client.send(active_task_id, false).await {
-                Ok(response) => client.apply_command(response, &active_task).await,
+            let send_result = if let Some(task_id) = active_task_id {
+                let remaining = active_task
+                    .lease_safety_remaining(config.lease_safety_margin)
+                    .await
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    active_task.request_lease_lost(task_id).await;
+                    continue;
+                }
+                tokio::select! {
+                    result = client.send(active_task_id, false) => result,
+                    _ = sleep(remaining) => {
+                        active_task.request_lease_lost(task_id).await;
+                        continue;
+                    }
+                    _ = shutdown.changed() => break,
+                }
+            } else {
+                tokio::select! {
+                    result = client.send(None, false) => result,
+                    _ = shutdown.changed() => break,
+                }
+            };
+            match send_result {
+                Ok(response) => {
+                    backoff.reset();
+                    client.apply_command(response, &active_task).await;
+                    publish_connection_state(&connection_tx, ConnectionState::Online);
+                    let next_interval = if active_task.get().await.is_some() {
+                        active_task
+                            .lease_safety_remaining(config.lease_safety_margin)
+                            .await
+                            .map(|remaining| {
+                                config
+                                    .interval
+                                    .min((remaining / 2).max(Duration::from_secs(1)))
+                            })
+                            .unwrap_or(config.interval)
+                    } else {
+                        config.interval
+                    };
+                    if sleep_or_stop(next_interval).await {
+                        break;
+                    }
+                }
+                Err(ScannerError::Server(error)) if error.is_retryable() => {
+                    publish_connection_state(&connection_tx, ConnectionState::Reconnecting);
+                    if let Some(task_id) = active_task_id
+                        && active_task
+                            .lease_safety_expired(config.lease_safety_margin)
+                            .await
+                    {
+                        active_task.request_lease_lost(task_id).await;
+                    }
+                    let maximum = active_task_id.map(|_| config.active_retry_max);
+                    let retry_after = error
+                        .retry_after()
+                        .map(|delay| maximum.map_or(delay, |maximum| delay.min(maximum)));
+                    let mut delay = backoff.next_delay(maximum, retry_after);
+                    if active_task_id.is_some()
+                        && let Some(remaining) = active_task
+                            .lease_safety_remaining(config.lease_safety_margin)
+                            .await
+                    {
+                        delay = delay.min(remaining);
+                    }
+                    tracing::warn!(
+                        attempt = backoff.failures(),
+                        retry_delay_seconds = delay.as_secs_f64(),
+                        error = %error,
+                        "heartbeat failed; reconnecting"
+                    );
+                    if sleep_or_stop(delay).await {
+                        break;
+                    }
+                }
+                Err(ScannerError::Server(ServerError::AuthRejected { .. })) => {
+                    publish_connection_state(&connection_tx, ConnectionState::AuthRejected);
+                    active_task.request_shutdown().await;
+                    tracing::error!("runtime token rejected; register the scanner again");
+                    request_stop();
+                    break;
+                }
+                Err(ScannerError::Server(ServerError::PolicyBlocked { .. })) => {
+                    publish_connection_state(&connection_tx, ConnectionState::PolicyBlocked);
+                    active_task.request_shutdown().await;
+                    tracing::error!("heartbeat blocked by server policy; stopping");
+                    request_stop();
+                    break;
+                }
+                Err(ScannerError::Server(error)) => {
+                    tracing::error!(%error, "non-retryable heartbeat failure; stopping");
+                    request_stop();
+                    break;
+                }
                 Err(error) => {
-                    tracing::warn!("heartbeat failed: {}", error);
-                    if error.to_string().contains("401 Unauthorized") {
-                        request_stop();
-                        tracing::error!("runtime token rejected by heartbeat endpoint; stopping");
+                    publish_connection_state(&connection_tx, ConnectionState::Reconnecting);
+                    let delay = backoff.next_delay(None, None);
+                    tracing::error!(%error, retry_delay_seconds = delay.as_secs_f64(), "heartbeat failed");
+                    if sleep_or_stop(delay).await {
                         break;
                     }
                 }
             }
-            sleep(Duration::from_secs(interval_seconds)).await;
         }
     })
+}
+
+fn publish_connection_state(sender: &watch::Sender<ConnectionState>, state: ConnectionState) {
+    if *sender.borrow() != state {
+        tracing::info!(?state, "server connection state changed");
+        let _ = sender.send(state);
+    }
+}
+
+async fn wait_until_online(receiver: &mut watch::Receiver<ConnectionState>) -> bool {
+    let mut shutdown = shutdown_receiver();
+    loop {
+        if stop_requested() {
+            return false;
+        }
+        match *receiver.borrow() {
+            ConnectionState::Online => return true,
+            ConnectionState::AuthRejected | ConnectionState::PolicyBlocked => return false,
+            ConnectionState::Connecting | ConnectionState::Reconnecting => {}
+        }
+        tokio::select! {
+            changed = receiver.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+            _ = shutdown.changed() => return false,
+        }
+    }
 }
 
 // ---- pipeline helpers ---------------------------------------------------
@@ -445,16 +660,48 @@ async fn flush(
     Ok(())
 }
 
+enum FlushAttempt {
+    Completed(Result<(), ScannerError>),
+    LeaseExpired(Uuid),
+    Stopped,
+}
+
+async fn flush_with_guards(
+    uploader: &Uploader,
+    scanner_id: Uuid,
+    cache: &mut CacheManager,
+    active_task: &ActiveTask,
+    lease_safety_margin: Duration,
+) -> FlushAttempt {
+    let Some(task_id) = active_task.get().await else {
+        return FlushAttempt::Completed(flush(uploader, scanner_id, cache).await);
+    };
+    let remaining = active_task
+        .lease_safety_remaining(lease_safety_margin)
+        .await
+        .unwrap_or_default();
+    if remaining.is_zero() {
+        return FlushAttempt::LeaseExpired(task_id);
+    }
+    let mut shutdown = shutdown_receiver();
+    tokio::select! {
+        result = flush(uploader, scanner_id, cache) => FlushAttempt::Completed(result),
+        _ = sleep(remaining) => FlushAttempt::LeaseExpired(task_id),
+        _ = shutdown.changed() => FlushAttempt::Stopped,
+    }
+}
+
 // ---- scan loop ----------------------------------------------------------
 
 struct ScanLoopConfig<'a> {
     scanner_path: &'a str,
     task_url: &'a str,
-    verify_tls: bool,
-    runtime_token: &'a str,
+    server_client: &'a ServerHttpClient,
     scanner_id: Uuid,
     rate: i32,
     service_detection: &'a crate::types::ServiceDetectionConfig,
+    retry_policy: RetryPolicy,
+    lease_safety_margin: Duration,
 }
 
 async fn scan_loop(
@@ -463,8 +710,10 @@ async fn scan_loop(
     heartbeat_client: &HeartbeatClient,
     active_task: &ActiveTask,
     cache: &mut CacheManager,
+    mut connection: watch::Receiver<ConnectionState>,
 ) {
-    let mut failures = 0u32;
+    let mut fetch_backoff = Backoff::new(config.retry_policy);
+    let mut upload_backoff = Backoff::new(config.retry_policy);
 
     tracing::debug!(
         scanner_id = %config.scanner_id,
@@ -475,89 +724,152 @@ async fn scan_loop(
 
     while !stop_requested() {
         if cache.has_pending_task() {
-            if let Err(error) = flush(uploader, config.scanner_id, cache).await {
-                log_event!(
-                    LogLevel::Error,
-                    "UPLOAD-ERROR",
-                    "upload failed",
-                    "scan_loop"
-                );
-                tracing::error!("upload failed; cached task retained: {}", error);
-                sleep(Duration::from_secs(5)).await;
+            if !wait_until_online(&mut connection).await {
+                break;
+            }
+            if active_task.cancellation_reason() == Some(TaskCancellationReason::LeaseLost) {
+                tracing::error!("discarding cached results after task lease loss");
+                cache.clear();
+                active_task.clear().await;
                 continue;
             }
-            active_task.clear().await;
+            match flush_with_guards(
+                uploader,
+                config.scanner_id,
+                cache,
+                active_task,
+                config.lease_safety_margin,
+            )
+            .await
+            {
+                FlushAttempt::LeaseExpired(task_id) => {
+                    active_task.request_lease_lost(task_id).await;
+                    tracing::error!(%task_id, "result upload stopped at the lease safety deadline");
+                    cache.clear();
+                    active_task.clear().await;
+                    continue;
+                }
+                FlushAttempt::Stopped => break,
+                FlushAttempt::Completed(Ok(())) => {
+                    upload_backoff.reset();
+                    active_task.clear().await;
+                }
+                FlushAttempt::Completed(Err(ScannerError::Server(error)))
+                    if error.is_retryable() =>
+                {
+                    log_event!(
+                        LogLevel::Warn,
+                        "UPLOAD-RETRY",
+                        "upload temporarily failed",
+                        "scan_loop"
+                    );
+                    let mut delay = upload_backoff.next_delay(None, error.retry_after());
+                    if let Some(remaining) = active_task
+                        .lease_safety_remaining(config.lease_safety_margin)
+                        .await
+                    {
+                        delay = delay.min(remaining);
+                    }
+                    tracing::warn!(
+                        attempt = upload_backoff.failures(),
+                        retry_delay_seconds = delay.as_secs_f64(),
+                        error = %error,
+                        "upload failed; cached task retained"
+                    );
+                    if sleep_or_stop(delay).await {
+                        break;
+                    }
+                    continue;
+                }
+                FlushAttempt::Completed(Err(ScannerError::Server(error)))
+                    if is_stale_task_error(&error) =>
+                {
+                    tracing::error!(%error, "server no longer accepts this task; discarding cached results");
+                    cache.clear();
+                    active_task.clear().await;
+                    continue;
+                }
+                FlushAttempt::Completed(Err(ScannerError::Server(error)))
+                    if stop_for_server_error(&error) =>
+                {
+                    break;
+                }
+                FlushAttempt::Completed(Err(error)) => {
+                    tracing::error!(%error, "non-retryable upload failure; stopping");
+                    request_stop();
+                    break;
+                }
+            }
         }
 
-        let assigned_task =
-            match fetch_task(config.task_url, config.verify_tls, config.runtime_token).await {
-                Ok(FetchTaskOutcome::Task(task)) => {
-                    failures = 0;
-                    tracing::debug!(
-                        task_id = %task.task_id,
-                        target_count = task.task_target.len(),
-                        ports = %task.task_port,
-                        "scan task received"
-                    );
-                    task
-                }
-                Ok(FetchTaskOutcome::NoTask) => {
-                    failures = 0;
-                    tracing::debug!(retry_delay_seconds = 5, "no scan task available");
-                    sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-                Ok(FetchTaskOutcome::Unauthorized { detail }) => {
-                    log_event!(
-                        LogLevel::Error,
-                        "AUTH",
-                        "runtime token rejected",
-                        "scan_loop"
-                    );
-                    tracing::error!(
-                        "runtime token rejected; register the scanner again: {}",
-                        detail
-                    );
+        if !wait_until_online(&mut connection).await {
+            break;
+        }
+        let assigned_task = match fetch_task(config.server_client, config.task_url).await {
+            Ok(FetchTaskOutcome::Task(task)) => {
+                fetch_backoff.reset();
+                tracing::debug!(
+                    task_id = %task.task_id,
+                    target_count = task.task_target.len(),
+                    ports = %task.task_port,
+                    lease_expires_at_ms = ?task.lease_expires_at_ms,
+                    lease_ttl_ms = task.lease_ttl_ms,
+                    "scan task received"
+                );
+                task
+            }
+            Ok(FetchTaskOutcome::NoTask) => {
+                fetch_backoff.reset();
+                tracing::debug!(retry_delay_seconds = 5, "no scan task available");
+                if sleep_or_stop(Duration::from_secs(5)).await {
                     break;
                 }
-                Ok(FetchTaskOutcome::Forbidden { detail }) => {
-                    log_event!(
-                        LogLevel::Error,
-                        "SERVER-POLICY",
-                        "task request forbidden",
-                        "scan_loop"
-                    );
-                    tracing::error!(
-                        "task request was blocked by server security middleware: {}",
-                        detail
-                    );
+                continue;
+            }
+            Err(error) if error.is_retryable() => {
+                let delay = fetch_backoff.next_delay(None, error.retry_after());
+                tracing::warn!(
+                    attempt = fetch_backoff.failures(),
+                    retry_delay_seconds = delay.as_secs_f64(),
+                    error = %error,
+                    "fetch task failed"
+                );
+                if sleep_or_stop(delay).await {
                     break;
                 }
-                Err(e) => {
-                    failures += 1;
-                    let delay = u64::from(failures.min(12)) * 5;
-                    tracing::warn!(
-                        attempt = failures,
-                        retry_delay_seconds = delay,
-                        error = %e,
-                        "fetch task failed"
-                    );
-                    sleep(Duration::from_secs(delay)).await;
-                    continue;
-                }
-            };
+                continue;
+            }
+            Err(error) if stop_for_server_error(&error) => break,
+            Err(error) => {
+                tracing::error!(%error, "non-retryable task request failure; stopping");
+                request_stop();
+                break;
+            }
+        };
+        active_task
+            .set(assigned_task.task_id, assigned_task.lease_ttl_ms)
+            .await;
         if let Err(message) = assigned_task.validate_targets() {
             tracing::error!(
                 task_id = %assigned_task.task_id,
                 error = %message,
                 "rejecting unsafe scan target"
             );
-            if let Err(error) = heartbeat_client
-                .report_terminal_failure(assigned_task.task_id, &message)
-                .await
+            if report_task_status_with_retry(
+                heartbeat_client,
+                active_task,
+                assigned_task.task_id,
+                TaskReport::TerminalFailure(&message),
+                config.retry_policy,
+                config.lease_safety_margin,
+            )
+            .await
             {
-                tracing::error!(%error, "failed to report unsafe scan target");
+                active_task.clear().await;
+            } else if stop_requested() {
                 break;
+            } else {
+                active_task.clear().await;
             }
             continue;
         }
@@ -574,19 +886,24 @@ async fn scan_loop(
                 address_family = %assigned_task.address_family,
                 "rejecting incompatible scan task"
             );
-            if let Err(error) = heartbeat_client.send(None, false).await {
-                tracing::warn!(%error, "failed to refresh network capability before rejecting task");
-            }
-            if let Err(error) = heartbeat_client
-                .report_failure(assigned_task.task_id, &message)
-                .await
+            if report_task_status_with_retry(
+                heartbeat_client,
+                active_task,
+                assigned_task.task_id,
+                TaskReport::Failure(&message),
+                config.retry_policy,
+                config.lease_safety_margin,
+            )
+            .await
             {
-                tracing::error!(%error, "failed to report incompatible task");
+                active_task.clear().await;
+            } else if stop_requested() {
                 break;
+            } else {
+                active_task.clear().await;
             }
             continue;
         }
-        active_task.set(assigned_task.task_id).await;
         tracing::debug!(task_id = %assigned_task.task_id, "task marked active");
 
         let target = TargetParams {
@@ -618,51 +935,80 @@ async fn scan_loop(
         .await
         {
             Ok(ScanOutcome::Completed(results)) => results,
-            Ok(ScanOutcome::Cancelled) => {
-                match heartbeat_client
-                    .report_cancelled(assigned_task.task_id)
-                    .await
-                {
-                    Ok(()) => {
+            Ok(ScanOutcome::Cancelled) => match active_task.cancellation_reason() {
+                Some(TaskCancellationReason::ServerRequested) => {
+                    let reported = report_task_status_with_retry(
+                        heartbeat_client,
+                        active_task,
+                        assigned_task.task_id,
+                        TaskReport::Cancelled,
+                        config.retry_policy,
+                        config.lease_safety_margin,
+                    )
+                    .await;
+                    if reported {
                         tracing::info!("task {} cancelled by server", assigned_task.task_id);
-                        active_task.clear().await;
-                        continue;
                     }
-                    Err(error) => {
-                        tracing::error!("failed to acknowledge task cancellation: {error}");
-                        break;
+                    active_task.clear().await;
+                    if stop_requested() {
+                        return;
                     }
+                    continue;
                 }
-            }
+                Some(TaskCancellationReason::LeaseLost) => {
+                    tracing::error!(task_id = %assigned_task.task_id, "scan stopped because its lease was lost");
+                    active_task.clear().await;
+                    continue;
+                }
+                Some(TaskCancellationReason::Shutdown) | None => return,
+            },
             Err(e) => {
                 log_event!(LogLevel::Error, "SCAN-ERROR", "scan failed", "scan_loop");
                 tracing::error!("scan error: {}", e);
-                let mut reported = false;
-                for attempt in 1..=3 {
-                    match heartbeat_client
-                        .report_failure(assigned_task.task_id, &e.to_string())
-                        .await
-                    {
-                        Ok(()) => {
-                            reported = true;
-                            active_task.clear().await;
-                            break;
-                        }
-                        Err(error) => {
-                            tracing::warn!("failed to report task failure ({attempt}/3): {error}");
-                            sleep(Duration::from_secs(2)).await;
-                        }
-                    }
-                }
-                if reported {
+                let error_message = e.to_string();
+                if report_task_status_with_retry(
+                    heartbeat_client,
+                    active_task,
+                    assigned_task.task_id,
+                    TaskReport::Failure(&error_message),
+                    config.retry_policy,
+                    config.lease_safety_margin,
+                )
+                .await
+                {
+                    active_task.clear().await;
                     continue;
                 }
-                tracing::error!(
-                    "task failure could not be reported; stopping to preserve lease ownership"
-                );
-                break;
+                if stop_requested() {
+                    break;
+                }
+                active_task.clear().await;
+                continue;
             }
         };
+
+        match active_task.cancellation_reason() {
+            Some(TaskCancellationReason::LeaseLost) => {
+                tracing::error!(task_id = %assigned_task.task_id, "discarding completed results after lease loss");
+                active_task.clear().await;
+                continue;
+            }
+            Some(TaskCancellationReason::Shutdown) => return,
+            Some(TaskCancellationReason::ServerRequested) => {
+                let _ = report_task_status_with_retry(
+                    heartbeat_client,
+                    active_task,
+                    assigned_task.task_id,
+                    TaskReport::Cancelled,
+                    config.retry_policy,
+                    config.lease_safety_margin,
+                )
+                .await;
+                active_task.clear().await;
+                continue;
+            }
+            None => {}
+        }
 
         tracing::debug!(
             task_id = %assigned_task.task_id,
@@ -686,9 +1032,7 @@ async fn scan_loop(
                 if let Err(error) = flush(uploader, config.scanner_id, cache).await {
                     tracing::error!("upload during shutdown failed: {}", error);
                 }
-                if stop_requested() {
-                    return;
-                }
+                return;
             }
 
             if let Err(e) = cache.insert(observation) {
@@ -712,9 +1056,130 @@ async fn scan_loop(
 
     tracing::debug!(stop_requested = stop_requested(), "scan loop exiting");
 
-    match flush(uploader, config.scanner_id, cache).await {
-        Ok(()) if !cache.has_pending_task() => active_task.clear().await,
-        Ok(()) => {}
-        Err(error) => tracing::error!("final scan-loop upload failed: {}", error),
+    if active_task.cancellation_reason() == Some(TaskCancellationReason::LeaseLost) {
+        cache.clear();
+        active_task.clear().await;
+    } else {
+        match flush(uploader, config.scanner_id, cache).await {
+            Ok(()) if !cache.has_pending_task() => active_task.clear().await,
+            Ok(()) => {}
+            Err(error) => tracing::error!("final scan-loop upload failed: {}", error),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TaskReport<'a> {
+    Failure(&'a str),
+    TerminalFailure(&'a str),
+    Cancelled,
+}
+
+async fn report_task_status_with_retry(
+    client: &HeartbeatClient,
+    active_task: &ActiveTask,
+    task_id: Uuid,
+    report: TaskReport<'_>,
+    retry_policy: RetryPolicy,
+    lease_safety_margin: Duration,
+) -> bool {
+    let mut backoff = Backoff::new(retry_policy);
+    loop {
+        if stop_requested()
+            || active_task.cancellation_reason() == Some(TaskCancellationReason::LeaseLost)
+        {
+            return false;
+        }
+        let remaining = active_task
+            .lease_safety_remaining(lease_safety_margin)
+            .await
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            active_task.request_lease_lost(task_id).await;
+            return false;
+        }
+        let report_future = async {
+            match report {
+                TaskReport::Failure(message) => client.report_failure(task_id, message).await,
+                TaskReport::TerminalFailure(message) => {
+                    client.report_terminal_failure(task_id, message).await
+                }
+                TaskReport::Cancelled => client.report_cancelled(task_id).await,
+            }
+        };
+        let mut shutdown = shutdown_receiver();
+        let result = tokio::select! {
+            result = report_future => result,
+            _ = sleep(remaining) => {
+                active_task.request_lease_lost(task_id).await;
+                return false;
+            }
+            _ = shutdown.changed() => return false,
+        };
+        match result {
+            Ok(()) => return true,
+            Err(ScannerError::Server(error)) if error.is_retryable() => {
+                if active_task.lease_safety_expired(lease_safety_margin).await {
+                    active_task.request_lease_lost(task_id).await;
+                    return false;
+                }
+                let mut delay = backoff.next_delay(None, error.retry_after());
+                if let Some(remaining) = active_task
+                    .lease_safety_remaining(lease_safety_margin)
+                    .await
+                {
+                    delay = delay.min(remaining);
+                }
+                tracing::warn!(
+                    attempt = backoff.failures(),
+                    retry_delay_seconds = delay.as_secs_f64(),
+                    error = %error,
+                    "task status report failed; retrying"
+                );
+                if sleep_or_stop(delay).await {
+                    return false;
+                }
+            }
+            Err(ScannerError::Server(error)) if is_stale_task_error(&error) => {
+                active_task.request_lease_lost(task_id).await;
+                return false;
+            }
+            Err(ScannerError::Server(error)) if stop_for_server_error(&error) => return false,
+            Err(error) => {
+                tracing::error!(%error, "non-retryable task status report failure");
+                request_stop();
+                return false;
+            }
+        }
+    }
+}
+
+fn is_stale_task_error(error: &ServerError) -> bool {
+    matches!(
+        error.status(),
+        Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::CONFLICT)
+    )
+}
+
+fn stop_for_server_error(error: &ServerError) -> bool {
+    match error {
+        ServerError::AuthRejected { .. } => {
+            log_event!(LogLevel::Error, "AUTH", "runtime token rejected", "main");
+            tracing::error!(%error, "register the scanner again");
+            request_stop();
+            true
+        }
+        ServerError::PolicyBlocked { .. } => {
+            log_event!(
+                LogLevel::Error,
+                "SERVER-POLICY",
+                "request forbidden",
+                "main"
+            );
+            tracing::error!(%error, "request blocked by server policy");
+            request_stop();
+            true
+        }
+        _ => false,
     }
 }
