@@ -329,7 +329,7 @@ fn extract_banner(module_data: &Value) -> Option<String> {
         if let Some(value) = module_data.pointer(pointer)
             && let Some(text) = banner_text(value)
         {
-            return Some(text.chars().take(MAX_BANNER_CHARS).collect());
+            return Some(strip_nul(text).chars().take(MAX_BANNER_CHARS).collect());
         }
     }
     None
@@ -341,8 +341,32 @@ fn banner_text(value: &Value) -> Option<&str> {
         .or_else(|| value.get("raw").and_then(Value::as_str))
 }
 
+// 服务端 PostgreSQL 的 text/jsonb 不接受 NUL 字节（22P05），抓取到的
+// 原始 banner/响应体常含 NUL，上传前必须剔除，否则服务端写库报错。
+fn strip_nul(value: &str) -> String {
+    if value.contains('\0') {
+        value.replace('\0', "")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn sanitize_json_value(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(strip_nul(&text)),
+        Value::Array(items) => Value::Array(items.into_iter().map(sanitize_json_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (strip_nul(&key), sanitize_json_value(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn bounded_detail(module: &str, module_data: &Value, max_result_bytes: usize) -> Value {
-    let serialized_bytes = serde_json::to_vec(module_data)
+    let module_data = sanitize_json_value(module_data.clone());
+    let serialized_bytes = serde_json::to_vec(&module_data)
         .map(|value| value.len())
         .unwrap_or(0);
     if serialized_bytes <= max_result_bytes {
@@ -580,5 +604,25 @@ done
                 .iter()
                 .any(|item| item.service.as_deref() == Some("http"))
         );
+    }
+
+    #[test]
+    fn strip_nul_removes_nul_characters() {
+        assert_eq!(strip_nul("a\u{0}b\u{0}c"), "abc");
+        assert_eq!(strip_nul("clean"), "clean");
+    }
+
+    #[test]
+    fn bounded_detail_strips_nul_from_nested_data() {
+        let module_data = json!({
+            "status": "success",
+            "result": {
+                "response": {"body": "bin\u{0}ary"},
+                "banner": "telnet\u{0}banner",
+            }
+        });
+        let detail = bounded_detail("http", &module_data, 1024);
+        assert_eq!(detail["data"]["result"]["response"]["body"], "binary");
+        assert_eq!(detail["data"]["result"]["banner"], "telnetbanner");
     }
 }
