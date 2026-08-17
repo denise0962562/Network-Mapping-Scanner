@@ -190,14 +190,15 @@ pub(crate) async fn run(
         .map_err(|e| ScannerError::Scan(format!("waitpid failed: {}", e)))?;
     let stderr_output = finish_scanner_stderr(stderr_handle).await;
 
-    tracing::debug!(
+    tracing::info!(
+        event = "PortDiscoveryCompleted",
         exit_code = ?status.code(),
         success = status.success(),
         elapsed_ms = started_at.elapsed().as_millis(),
         discovered_count,
         unknown_count,
         result_count = results.len(),
-        "masscan process finished"
+        "port discovery completed"
     );
 
     if !status.success() {

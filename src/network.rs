@@ -89,10 +89,15 @@ impl NetworkDetector {
             )
         );
         tracing::info!(
+            event = "NetworkCapabilitiesDetected",
+            ipv4_supported = ipv4.supported,
             ipv4_ready = ipv4.ready,
-            ipv4 = ?ipv4.public_ip,
+            ipv4 = ipv4.public_ip.as_deref().unwrap_or("-"),
+            ipv4_reason = ipv4.reason.as_deref().unwrap_or("-"),
+            ipv6_supported = ipv6.supported,
             ipv6_ready = ipv6.ready,
-            ipv6 = ?ipv6.public_ip,
+            ipv6 = ipv6.public_ip.as_deref().unwrap_or("-"),
+            ipv6_reason = ipv6.reason.as_deref().unwrap_or("-"),
             "network protocol detection completed"
         );
         NetworkCapabilities { ipv4, ipv6 }

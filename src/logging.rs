@@ -41,7 +41,8 @@ pub(crate) fn init_logging(
         .with_file(true)
         .with_line_number(true)
         .with_thread_ids(true)
-        .with_thread_names(true);
+        .with_thread_names(true)
+        .with_current_span(true);
 
     tracing_subscriber::registry()
         .with(env_filter)
