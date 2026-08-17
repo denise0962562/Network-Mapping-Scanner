@@ -37,11 +37,14 @@ impl Uploader {
             return Err(response_error(response, "upload results").await);
         }
         tracing::info!(
-            "uploaded {} observations for task {} batch {} to {}",
-            payload.observations.len(),
-            payload.task_id,
-            payload.batch_index,
-            self.endpoint
+            event = "ResultBatchUploaded",
+            task_id = %payload.task_id,
+            upload_id = %payload.upload_id,
+            batch_index = payload.batch_index,
+            is_final = payload.is_final,
+            observation_count = payload.observations.len(),
+            endpoint = %self.endpoint,
+            "scan result batch uploaded"
         );
         Ok(())
     }

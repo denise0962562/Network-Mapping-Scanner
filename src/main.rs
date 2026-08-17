@@ -22,7 +22,7 @@ use crate::logging::{LogLevel, init_logging};
 use crate::network::{NetworkDetector, SharedNetworkCapabilities};
 use crate::reconnect::{Backoff, ConnectionState, RetryPolicy};
 use crate::scan::{
-    ScanCapabilities, ScanOutcome, ScanPlan, run_scan, validate_scanner_binary,
+    ScanCapabilities, ScanObservation, ScanOutcome, ScanPlan, run_scan, validate_scanner_binary,
     validate_zgrab_binary,
 };
 use crate::sysinfo::SystemInfo;
@@ -33,7 +33,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
+use tracing::Instrument;
 use uuid::Uuid;
 
 // ---- CLI ----------------------------------------------------------------
@@ -651,11 +652,28 @@ async fn flush(
             "flushing cached scan observations"
         );
     }
+    let task_id = cache
+        .task_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    let upload_id = cache
+        .upload_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    let observation_count = cache.observations.len();
+    let batch_count = batches.len();
     for batch in &batches {
         uploader.upload(batch).await?;
         cache.mark_batch_uploaded(batch.batch_index)?;
     }
-    log_event!(LogLevel::Info, "UPLOAD", "upload complete", "flush");
+    tracing::info!(
+        event = "ResultUploadCompleted",
+        task_id = %task_id,
+        upload_id = %upload_id,
+        batch_count,
+        observation_count,
+        "all cached scan results uploaded"
+    );
     cache.clear();
     Ok(())
 }
@@ -917,14 +935,27 @@ async fn scan_loop(
             .clone()
             .unwrap_or_else(|| ScanPlan::legacy(config.service_detection));
 
+        let scan_started_at = Instant::now();
         tracing::info!(
-            "scanning {}:{} rate={}",
-            target.ip,
-            target.port,
-            target.rate
+            event = "ScanTaskStarted",
+            task_id = %assigned_task.task_id,
+            scan_profile = %scan_plan.profile,
+            stage_count = scan_plan.stages.len(),
+            address_family = %target.address_family,
+            targets = %target.ip,
+            ports = %target.port,
+            rate = target.rate,
+            service_detection_enabled = config.service_detection.enabled,
+            "scan task started"
         );
 
         let cancel_flag = active_task.cancellation_flag();
+        let scan_span = tracing::info_span!(
+            "scan_task",
+            task_id = %assigned_task.task_id,
+            scan_profile = %scan_plan.profile,
+            address_family = %target.address_family,
+        );
         let results = match run_scan(
             config.scanner_path,
             config.service_detection,
@@ -932,6 +963,7 @@ async fn scan_loop(
             &target,
             &cancel_flag,
         )
+        .instrument(scan_span)
         .await
         {
             Ok(ScanOutcome::Completed(results)) => results,
@@ -947,7 +979,13 @@ async fn scan_loop(
                     )
                     .await;
                     if reported {
-                        tracing::info!("task {} cancelled by server", assigned_task.task_id);
+                        tracing::info!(
+                            event = "ScanTaskCancelled",
+                            task_id = %assigned_task.task_id,
+                            reason = "server_requested",
+                            elapsed_ms = scan_started_at.elapsed().as_millis(),
+                            "scan task cancelled"
+                        );
                     }
                     active_task.clear().await;
                     if stop_requested() {
@@ -956,15 +994,27 @@ async fn scan_loop(
                     continue;
                 }
                 Some(TaskCancellationReason::LeaseLost) => {
-                    tracing::error!(task_id = %assigned_task.task_id, "scan stopped because its lease was lost");
+                    tracing::error!(
+                        event = "ScanTaskLeaseLost",
+                        task_id = %assigned_task.task_id,
+                        elapsed_ms = scan_started_at.elapsed().as_millis(),
+                        "scan stopped because its lease was lost"
+                    );
                     active_task.clear().await;
                     continue;
                 }
                 Some(TaskCancellationReason::Shutdown) | None => return,
             },
             Err(e) => {
-                log_event!(LogLevel::Error, "SCAN-ERROR", "scan failed", "scan_loop");
-                tracing::error!("scan error: {}", e);
+                tracing::error!(
+                    event = "ScanTaskFailed",
+                    task_id = %assigned_task.task_id,
+                    scan_profile = %scan_plan.profile,
+                    address_family = %target.address_family,
+                    elapsed_ms = scan_started_at.elapsed().as_millis(),
+                    error = %e,
+                    "scan task failed"
+                );
                 let error_message = e.to_string();
                 if report_task_status_with_retry(
                     heartbeat_client,
@@ -986,6 +1036,22 @@ async fn scan_loop(
                 continue;
             }
         };
+
+        let port_count = results
+            .iter()
+            .filter(|item| matches!(item, ScanObservation::Port(_)))
+            .count();
+        let service_count = results.len().saturating_sub(port_count);
+        tracing::info!(
+            event = "ScanTaskCompleted",
+            task_id = %assigned_task.task_id,
+            scan_profile = %scan_plan.profile,
+            elapsed_ms = scan_started_at.elapsed().as_millis(),
+            observation_count = results.len(),
+            port_count,
+            service_count,
+            "scan task completed"
+        );
 
         match active_task.cancellation_reason() {
             Some(TaskCancellationReason::LeaseLost) => {

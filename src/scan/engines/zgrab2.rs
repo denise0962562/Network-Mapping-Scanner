@@ -94,7 +94,11 @@ pub(crate) async fn run(
 ) -> Result<EngineOutcome, ScannerError> {
     let input = build_zgrab_input(open_ports);
     if input.is_empty() {
-        tracing::debug!("zgrab2 skipped; masscan found no TCP endpoints");
+        tracing::info!(
+            event = "ServiceDetectionSkipped",
+            reason = "no_tcp_endpoints",
+            "service detection skipped"
+        );
         return Ok(EngineOutcome::Completed(Vec::new()));
     }
 
@@ -175,6 +179,15 @@ pub(crate) async fn run(
         }
     }
 
+    if cancel_requested.load(Ordering::Relaxed) {
+        tracing::debug!(process_id = ?child.id(), "zgrab2 exited during cancellation");
+        input_handle.abort();
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let _ = finish_zgrab_stderr(stderr_handle).await;
+        return Ok(EngineOutcome::Cancelled);
+    }
+
     input_handle
         .await
         .map_err(|error| ScannerError::Scan(format!("zgrab2 input writer failed: {error}")))?
@@ -185,13 +198,22 @@ pub(crate) async fn run(
         .map_err(|error| ScannerError::Scan(format!("failed to wait for zgrab2: {error}")))?;
     let stderr_output = finish_zgrab_stderr(stderr_handle).await;
 
-    tracing::debug!(
+    if cancel_requested.load(Ordering::Relaxed) {
+        tracing::debug!(
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "zgrab2 completed while cancellation was pending"
+        );
+        return Ok(EngineOutcome::Cancelled);
+    }
+
+    tracing::info!(
+        event = "ServiceDetectionCompleted",
         exit_code = ?status.code(),
         success = status.success(),
         elapsed_ms = started_at.elapsed().as_millis(),
         result_count = results.len(),
         invalid_lines,
-        "zgrab2 service detection finished"
+        "service detection completed"
     );
     if !status.success() {
         let detail = if stderr_output.trim().is_empty() {
