@@ -101,7 +101,7 @@ pub(crate) async fn fetch_task(
             );
             Ok(FetchTaskOutcome::Task(task))
         }
-        StatusCode::NOT_FOUND => Ok(FetchTaskOutcome::NoTask),
+        StatusCode::NOT_FOUND | StatusCode::NO_CONTENT => Ok(FetchTaskOutcome::NoTask),
         _ => Err(response_error(response, "fetch task").await),
     }
 }
