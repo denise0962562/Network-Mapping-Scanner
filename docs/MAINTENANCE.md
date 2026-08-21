@@ -104,17 +104,30 @@ masscan 始终使用机器可读的 list 输出，不启用 `--banner`。旧的 
 
 zgrab2 使用 `multiple` 模式。扫描器把每个开放 TCP 端点编码成 `IP,,TAG,PORT`。
 `TAG` 根据端口映射为 `ssh`、`http`、`https`、`tls`、`smtp`、`mysql`、`postgres`
-等模块；未映射端口使用 `banner`。
+等模块；未映射端口使用 `banner`。SMTPS、FTPS、IMAPS、POP3S、MQTTS 使用独立
+TAG，但分别复用 zgrab2 的 `smtp`、`ftp`、`imap`、`pop3`、`mqtt` 模块及其隐式
+TLS 参数。
 
 - `status=success`：写入规范化 `service`，并提取可用的短 banner；
-- 超时、拒绝或协议错误：`service` 保持为空，结构化状态写入 observation 的 `data`；
+- 每个端点只保留最终服务关联的 `evidence`，不上传完整探测尝试和候选列表；
+- 应用模块根级结果已经包含 `tls` 时只保存一份应用握手，HTTPS 才额外关联独立 TLS；
+- 超时、拒绝或协议错误：`service` 保持为空，只保留探测次数，不保存所有失败详情；
 - 详细数据超过 `max_result_bytes`：只保留状态、错误、原大小和 `truncated=true`。
+
+已知隐式 TLS 端口优先执行应用协议：465 → SMTPS、990 → FTPS、993 → IMAPS、
+995 → POP3S、8883 → MQTTS。636（LDAPS）、853（DNS over TLS）以及 989（FTPS
+数据通道）目前仍只执行通用 TLS，因为扫描器尚无相应应用握手模块。自适应模式在非标准
+端口只获得 TLS 时不会提前结束，而会在剩余连接预算中优先尝试安全应用协议。
 
 若 `required=false`，zgrab2 进程启动失败或非零退出只记录警告，masscan 端口结果照常上报；
 若 `required=true`，此类错误使任务按现有可重试失败流程处理。任务取消会终止当前 masscan 或
 zgrab2 子进程。
 
 #### `cache.rs`
+
+上传批次按稳定顺序同时满足最多 500 条 observation 和序列化 JSON 不超过 8 MiB。
+任何单条 observation 超过 8 MiB 会在上传前返回明确错误；正常服务详情仍受更小的
+`max_result_bytes` 限制。
 
 ```rust
 impl CacheManager {
@@ -544,14 +557,22 @@ scanner-rs
       "banner": "HTTP/1.1 200 OK",
       "source": "zgrab2",
       "data": {
-        "source": "zgrab2",
-        "module": "http",
-        "data": {
-          "status": "success",
-          "protocol": "http",
-          "port": 80,
-          "result": {}
-        }
+        "schema_version": 2,
+        "confidence": 100,
+        "selected_probe": "http",
+        "attempt_count": 4,
+        "selection_reason": "protocol_handshake",
+        "evidence": [
+          {
+            "role": "application_handshake",
+            "module": "http",
+            "result": {
+              "response": {
+                "status_line": "HTTP/1.1 200 OK"
+              }
+            }
+          }
+        ]
       }
     }
   ]

@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 pub(crate) const UPLOAD_BATCH_SIZE: usize = 500;
+pub(crate) const UPLOAD_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const RESULT_PROTOCOL_VERSION: u16 = 2;
 
 impl CacheManager {
@@ -70,20 +71,20 @@ impl CacheManager {
             });
         }
 
-        let chunk_count = self.observations.len().div_ceil(UPLOAD_BATCH_SIZE);
-        let batches = self
-            .observations
-            .chunks(UPLOAD_BATCH_SIZE)
+        let ranges = upload_batch_ranges(&self.observations, scanner_id, task_id, upload_id)?;
+        let batch_count = ranges.len();
+        let batches = ranges
+            .into_iter()
             .enumerate()
             .skip(self.next_batch_index as usize)
-            .map(|(index, observations)| ScannerResultBatchUpload {
+            .map(|(index, range)| ScannerResultBatchUpload {
                 protocol_version: RESULT_PROTOCOL_VERSION,
                 scanner_id,
                 task_id,
                 upload_id,
                 batch_index: u32::try_from(index).expect("observation batch index fits in u32"),
-                is_final: index + 1 == chunk_count,
-                observations: observations.to_vec(),
+                is_final: index + 1 == batch_count,
+                observations: self.observations[range].to_vec(),
             })
             .collect();
         Ok(batches)
@@ -109,6 +110,73 @@ impl CacheManager {
             .map(ScanObservation::identity)
             .collect()
     }
+}
+
+fn upload_batch_ranges(
+    observations: &[ScanObservation],
+    scanner_id: Uuid,
+    task_id: Uuid,
+    upload_id: Uuid,
+) -> Result<Vec<std::ops::Range<usize>>, ScannerError> {
+    let observation_sizes = observations
+        .iter()
+        .map(|observation| {
+            serde_json::to_vec(observation)
+                .map(|json| json.len())
+                .map_err(|error| {
+                    ScannerError::Upload(format!(
+                        "failed to measure serialized observation: {error}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+
+    while start < observations.len() {
+        let batch_index = u32::try_from(ranges.len())
+            .map_err(|_| ScannerError::Upload("observation batch index exceeded u32".into()))?;
+        // `false` is one byte longer than `true`, so this is also a safe estimate
+        // for the final batch after its marker changes.
+        let empty_batch = ScannerResultBatchUpload {
+            protocol_version: RESULT_PROTOCOL_VERSION,
+            scanner_id,
+            task_id,
+            upload_id,
+            batch_index,
+            is_final: false,
+            observations: Vec::new(),
+        };
+        let mut serialized_bytes = serde_json::to_vec(&empty_batch)
+            .map_err(|error| {
+                ScannerError::Upload(format!("failed to measure upload batch: {error}"))
+            })?
+            .len();
+        let mut end = start;
+
+        while end < observations.len() && end - start < UPLOAD_BATCH_SIZE {
+            let separator_bytes = usize::from(end > start);
+            let candidate_bytes = serialized_bytes
+                .saturating_add(separator_bytes)
+                .saturating_add(observation_sizes[end]);
+            if candidate_bytes > UPLOAD_BATCH_MAX_BYTES {
+                if end == start {
+                    return Err(ScannerError::Upload(format!(
+                        "serialized observation at index {start} exceeds the {} byte upload limit",
+                        UPLOAD_BATCH_MAX_BYTES
+                    )));
+                }
+                break;
+            }
+            serialized_bytes = candidate_bytes;
+            end += 1;
+        }
+
+        ranges.push(start..end);
+        start = end;
+    }
+
+    Ok(ranges)
 }
 
 #[cfg(test)]
@@ -196,5 +264,57 @@ mod tests {
         let remaining = cache.upload_batches(Uuid::now_v7()).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].batch_index, 1);
+    }
+
+    #[test]
+    fn large_observations_are_split_at_the_serialized_byte_limit() {
+        let mut cache = CacheManager::default();
+        cache.begin_task(Uuid::now_v7()).unwrap();
+        for port in [443, 8443] {
+            cache
+                .insert(&ScanObservation::Service(ServiceObservation {
+                    ip: "192.0.2.1".into(),
+                    port,
+                    protocol: "tcp".into(),
+                    service: Some("https".into()),
+                    banner: None,
+                    source: "zgrab2",
+                    data: Some(serde_json::json!({
+                        "evidence": [{"result": "x".repeat(5 * 1024 * 1024)}]
+                    })),
+                }))
+                .unwrap();
+        }
+
+        let batches = cache.upload_batches(Uuid::now_v7()).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert!(batches.iter().all(|batch| batch.observations.len() == 1));
+        assert!(
+            batches.iter().all(|batch| {
+                serde_json::to_vec(batch).unwrap().len() <= UPLOAD_BATCH_MAX_BYTES
+            })
+        );
+    }
+
+    #[test]
+    fn single_observation_larger_than_upload_limit_is_rejected() {
+        let mut cache = CacheManager::default();
+        cache.begin_task(Uuid::now_v7()).unwrap();
+        cache
+            .insert(&ScanObservation::Service(ServiceObservation {
+                ip: "192.0.2.1".into(),
+                port: 443,
+                protocol: "tcp".into(),
+                service: Some("https".into()),
+                banner: None,
+                source: "zgrab2",
+                data: Some(serde_json::json!({
+                    "evidence": [{"result": "x".repeat(UPLOAD_BATCH_MAX_BYTES)}]
+                })),
+            }))
+            .unwrap();
+
+        let error = cache.upload_batches(Uuid::now_v7()).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
     }
 }
