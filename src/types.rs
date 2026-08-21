@@ -104,6 +104,9 @@ pub(crate) struct AppConfig {
 pub(crate) struct ServiceDetectionConfig {
     pub(crate) enabled: bool,
     pub(crate) required: bool,
+    pub(crate) strategy: ServiceDetectionStrategy,
+    pub(crate) max_probes_per_endpoint: usize,
+    pub(crate) confidence_threshold: u8,
     pub(crate) zgrab_path: String,
     pub(crate) senders: u32,
     pub(crate) server_rate_limit: u32,
@@ -112,11 +115,33 @@ pub(crate) struct ServiceDetectionConfig {
     pub(crate) max_result_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ServiceDetectionStrategy {
+    #[default]
+    Standard,
+    Adaptive,
+    Exhaustive,
+}
+
+impl ServiceDetectionStrategy {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Adaptive => "adaptive",
+            Self::Exhaustive => "exhaustive",
+        }
+    }
+}
+
 impl Default for ServiceDetectionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             required: false,
+            strategy: ServiceDetectionStrategy::Standard,
+            max_probes_per_endpoint: 8,
+            confidence_threshold: 80,
             zgrab_path: "zgrab2".into(),
             senders: 200,
             server_rate_limit: 20,

@@ -1,8 +1,10 @@
 use crate::error::ScannerError;
+use crate::scan::detection::{
+    ProbeAttempt, ProbeEvidence, ProbeKind, aggregate, fallback_attempts, initial_attempts,
+};
 use crate::scan::{PortObservation, ServiceObservation};
 use crate::types::ServiceDetectionConfig;
 use serde_json::{Value, json};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -17,6 +19,11 @@ const MAX_BANNER_CHARS: usize = 1024;
 
 pub(crate) enum EngineOutcome {
     Completed(Vec<ServiceObservation>),
+    Cancelled,
+}
+
+enum ProcessOutcome {
+    Completed(Vec<ProbeEvidence>),
     Cancelled,
 }
 
@@ -92,8 +99,8 @@ pub(crate) async fn run(
     address_family: &str,
     cancel_requested: &AtomicBool,
 ) -> Result<EngineOutcome, ScannerError> {
-    let input = build_zgrab_input(open_ports);
-    if input.is_empty() {
+    let initial = initial_attempts(open_ports, config);
+    if initial.is_empty() {
         tracing::info!(
             event = "ServiceDetectionSkipped",
             reason = "no_tcp_endpoints",
@@ -102,11 +109,46 @@ pub(crate) async fn run(
         return Ok(EngineOutcome::Completed(Vec::new()));
     }
 
+    let mut evidence =
+        match run_attempts(config, &initial, address_family, cancel_requested).await? {
+            ProcessOutcome::Completed(evidence) => evidence,
+            ProcessOutcome::Cancelled => return Ok(EngineOutcome::Cancelled),
+        };
+    let fallback = fallback_attempts(open_ports, &initial, &evidence, config);
+    if !fallback.is_empty() {
+        tracing::debug!(
+            endpoint_count = fallback
+                .iter()
+                .map(|attempt| (&attempt.ip, attempt.port))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            probe_count = fallback.len(),
+            "running adaptive service detection fallback round"
+        );
+        match run_attempts(config, &fallback, address_family, cancel_requested).await? {
+            ProcessOutcome::Completed(mut fallback_evidence) => {
+                evidence.append(&mut fallback_evidence)
+            }
+            ProcessOutcome::Cancelled => return Ok(EngineOutcome::Cancelled),
+        }
+    }
+
+    Ok(EngineOutcome::Completed(aggregate(&evidence, config)))
+}
+
+async fn run_attempts(
+    config: &ServiceDetectionConfig,
+    attempts: &[ProbeAttempt],
+    address_family: &str,
+    cancel_requested: &AtomicBool,
+) -> Result<ProcessOutcome, ScannerError> {
+    let input = build_zgrab_input(attempts);
+
     let config_file = TempZgrabConfig::create(config).await?;
     let started_at = Instant::now();
     tracing::debug!(
         zgrab_path = %config.zgrab_path,
-        endpoint_count = input.lines().count(),
+        probe_count = input.lines().count(),
         senders = config.senders,
         server_rate_limit = config.server_rate_limit,
         address_family,
@@ -161,7 +203,7 @@ pub(crate) async fn run(
             let _ = child.wait().await;
             input_handle.abort();
             let _ = finish_zgrab_stderr(stderr_handle).await;
-            return Ok(EngineOutcome::Cancelled);
+            return Ok(ProcessOutcome::Cancelled);
         }
 
         let line = tokio::select! {
@@ -185,7 +227,7 @@ pub(crate) async fn run(
         let _ = child.kill().await;
         let _ = child.wait().await;
         let _ = finish_zgrab_stderr(stderr_handle).await;
-        return Ok(EngineOutcome::Cancelled);
+        return Ok(ProcessOutcome::Cancelled);
     }
 
     input_handle
@@ -203,7 +245,7 @@ pub(crate) async fn run(
             elapsed_ms = started_at.elapsed().as_millis(),
             "zgrab2 completed while cancellation was pending"
         );
-        return Ok(EngineOutcome::Cancelled);
+        return Ok(ProcessOutcome::Cancelled);
     }
 
     tracing::info!(
@@ -226,49 +268,26 @@ pub(crate) async fn run(
         )));
     }
 
-    Ok(EngineOutcome::Completed(results))
+    Ok(ProcessOutcome::Completed(results))
 }
 
-fn build_zgrab_input(open_ports: &[PortObservation]) -> String {
-    let mut seen = HashSet::new();
+fn build_zgrab_input(attempts: &[ProbeAttempt]) -> String {
     let mut input = String::new();
-    for result in open_ports {
-        if result.protocol != "tcp" || !seen.insert((&result.ip, result.port)) {
-            continue;
-        }
-        let module = probe_module_for_port(result.port);
-        input.push_str(&format!("{},,{},{}\n", result.ip, module, result.port));
+    for attempt in attempts {
+        input.push_str(&format!(
+            "{},,{},{}\n",
+            attempt.ip,
+            attempt.probe.name(),
+            attempt.port
+        ));
     }
     input
-}
-
-fn probe_module_for_port(port: u16) -> &'static str {
-    match port {
-        21 => "ftp",
-        22 => "ssh",
-        23 => "telnet",
-        25 | 587 => "smtp",
-        80 | 8000 | 8008 | 8080 | 8081 | 8888 => "http",
-        110 => "pop3",
-        143 => "imap",
-        443 | 4443 | 8443 | 9443 => "https",
-        445 => "smb",
-        465 | 636 | 853 | 989 | 990 | 993 | 995 => "tls",
-        1883 => "mqtt",
-        3306 => "mysql",
-        3389 => "rdp",
-        5432 => "postgres",
-        6379 => "redis",
-        11211 => "memcached",
-        27017 => "mongodb",
-        _ => "banner",
-    }
 }
 
 fn parse_zgrab_line(
     line: &str,
     max_result_bytes: usize,
-) -> Result<Vec<ServiceObservation>, ScannerError> {
+) -> Result<Vec<ProbeEvidence>, ScannerError> {
     let root: Value = serde_json::from_str(line)?;
     let ip = root
         .get("ip")
@@ -293,30 +312,19 @@ fn parse_zgrab_line(
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        let success = status == "success";
-        let service = success
-            .then(|| normalized_service(module))
-            .flatten()
-            .map(str::to_owned);
-        let banner = success.then(|| extract_banner(module_data)).flatten();
-        results.push(ServiceObservation {
+        let banner = (status == "success")
+            .then(|| extract_banner(module_data))
+            .flatten();
+        results.push(ProbeEvidence {
             ip: ip.to_owned(),
             port,
-            protocol: "tcp".into(),
-            service,
+            module: module.to_owned(),
+            status: status.to_owned(),
             banner,
-            source: "zgrab2",
-            data: Some(bounded_detail(module, module_data, max_result_bytes)),
+            detail: bounded_detail(module, module_data, max_result_bytes),
         });
     }
     Ok(results)
-}
-
-fn normalized_service(module: &str) -> Option<&str> {
-    match module {
-        "banner" => None,
-        value => Some(value),
-    }
 }
 
 fn extract_banner(module_data: &Value) -> Option<String> {
@@ -425,33 +433,14 @@ fn zgrab_config(config: &ServiceDetectionConfig) -> String {
         config.connect_timeout_seconds, config.target_timeout_seconds
     );
     let mut output = String::from("[Application Options]\n\n");
-    for (section, name, port, extra) in [
-        ("ftp", "ftp", 21, ""),
-        ("ssh", "ssh", 22, ""),
-        ("telnet", "telnet", 23, ""),
-        ("smtp", "smtp", 25, ""),
-        ("http", "http", 80, "endpoint=\"/\"\nmax-redirects=0\n"),
-        ("pop3", "pop3", 110, ""),
-        ("imap", "imap", 143, ""),
-        (
-            "http",
-            "https",
-            443,
-            "use-https=true\nendpoint=\"/\"\nmax-redirects=0\n",
-        ),
-        ("smb", "smb", 445, ""),
-        ("tls", "tls", 443, ""),
-        ("mqtt", "mqtt", 1883, ""),
-        ("mysql", "mysql", 3306, ""),
-        ("rdp", "rdp", 3389, ""),
-        ("postgres", "postgres", 5432, ""),
-        ("redis", "redis", 6379, ""),
-        ("memcached", "memcached", 11211, ""),
-        ("mongodb", "mongodb", 27017, ""),
-        ("banner", "banner", 80, ""),
-    ] {
+    for probe in ProbeKind::ALL {
         output.push_str(&format!(
-            "[{section}]\nname=\"{name}\"\ntrigger=\"{name}\"\nport={port}\n{timeout}{extra}\n"
+            "[{}]\nname=\"{}\"\ntrigger=\"{}\"\nport={}\n{timeout}{}\n",
+            probe.section(),
+            probe.name(),
+            probe.name(),
+            probe.default_port(),
+            probe.extra_config(),
         ));
     }
     output
@@ -499,14 +488,20 @@ mod tests {
     }
 
     #[test]
-    fn input_deduplicates_tcp_targets_and_tags_modules() {
+    fn input_tags_each_probe_and_overrides_its_port() {
         let input = build_zgrab_input(&[
-            open_port("192.0.2.1", 22, "tcp"),
-            open_port("192.0.2.1", 22, "tcp"),
-            open_port("192.0.2.1", 53, "udp"),
-            open_port("2001:db8::1", 443, "tcp"),
+            ProbeAttempt {
+                ip: "192.0.2.1".into(),
+                port: 2222,
+                probe: ProbeKind::Ssh,
+            },
+            ProbeAttempt {
+                ip: "2001:db8::1".into(),
+                port: 10443,
+                probe: ProbeKind::Https,
+            },
         ]);
-        assert_eq!(input, "192.0.2.1,,ssh,22\n2001:db8::1,,https,443\n");
+        assert_eq!(input, "192.0.2.1,,ssh,2222\n2001:db8::1,,https,10443\n");
     }
 
     #[test]
@@ -514,21 +509,19 @@ mod tests {
         let line = r#"{"ip":"192.0.2.1","data":{"http":{"status":"success","protocol":"http","port":8080,"result":{"response":{"status_line":"HTTP/1.1 200 OK"}}}}}"#;
         let results = parse_zgrab_line(line, 65_536).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].service.as_deref(), Some("http"));
+        assert_eq!(results[0].module, "http");
+        assert_eq!(results[0].status, "success");
         assert_eq!(results[0].banner.as_deref(), Some("HTTP/1.1 200 OK"));
-        assert_eq!(results[0].data.as_ref().unwrap()["source"], "zgrab2");
+        assert_eq!(results[0].detail["source"], "zgrab2");
     }
 
     #[test]
-    fn failed_probe_preserves_open_port_without_claiming_service() {
+    fn failed_probe_preserves_status_and_detail() {
         let line = r#"{"ip":"192.0.2.2","data":{"ssh":{"status":"connection-timeout","protocol":"ssh","port":22,"error":"timeout"}}}"#;
         let results = parse_zgrab_line(line, 65_536).unwrap();
         assert_eq!(results[0].port, 22);
-        assert!(results[0].service.is_none());
-        assert_eq!(
-            results[0].data.as_ref().unwrap()["data"]["status"],
-            "connection-timeout"
-        );
+        assert_eq!(results[0].status, "connection-timeout");
+        assert_eq!(results[0].detail["data"]["status"], "connection-timeout");
     }
 
     #[test]
@@ -538,8 +531,7 @@ mod tests {
             "x".repeat(2048)
         );
         let results = parse_zgrab_line(&line, 1024).unwrap();
-        assert_eq!(results[0].data.as_ref().unwrap()["truncated"], true);
-        assert!(results[0].service.is_none());
+        assert_eq!(results[0].detail["truncated"], true);
     }
 
     #[test]
@@ -604,6 +596,59 @@ done
                 .iter()
                 .any(|item| item.service.as_deref() == Some("http"))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adaptive_fallback_identifies_mysql_on_a_nonstandard_port() {
+        use crate::types::ServiceDetectionStrategy;
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "scanner-rs-fake-adaptive-zgrab2-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        std::fs::write(
+            &path,
+            br#"#!/bin/sh
+while IFS=',' read -r ip domain tag port; do
+  if [ "$tag" = "mysql" ]; then
+    status=success
+  else
+    status=protocol-error
+  fi
+  printf '{"ip":"%s","data":{"%s":{"status":"%s","protocol":"%s","port":%s,"result":{"banner":"mysql identified"}}}}\n' "$ip" "$tag" "$status" "$tag" "$port"
+done
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let config = ServiceDetectionConfig {
+            enabled: true,
+            strategy: ServiceDetectionStrategy::Adaptive,
+            max_probes_per_endpoint: 8,
+            zgrab_path: path.to_string_lossy().into_owned(),
+            ..ServiceDetectionConfig::default()
+        };
+        let outcome = run(
+            &config,
+            &[open_port("192.0.2.20", 13306, "tcp")],
+            "ipv4",
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let EngineOutcome::Completed(results) = outcome else {
+            panic!("service detection must complete");
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].port, 13306);
+        assert_eq!(results[0].service.as_deref(), Some("mysql"));
+        assert_eq!(results[0].data.as_ref().unwrap()["attempt_count"], 8);
     }
 
     #[test]

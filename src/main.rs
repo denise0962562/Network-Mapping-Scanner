@@ -190,6 +190,8 @@ async fn run() -> Result<(), ScannerError> {
         active_task_reconnect_max_delay_seconds = cfg.scanner.active_task_reconnect_max_delay_seconds,
         lease_safety_margin_seconds = cfg.scanner.lease_safety_margin_seconds,
         service_detection_enabled = cfg.service_detection.enabled,
+        service_detection_strategy = cfg.service_detection.strategy.as_str(),
+        service_detection_max_probes = cfg.service_detection.max_probes_per_endpoint,
         zgrab_path = %cfg.service_detection.zgrab_path,
         zgrab_senders = cfg.service_detection.senders,
         "effective scanner configuration"
@@ -221,6 +223,11 @@ async fn run() -> Result<(), ScannerError> {
     if cfg.service_detection.enabled {
         println!("zgrab.path         = {}", cfg.service_detection.zgrab_path);
         println!("zgrab.senders      = {}", cfg.service_detection.senders);
+        println!(
+            "zgrab.strategy     = {} (max {} probes/endpoint)",
+            cfg.service_detection.strategy.as_str(),
+            cfg.service_detection.max_probes_per_endpoint
+        );
     }
     println!(
         "heartbeat.interval = {}s",
@@ -1041,7 +1048,13 @@ async fn scan_loop(
             .iter()
             .filter(|item| matches!(item, ScanObservation::Port(_)))
             .count();
-        let service_count = results.len().saturating_sub(port_count);
+        let service_observation_count = results.len().saturating_sub(port_count);
+        let service_count = results
+            .iter()
+            .filter(|item| {
+                matches!(item, ScanObservation::Service(service) if service.service.is_some())
+            })
+            .count();
         tracing::info!(
             event = "ScanTaskCompleted",
             task_id = %assigned_task.task_id,
@@ -1049,6 +1062,7 @@ async fn scan_loop(
             elapsed_ms = scan_started_at.elapsed().as_millis(),
             observation_count = results.len(),
             port_count,
+            service_observation_count,
             service_count,
             "scan task completed"
         );

@@ -27,6 +27,12 @@ lease_safety_margin_seconds = 10
 enabled = true
 # If false, a zgrab2 process failure still uploads the discovered open ports.
 required = false
+# standard keeps one port-mapped probe; adaptive adds bounded fallback probes;
+# exhaustive tries every supported safe protocol module on each TCP endpoint.
+strategy = "adaptive"
+max_probes_per_endpoint = 8
+# Only candidates at or above this confidence are reported as identified services.
+confidence_threshold = 80
 zgrab_path = "zgrab2"
 # Connection workers and per-target-IP connection rate.
 senders = 200

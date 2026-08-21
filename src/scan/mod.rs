@@ -1,3 +1,4 @@
+mod detection;
 mod engines;
 mod observation;
 mod orchestrator;

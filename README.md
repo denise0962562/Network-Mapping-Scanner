@@ -26,6 +26,9 @@ cargo build --release
 [service_detection]
 enabled = true
 required = false
+strategy = "adaptive"
+max_probes_per_endpoint = 8
+confidence_threshold = 80
 zgrab_path = "zgrab2"
 senders = 200
 server_rate_limit = 20
@@ -35,6 +38,11 @@ max_result_bytes = 65536
 ```
 
 - `required = false` 时，zgrab2 整体失败仍会上报 masscan 已发现的开放端口。
+- `strategy = "standard"` 保持按端口选择单个协议的旧行为；`adaptive` 先执行
+  Banner、TLS 和 HTTP(S) 探测，再为未识别端点执行预算内的协议回退；`exhaustive`
+  会对每个 TCP 端点执行全部受支持模块。
+- `max_probes_per_endpoint` 限制 `adaptive` 模式对每个端点建立的探测连接数；
+  `confidence_threshold` 控制写入 `service` 字段所需的最低置信度。
 - 单个协议握手超时或不匹配不会抹掉端口观察，只会在 service observation 的 `data` 中记录探测状态。
 - 未配置 `[service_detection]` 的旧配置默认关闭该功能。
 - zgrab2 使用系统 TCP 栈，`senders` 和 `server_rate_limit` 应从较低值开始压测，不能照搬
