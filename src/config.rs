@@ -130,6 +130,16 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
             "must not be empty when service detection is enabled",
         ),
         (
+            "service_detection.max_probes_per_endpoint",
+            !(1..=32).contains(&cfg.service_detection.max_probes_per_endpoint),
+            "must be between 1 and 32",
+        ),
+        (
+            "service_detection.confidence_threshold",
+            !(1..=100).contains(&cfg.service_detection.confidence_threshold),
+            "must be between 1 and 100",
+        ),
+        (
             "service_detection.senders",
             !(1..=10_000).contains(&cfg.service_detection.senders),
             "must be between 1 and 10000",
