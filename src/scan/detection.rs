@@ -6,16 +6,21 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ProbeKind {
     Ftp,
+    Ftps,
     Ssh,
     Telnet,
     Smtp,
+    Smtps,
     Http,
     Pop3,
+    Pop3s,
     Imap,
+    Imaps,
     Https,
     Smb,
     Tls,
     Mqtt,
+    Mqtts,
     Mysql,
     Rdp,
     Postgres,
@@ -26,7 +31,7 @@ pub(crate) enum ProbeKind {
 }
 
 impl ProbeKind {
-    pub(crate) const ALL: [Self; 18] = [
+    pub(crate) const ALL: [Self; 23] = [
         Self::Banner,
         Self::Tls,
         Self::Http,
@@ -42,9 +47,14 @@ impl ProbeKind {
         Self::Postgres,
         Self::Mongodb,
         Self::Mqtt,
+        Self::Mqtts,
         Self::Smb,
         Self::Rdp,
         Self::Memcached,
+        Self::Smtps,
+        Self::Ftps,
+        Self::Pop3s,
+        Self::Imaps,
     ];
 
     const ADAPTIVE_FALLBACK: [Self; 14] = [
@@ -64,19 +74,32 @@ impl ProbeKind {
         Self::Imap,
     ];
 
+    const ADAPTIVE_TLS_FALLBACK: [Self; 5] = [
+        Self::Mqtts,
+        Self::Smtps,
+        Self::Imaps,
+        Self::Pop3s,
+        Self::Ftps,
+    ];
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Ftp => "ftp",
+            Self::Ftps => "ftps",
             Self::Ssh => "ssh",
             Self::Telnet => "telnet",
             Self::Smtp => "smtp",
+            Self::Smtps => "smtps",
             Self::Http => "http",
             Self::Pop3 => "pop3",
+            Self::Pop3s => "pop3s",
             Self::Imap => "imap",
+            Self::Imaps => "imaps",
             Self::Https => "https",
             Self::Smb => "smb",
             Self::Tls => "tls",
             Self::Mqtt => "mqtt",
+            Self::Mqtts => "mqtts",
             Self::Mysql => "mysql",
             Self::Rdp => "rdp",
             Self::Postgres => "postgres",
@@ -90,6 +113,11 @@ impl ProbeKind {
     pub(crate) fn section(self) -> &'static str {
         match self {
             Self::Https => "http",
+            Self::Ftps => "ftp",
+            Self::Smtps => "smtp",
+            Self::Pop3s => "pop3",
+            Self::Imaps => "imap",
+            Self::Mqtts => "mqtt",
             value => value.name(),
         }
     }
@@ -97,15 +125,20 @@ impl ProbeKind {
     pub(crate) fn default_port(self) -> u16 {
         match self {
             Self::Ftp => 21,
+            Self::Ftps => 990,
             Self::Ssh => 22,
             Self::Telnet => 23,
             Self::Smtp => 25,
+            Self::Smtps => 465,
             Self::Http | Self::Banner => 80,
             Self::Pop3 => 110,
+            Self::Pop3s => 995,
             Self::Imap => 143,
+            Self::Imaps => 993,
             Self::Https | Self::Tls => 443,
             Self::Smb => 445,
             Self::Mqtt => 1883,
+            Self::Mqtts => 8883,
             Self::Mysql => 3306,
             Self::Rdp => 3389,
             Self::Postgres => 5432,
@@ -119,6 +152,11 @@ impl ProbeKind {
         match self {
             Self::Http => "endpoint=\"/\"\nmax-redirects=0\n",
             Self::Https => "use-https=true\nendpoint=\"/\"\nmax-redirects=0\n",
+            Self::Ftps => "implicit-tls=true\n",
+            Self::Smtps => "smtps=true\n",
+            Self::Pop3s => "pop3s=true\n",
+            Self::Imaps => "imaps=true\n",
+            Self::Mqtts => "tls=true\n",
             _ => "",
         }
     }
@@ -220,7 +258,18 @@ pub(crate) fn fallback_attempts(
             .saturating_sub(*counts.get(&(ip.clone(), port)).unwrap_or(&0));
         // Banner already covers server-first text protocols well, so spend the
         // bounded fallback budget on binary/client-first protocols first.
-        for probe in ProbeKind::ADAPTIVE_FALLBACK {
+        let tls_succeeded = evidence.iter().any(|item| {
+            item.ip == ip
+                && item.port == port
+                && item.module == ProbeKind::Tls.name()
+                && item.status == "success"
+        });
+        let fallback_probes: &[ProbeKind] = if tls_succeeded {
+            &ProbeKind::ADAPTIVE_TLS_FALLBACK
+        } else {
+            &ProbeKind::ADAPTIVE_FALLBACK
+        };
+        for &probe in fallback_probes {
             if remaining == 0 {
                 break;
             }
@@ -265,35 +314,23 @@ pub(crate) fn aggregate(
                         .find(|item| item.module == ProbeKind::Banner.name())
                         .and_then(|item| item.banner.clone())
                 });
-            let attempts: Vec<Value> = evidence
-                .iter()
-                .map(|item| {
-                    json!({
-                        "module": item.module,
-                        "status": item.status,
-                        "error": item.detail.pointer("/data/error"),
-                    })
-                })
-                .collect();
-            let candidate_details: Vec<Value> = candidates
-                .iter()
-                .map(|candidate| {
-                    json!({
-                        "service": candidate.service,
-                        "confidence": candidate.score,
-                        "reason": candidate.reason,
-                    })
-                })
-                .collect();
+            let mut retained_evidence = selected_evidence
+                .map(|item| vec![retained_handshake(item)])
+                .unwrap_or_default();
+            if selected_evidence.is_some_and(|item| item.module == ProbeKind::Https.name())
+                && let Some(tls) = evidence
+                    .iter()
+                    .find(|item| item.module == ProbeKind::Tls.name() && item.status == "success")
+            {
+                retained_evidence.push(retained_handshake(tls));
+            }
             let data = json!({
-                "source": "zgrab2",
-                "strategy": config.strategy.as_str(),
+                "schema_version": 2,
                 "confidence": selected.map(|candidate| candidate.score).unwrap_or(0),
                 "selected_probe": selected_evidence.map(|item| item.module.as_str()),
                 "attempt_count": evidence.len(),
-                "attempts": attempts,
-                "candidates": candidate_details,
-                "selected_detail": selected_evidence.map(|item| &item.detail),
+                "selection_reason": selected.map(|candidate| candidate.reason),
+                "evidence": retained_evidence,
             });
             ServiceObservation {
                 ip,
@@ -306,6 +343,24 @@ pub(crate) fn aggregate(
             }
         })
         .collect()
+}
+
+fn retained_handshake(item: &ProbeEvidence) -> Value {
+    let role = match ProbeKind::from_name(&item.module) {
+        Some(ProbeKind::Tls) => "transport_security",
+        Some(ProbeKind::Banner) => "banner",
+        _ => "application_handshake",
+    };
+    let result = item
+        .detail
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| item.detail.clone());
+    json!({
+        "role": role,
+        "module": item.module,
+        "result": result,
+    })
 }
 
 fn unique_tcp_endpoints(open_ports: &[PortObservation]) -> Vec<(String, u16)> {
@@ -335,8 +390,13 @@ fn primary_probe(port: u16) -> ProbeKind {
         143 => ProbeKind::Imap,
         443 | 4443 | 8443 | 9443 => ProbeKind::Https,
         445 => ProbeKind::Smb,
-        465 | 636 | 853 | 989 | 990 | 993 | 995 => ProbeKind::Tls,
+        465 => ProbeKind::Smtps,
+        636 | 853 | 989 => ProbeKind::Tls,
+        990 => ProbeKind::Ftps,
+        993 => ProbeKind::Imaps,
+        995 => ProbeKind::Pop3s,
         1883 => ProbeKind::Mqtt,
+        8883 => ProbeKind::Mqtts,
         3306 => ProbeKind::Mysql,
         3389 => ProbeKind::Rdp,
         5432 => ProbeKind::Postgres,
@@ -361,11 +421,15 @@ fn confident_endpoints(
     grouped
         .into_iter()
         .filter_map(|(endpoint, evidence)| {
-            select_candidate(
-                &candidates_for(&evidence, config.strategy),
-                config.confidence_threshold,
-            )
-            .map(|_| endpoint)
+            let candidates = candidates_for(&evidence, config.strategy);
+            let selected = select_candidate(&candidates, config.confidence_threshold)?;
+            if selected.service == ProbeKind::Tls.name()
+                && primary_probe(endpoint.1) != ProbeKind::Tls
+            {
+                None
+            } else {
+                Some(endpoint)
+            }
         })
         .collect()
 }
@@ -384,7 +448,7 @@ fn candidates_for(
             let base_score: u8 = if probe == Some(ProbeKind::Tls) {
                 85
             } else {
-                95
+                100
             };
             let score = if probe == Some(primary_probe(item.port)) {
                 base_score.saturating_add(3).min(100)
@@ -474,7 +538,10 @@ mod tests {
             module: module.into(),
             status: status.into(),
             banner: banner.map(str::to_owned),
-            detail: json!({"data": {"status": status}}),
+            detail: json!({
+                "status": status,
+                "result": {"banner": banner},
+            }),
         }
     }
 
@@ -485,6 +552,27 @@ mod tests {
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].probe, ProbeKind::Ssh);
         assert_eq!(attempts[1].probe, ProbeKind::Banner);
+    }
+
+    #[test]
+    fn standard_strategy_uses_application_probes_for_implicit_tls_ports() {
+        let attempts = initial_attempts(
+            &[port(465), port(990), port(993), port(995), port(8883)],
+            &ServiceDetectionConfig::default(),
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.probe)
+                .collect::<Vec<_>>(),
+            vec![
+                ProbeKind::Smtps,
+                ProbeKind::Ftps,
+                ProbeKind::Imaps,
+                ProbeKind::Pop3s,
+                ProbeKind::Mqtts,
+            ]
+        );
     }
 
     #[test]
@@ -536,6 +624,30 @@ mod tests {
             &config,
         );
         assert_eq!(results[0].service.as_deref(), Some("https"));
+        let retained = results[0].data.as_ref().unwrap()["evidence"]
+            .as_array()
+            .unwrap();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0]["role"], "application_handshake");
+        assert_eq!(retained[1]["role"], "transport_security");
+    }
+
+    #[test]
+    fn implicit_tls_application_keeps_one_self_contained_handshake() {
+        let config = ServiceDetectionConfig {
+            strategy: ServiceDetectionStrategy::Adaptive,
+            ..ServiceDetectionConfig::default()
+        };
+        let mut smtps = evidence("smtps", 465, "success", Some("220 mail.example"));
+        smtps.detail["result"]["tls"] = json!({"handshake_log": {}});
+        let results = aggregate(&[smtps, evidence("tls", 465, "success", None)], &config);
+        assert_eq!(results[0].service.as_deref(), Some("smtps"));
+        let retained = results[0].data.as_ref().unwrap()["evidence"]
+            .as_array()
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0]["module"], "smtps");
+        assert!(retained[0]["result"]["tls"].is_object());
     }
 
     #[test]
@@ -553,6 +665,12 @@ mod tests {
         );
         assert!(results[0].service.is_none());
         assert_eq!(results[0].data.as_ref().unwrap()["attempt_count"], 2);
+        assert!(
+            results[0].data.as_ref().unwrap()["evidence"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -570,12 +688,11 @@ mod tests {
         );
         assert!(results[0].service.is_none());
         assert_eq!(results[0].data.as_ref().unwrap()["confidence"], 0);
-        assert_eq!(
-            results[0].data.as_ref().unwrap()["candidates"]
+        assert!(
+            results[0].data.as_ref().unwrap()["evidence"]
                 .as_array()
                 .unwrap()
-                .len(),
-            2
+                .is_empty()
         );
     }
 
@@ -593,13 +710,17 @@ mod tests {
             &config,
         );
         assert_eq!(results[0].service.as_deref(), Some("ssh"));
-        assert_eq!(results[0].data.as_ref().unwrap()["confidence"], 99);
+        assert_eq!(results[0].data.as_ref().unwrap()["confidence"], 100);
         assert_eq!(
-            results[0].data.as_ref().unwrap()["candidates"]
+            results[0].data.as_ref().unwrap()["evidence"]
                 .as_array()
                 .unwrap()
                 .len(),
             1
+        );
+        assert_eq!(
+            results[0].data.as_ref().unwrap()["evidence"][0]["module"],
+            "ssh"
         );
     }
 
@@ -618,6 +739,35 @@ mod tests {
             "success",
             Some("SSH-2.0-OpenSSH_9.6"),
         )];
+        assert!(fallback_attempts(&ports, &initial, &evidence, &config).is_empty());
+    }
+
+    #[test]
+    fn tls_on_nonstandard_port_prioritizes_secure_application_fallbacks() {
+        let config = ServiceDetectionConfig {
+            strategy: ServiceDetectionStrategy::Adaptive,
+            max_probes_per_endpoint: 7,
+            ..ServiceDetectionConfig::default()
+        };
+        let ports = [port(10465)];
+        let initial = initial_attempts(&ports, &config);
+        let evidence = [evidence("tls", 10465, "success", None)];
+        let fallback = fallback_attempts(&ports, &initial, &evidence, &config);
+        assert_eq!(fallback.len(), 3);
+        assert_eq!(fallback[0].probe, ProbeKind::Mqtts);
+        assert_eq!(fallback[1].probe, ProbeKind::Smtps);
+        assert_eq!(fallback[2].probe, ProbeKind::Imaps);
+    }
+
+    #[test]
+    fn tls_on_known_generic_tls_port_is_a_terminal_result() {
+        let config = ServiceDetectionConfig {
+            strategy: ServiceDetectionStrategy::Adaptive,
+            ..ServiceDetectionConfig::default()
+        };
+        let ports = [port(636)];
+        let initial = initial_attempts(&ports, &config);
+        let evidence = [evidence("tls", 636, "success", None)];
         assert!(fallback_attempts(&ports, &initial, &evidence, &config).is_empty());
     }
 

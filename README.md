@@ -41,9 +41,13 @@ max_result_bytes = 65536
 - `strategy = "standard"` 保持按端口选择单个协议的旧行为；`adaptive` 先执行
   Banner、TLS 和 HTTP(S) 探测，再为未识别端点执行预算内的协议回退；`exhaustive`
   会对每个 TCP 端点执行全部受支持模块。
+- 465、990、993、995 和 8883 分别使用 SMTPS、FTPS、IMAPS、POP3S 和 MQTTS
+  应用握手，不会只识别成通用 TLS；非标准端口确认存在 TLS 后会优先尝试这些安全协议。
 - `max_probes_per_endpoint` 限制 `adaptive` 模式对每个端点建立的探测连接数；
   `confidence_threshold` 控制写入 `service` 字段所需的最低置信度。
-- 单个协议握手超时或不匹配不会抹掉端口观察，只会在 service observation 的 `data` 中记录探测状态。
+- service observation 只保留最终服务关联的应用握手；应用模块已经包含 TLS 时不重复保存，
+  HTTPS 则额外关联一份独立 TLS 握手。未识别端点不保存全部失败详情。
+- 上传批次同时限制为最多 500 条 observation 和最多 8 MiB JSON，避免少量大握手产生超大请求。
 - 未配置 `[service_detection]` 的旧配置默认关闭该功能。
 - zgrab2 使用系统 TCP 栈，`senders` 和 `server_rate_limit` 应从较低值开始压测，不能照搬
   masscan 的发包速率。

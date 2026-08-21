@@ -321,7 +321,7 @@ fn parse_zgrab_line(
             module: module.to_owned(),
             status: status.to_owned(),
             banner,
-            detail: bounded_detail(module, module_data, max_result_bytes),
+            detail: bounded_detail(module_data, max_result_bytes),
         });
     }
     Ok(results)
@@ -372,22 +372,16 @@ fn sanitize_json_value(value: Value) -> Value {
     }
 }
 
-fn bounded_detail(module: &str, module_data: &Value, max_result_bytes: usize) -> Value {
+fn bounded_detail(module_data: &Value, max_result_bytes: usize) -> Value {
     let module_data = sanitize_json_value(module_data.clone());
     let serialized_bytes = serde_json::to_vec(&module_data)
         .map(|value| value.len())
         .unwrap_or(0);
     if serialized_bytes <= max_result_bytes {
-        return json!({
-            "source": "zgrab2",
-            "module": module,
-            "data": module_data,
-        });
+        return module_data;
     }
 
     json!({
-        "source": "zgrab2",
-        "module": module,
         "status": module_data.get("status"),
         "error": module_data.get("error"),
         "truncated": true,
@@ -512,7 +506,7 @@ mod tests {
         assert_eq!(results[0].module, "http");
         assert_eq!(results[0].status, "success");
         assert_eq!(results[0].banner.as_deref(), Some("HTTP/1.1 200 OK"));
-        assert_eq!(results[0].detail["source"], "zgrab2");
+        assert_eq!(results[0].detail["status"], "success");
     }
 
     #[test]
@@ -521,7 +515,7 @@ mod tests {
         let results = parse_zgrab_line(line, 65_536).unwrap();
         assert_eq!(results[0].port, 22);
         assert_eq!(results[0].status, "connection-timeout");
-        assert_eq!(results[0].detail["data"]["status"], "connection-timeout");
+        assert_eq!(results[0].detail["status"], "connection-timeout");
     }
 
     #[test]
@@ -541,6 +535,21 @@ mod tests {
         assert!(config.contains("name=\"https\""));
         assert!(config.contains("use-https=true"));
         assert!(config.contains("connect-timeout=\"5s\""));
+    }
+
+    #[test]
+    fn generated_config_enables_implicit_tls_application_modules() {
+        let config = zgrab_config(&ServiceDetectionConfig::default());
+        assert!(config.contains("[smtp]\nname=\"smtps\""));
+        assert!(config.contains("smtps=true"));
+        assert!(config.contains("[ftp]\nname=\"ftps\""));
+        assert!(config.contains("implicit-tls=true"));
+        assert!(config.contains("[pop3]\nname=\"pop3s\""));
+        assert!(config.contains("pop3s=true"));
+        assert!(config.contains("[imap]\nname=\"imaps\""));
+        assert!(config.contains("imaps=true"));
+        assert!(config.contains("[mqtt]\nname=\"mqtts\""));
+        assert!(config.contains("tls=true"));
     }
 
     #[cfg(unix)]
@@ -666,8 +675,8 @@ done
                 "banner": "telnet\u{0}banner",
             }
         });
-        let detail = bounded_detail("http", &module_data, 1024);
-        assert_eq!(detail["data"]["result"]["response"]["body"], "binary");
-        assert_eq!(detail["data"]["result"]["banner"], "telnetbanner");
+        let detail = bounded_detail(&module_data, 1024);
+        assert_eq!(detail["result"]["response"]["body"], "binary");
+        assert_eq!(detail["result"]["banner"], "telnetbanner");
     }
 }
