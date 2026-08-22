@@ -2,7 +2,7 @@ use crate::error::ScannerError;
 use crate::types::NetworkConfig;
 use reqwest::Client;
 use serde::Serialize;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -120,6 +120,21 @@ async fn probe_family(
     enabled: bool,
     expect_ipv6: bool,
 ) -> NetworkFamilyCapability {
+    let route = if enabled {
+        route_available(expect_ipv6)
+    } else {
+        Ok(())
+    };
+    probe_family_with_route(client, url, enabled, expect_ipv6, route).await
+}
+
+async fn probe_family_with_route(
+    client: &Client,
+    url: &str,
+    enabled: bool,
+    expect_ipv6: bool,
+    route: Result<(), String>,
+) -> NetworkFamilyCapability {
     if !enabled {
         return NetworkFamilyCapability {
             supported: false,
@@ -128,19 +143,24 @@ async fn probe_family(
             reason: Some("disabled_by_configuration".into()),
         };
     }
+    if let Err(error) = route {
+        return unavailable(&format!("route_unavailable: {error}"));
+    }
     if url.trim().is_empty() {
-        return unavailable("probe_url_not_configured");
+        return ready_without_public_ip("probe_url_not_configured");
     }
     let response = match client.get(url).send().await {
         Ok(response) => response,
-        Err(error) => return unavailable(&format!("probe_request_failed: {error}")),
+        Err(error) => {
+            return ready_without_public_ip(&format!("probe_request_failed: {error}"));
+        }
     };
     if !response.status().is_success() {
-        return unavailable(&format!("probe_http_status: {}", response.status()));
+        return ready_without_public_ip(&format!("probe_http_status: {}", response.status()));
     }
     let body = match response.text().await {
         Ok(body) => body,
-        Err(error) => return unavailable(&format!("probe_body_failed: {error}")),
+        Err(error) => return ready_without_public_ip(&format!("probe_body_failed: {error}")),
     };
     let value = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
@@ -152,10 +172,10 @@ async fn probe_family(
         .unwrap_or_else(|| body.trim().to_owned());
     let address: IpAddr = match value.parse() {
         Ok(address) => address,
-        Err(_) => return unavailable("probe_returned_invalid_ip"),
+        Err(_) => return ready_without_public_ip("probe_returned_invalid_ip"),
     };
     if address.is_ipv6() != expect_ipv6 {
-        return unavailable("probe_returned_wrong_address_family");
+        return ready_without_public_ip("probe_returned_wrong_address_family");
     }
     NetworkFamilyCapability {
         supported: true,
@@ -163,6 +183,37 @@ async fn probe_family(
         public_ip: Some(address.to_string()),
         reason: None,
     }
+}
+
+/// Checks whether the kernel can select a source address and route for the
+/// requested address family. UDP `connect` only updates local socket state; it
+/// does not send a packet, so this check does not depend on a third-party host.
+fn route_available(expect_ipv6: bool) -> Result<(), String> {
+    let (local, destination) = if expect_ipv6 {
+        (
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+            SocketAddr::from((
+                Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+                53,
+            )),
+        )
+    } else {
+        (
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::from((Ipv4Addr::new(1, 1, 1, 1), 53)),
+        )
+    };
+    let socket = UdpSocket::bind(local).map_err(|error| format!("bind_failed: {error}"))?;
+    socket
+        .connect(destination)
+        .map_err(|error| format!("route_lookup_failed: {error}"))?;
+    let selected = socket
+        .local_addr()
+        .map_err(|error| format!("local_address_failed: {error}"))?;
+    if selected.ip().is_unspecified() {
+        return Err("no_source_address".into());
+    }
+    Ok(())
 }
 
 fn unavailable(reason: &str) -> NetworkFamilyCapability {
@@ -174,16 +225,59 @@ fn unavailable(reason: &str) -> NetworkFamilyCapability {
     }
 }
 
+fn ready_without_public_ip(reason: &str) -> NetworkFamilyCapability {
+    NetworkFamilyCapability {
+        supported: true,
+        ready: true,
+        public_ip: None,
+        reason: Some(reason.chars().take(256).collect()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::probe_family;
+    use super::probe_family_with_route;
     use reqwest::Client;
 
     #[tokio::test]
     async fn disabled_family_does_not_probe() {
-        let result = probe_family(&Client::new(), "not-a-url", false, true).await;
+        let result =
+            probe_family_with_route(&Client::new(), "not-a-url", false, true, Ok(())).await;
         assert!(!result.supported);
         assert!(!result.ready);
         assert_eq!(result.reason.as_deref(), Some("disabled_by_configuration"));
+    }
+
+    #[tokio::test]
+    async fn missing_route_marks_family_unavailable() {
+        let result = probe_family_with_route(
+            &Client::new(),
+            "not-a-url",
+            true,
+            true,
+            Err("route lookup failed".into()),
+        )
+        .await;
+        assert!(result.supported);
+        assert!(!result.ready);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("route_unavailable: route lookup failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_ip_probe_failure_does_not_disable_scanning() {
+        let result =
+            probe_family_with_route(&Client::new(), "not-a-url", true, false, Ok(())).await;
+        assert!(result.supported);
+        assert!(result.ready);
+        assert!(result.public_ip.is_none());
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("probe_request_failed:"))
+        );
     }
 }
