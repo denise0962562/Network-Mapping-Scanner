@@ -1,6 +1,6 @@
 use crate::error::ServerError;
 use crate::types::AssignedTask;
-use reqwest::header::RETRY_AFTER;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::Serialize;
 use std::time::Duration;
@@ -60,6 +60,24 @@ impl ServerHttpClient {
             self.client
                 .post(url)
                 .bearer_auth(&self.runtime_token)
+                .json(payload),
+            operation,
+        )
+        .await
+    }
+
+    pub(crate) async fn post_json_with_headers<T: Serialize + ?Sized>(
+        &self,
+        url: &str,
+        payload: &T,
+        headers: HeaderMap,
+        operation: &'static str,
+    ) -> Result<Response, ServerError> {
+        self.execute(
+            self.client
+                .post(url)
+                .bearer_auth(&self.runtime_token)
+                .headers(headers)
                 .json(payload),
             operation,
         )
