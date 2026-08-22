@@ -256,14 +256,16 @@ pub(crate) enum ScannerError {
 ## 网络协议自动探测
 
 `network.rs` 先通过 UDP 套接字检查内核能否为 IPv4/IPv6 选择源地址和路由，再使用两个
-独立的 `reqwest::Client` 查询公网出口地址：
+独立的 `reqwest::Client` 查询公网出口地址。每个客户端先访问服务端鉴权接口，失败后再
+访问对应的备用 IP 回显接口：
 
 - IPv4 客户端绑定 `0.0.0.0`；
 - IPv6 客户端绑定 `::`。
 
 绑定未指定地址可以限制出站套接字的地址族，同时由操作系统选择具体接口地址。UDP
-`connect` 只执行本地路由选择，不会发送数据包。两个公网 IP 请求通过 `tokio::join!`
-并行执行，因此某个协议超时不会串行阻塞另一个协议。
+`connect` 只执行本地路由选择，不会发送数据包。两个地址族通过 `tokio::join!` 并行
+执行，因此某个协议超时不会串行阻塞另一个协议。运行 Token 只发送给服务端接口，不会
+发送给第三方或自定义备用接口。
 
 ```rust
 pub(crate) struct NetworkCapabilities {
@@ -281,7 +283,7 @@ pub(crate) struct NetworkCapabilities {
 | `public_ip` | API 返回的公网地址，查询失败时为空 |
 | `reason` | 禁用、无可用路由或公网 IP 查询失败等原因；公网 IP 查询失败不影响 `ready` |
 
-探测 API 支持两种响应：
+服务端与备用接口均支持两种响应：
 
 ```json
 {"ip":"203.0.113.10"}
@@ -298,11 +300,13 @@ pub(crate) struct NetworkCapabilities {
 ### 生命周期
 
 1. 普通运行启动时，在创建心跳任务前检查本机路由并完成首次并行公网 IP 查询。
-2. `SharedNetworkCapabilities` 使用 `Arc<RwLock<_>>` 在探测任务与心跳任务之间共享快照。
-3. 后台任务至少每 30 秒探测一次；实际周期来自 `probe_interval_seconds`。
-4. 每次心跳读取最新快照并发送给服务端。
-5. 任务响应中的 `address_family` 在执行前再次与本地快照匹配。
-6. 如果不匹配，扫描器立即发一次心跳刷新服务端状态，然后以可重试失败拒绝任务。
+2. 扫描器使用 `scanner_id` 和运行 Token 请求服务端 `/api/scanner/network/public-ip`。
+3. 服务端接口失败时，再请求该地址族配置的 `probe_url`，且不携带运行 Token。
+4. `SharedNetworkCapabilities` 使用 `Arc<RwLock<_>>` 在探测任务与心跳任务之间共享快照。
+5. 后台任务至少每 30 秒探测一次；实际周期来自 `probe_interval_seconds`。
+6. 每次心跳读取最新快照并发送给服务端。
+7. 任务响应中的 `address_family` 在执行前再次与本地快照匹配。
+8. 如果不匹配，扫描器立即发一次心跳刷新服务端状态，然后以可重试失败拒绝任务。
 
 心跳中的结构：
 
@@ -419,8 +423,8 @@ endpoint = "https://example.com/api/scanner/result"
 | `service_detection.max_result_bytes` | int | `65536` | 单服务结构化详情上限，范围 1024-1048576 字节 |
 | `network.ipv4_enabled` | bool | `true` | 是否自动探测并接受 IPv4 任务 |
 | `network.ipv6_enabled` | bool | `true` | 是否自动探测并接受 IPv6 任务 |
-| `network.ipv4_probe_url` | string | ipify IPv4 API | IPv4 IP 回显接口 |
-| `network.ipv6_probe_url` | string | ipify IPv6 API | IPv6 IP 回显接口 |
+| `network.ipv4_probe_url` | string | ipify IPv4 API | 服务端接口不可用时使用的 IPv4 IP 回显接口 |
+| `network.ipv6_probe_url` | string | ipify IPv6 API | 服务端接口不可用时使用的 IPv6 IP 回显接口 |
 | `network.probe_interval_seconds` | int | `300` | 重新探测周期，范围 30-86400 秒 |
 | `network.probe_timeout_seconds` | int | `5` | 单次连接及总请求超时，范围 1-60 秒 |
 | `upload.endpoint` | string | — | 扫描结果上报地址 |

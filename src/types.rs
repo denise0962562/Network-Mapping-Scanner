@@ -234,6 +234,13 @@ impl ScannerConfig {
         )
     }
 
+    pub(crate) fn public_ip_url(&self) -> String {
+        format!(
+            "https://{}:{}/api/scanner/network/public-ip?scannerid={}",
+            self.c_server, self.c_port, self.scanner_id
+        )
+    }
+
     pub(crate) fn task_failure_url(&self) -> String {
         format!(
             "https://{}:{}/api/scanner/task/fail",
@@ -343,6 +350,10 @@ mod tests {
         assert_eq!(
             config.heartbeat_url(),
             "https://scanner.example:443/api/scanner/heartbeat"
+        );
+        assert_eq!(
+            config.public_ip_url(),
+            "https://scanner.example:443/api/scanner/network/public-ip?scannerid=019c0000-0000-7000-8000-000000000001"
         );
         assert_eq!(
             config.task_failure_url(),

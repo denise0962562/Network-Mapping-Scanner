@@ -51,12 +51,19 @@ impl SharedNetworkCapabilities {
 #[derive(Clone)]
 pub(crate) struct NetworkDetector {
     config: NetworkConfig,
+    server_probe_url: String,
+    runtime_token: String,
     ipv4_client: Client,
     ipv6_client: Client,
 }
 
 impl NetworkDetector {
-    pub(crate) fn new(config: NetworkConfig, verify_tls: bool) -> Result<Self, ScannerError> {
+    pub(crate) fn new(
+        config: NetworkConfig,
+        verify_tls: bool,
+        server_probe_url: String,
+        runtime_token: String,
+    ) -> Result<Self, ScannerError> {
         let timeout = Duration::from_secs(config.probe_timeout_seconds.max(1));
         let client = |local_address| {
             Client::builder()
@@ -68,6 +75,8 @@ impl NetworkDetector {
         };
         Ok(Self {
             config,
+            server_probe_url,
+            runtime_token,
             ipv4_client: client(IpAddr::V4(Ipv4Addr::UNSPECIFIED))?,
             ipv6_client: client(IpAddr::V6(Ipv6Addr::UNSPECIFIED))?,
         })
@@ -77,13 +86,17 @@ impl NetworkDetector {
         let (ipv4, ipv6) = tokio::join!(
             probe_family(
                 &self.ipv4_client,
+                &self.server_probe_url,
                 &self.config.ipv4_probe_url,
+                &self.runtime_token,
                 self.config.ipv4_enabled,
                 false,
             ),
             probe_family(
                 &self.ipv6_client,
+                &self.server_probe_url,
                 &self.config.ipv6_probe_url,
+                &self.runtime_token,
                 self.config.ipv6_enabled,
                 true,
             )
@@ -116,7 +129,9 @@ impl NetworkDetector {
 
 async fn probe_family(
     client: &Client,
-    url: &str,
+    server_url: &str,
+    fallback_url: &str,
+    runtime_token: &str,
     enabled: bool,
     expect_ipv6: bool,
 ) -> NetworkFamilyCapability {
@@ -125,12 +140,23 @@ async fn probe_family(
     } else {
         Ok(())
     };
-    probe_family_with_route(client, url, enabled, expect_ipv6, route).await
+    probe_family_with_route(
+        client,
+        server_url,
+        fallback_url,
+        runtime_token,
+        enabled,
+        expect_ipv6,
+        route,
+    )
+    .await
 }
 
 async fn probe_family_with_route(
     client: &Client,
-    url: &str,
+    server_url: &str,
+    fallback_url: &str,
+    runtime_token: &str,
     enabled: bool,
     expect_ipv6: bool,
     route: Result<(), String>,
@@ -146,22 +172,54 @@ async fn probe_family_with_route(
     if let Err(error) = route {
         return unavailable(&format!("route_unavailable: {error}"));
     }
+    let server_error =
+        match fetch_public_ip(client, server_url, Some(runtime_token), expect_ipv6).await {
+            Ok(address) => return available(address, None),
+            Err(error) => error,
+        };
+    capability_from_fallback(
+        server_error,
+        fetch_public_ip(client, fallback_url, None, expect_ipv6).await,
+    )
+}
+
+fn capability_from_fallback(
+    server_error: String,
+    fallback_result: Result<IpAddr, String>,
+) -> NetworkFamilyCapability {
+    match fallback_result {
+        Ok(address) => available(
+            address,
+            Some(format!(
+                "server_probe_failed: {server_error}; fallback_probe_succeeded"
+            )),
+        ),
+        Err(fallback_error) => ready_without_public_ip(&format!(
+            "server_probe_failed: {server_error}; fallback_probe_failed: {fallback_error}"
+        )),
+    }
+}
+
+async fn fetch_public_ip(
+    client: &Client,
+    url: &str,
+    bearer_token: Option<&str>,
+    expect_ipv6: bool,
+) -> Result<IpAddr, String> {
     if url.trim().is_empty() {
-        return ready_without_public_ip("probe_url_not_configured");
+        return Err("probe_url_not_configured".into());
     }
-    let response = match client.get(url).send().await {
-        Ok(response) => response,
-        Err(error) => {
-            return ready_without_public_ip(&format!("probe_request_failed: {error}"));
-        }
-    };
+    let response = build_probe_request(client, url, bearer_token)
+        .send()
+        .await
+        .map_err(|error| format!("request_failed: {error}"))?;
     if !response.status().is_success() {
-        return ready_without_public_ip(&format!("probe_http_status: {}", response.status()));
+        return Err(format!("http_status: {}", response.status()));
     }
-    let body = match response.text().await {
-        Ok(body) => body,
-        Err(error) => return ready_without_public_ip(&format!("probe_body_failed: {error}")),
-    };
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("body_failed: {error}"))?;
     let value = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|json| {
@@ -170,18 +228,33 @@ async fn probe_family_with_route(
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| body.trim().to_owned());
-    let address: IpAddr = match value.parse() {
-        Ok(address) => address,
-        Err(_) => return ready_without_public_ip("probe_returned_invalid_ip"),
-    };
+    let address: IpAddr = value
+        .parse()
+        .map_err(|_| "returned_invalid_ip".to_owned())?;
     if address.is_ipv6() != expect_ipv6 {
-        return ready_without_public_ip("probe_returned_wrong_address_family");
+        return Err("returned_wrong_address_family".into());
     }
+    Ok(address)
+}
+
+fn build_probe_request(
+    client: &Client,
+    url: &str,
+    bearer_token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    match bearer_token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
+}
+
+fn available(address: IpAddr, reason: Option<String>) -> NetworkFamilyCapability {
     NetworkFamilyCapability {
         supported: true,
         ready: true,
         public_ip: Some(address.to_string()),
-        reason: None,
+        reason: reason.map(|reason| reason.chars().take(256).collect()),
     }
 }
 
@@ -236,13 +309,22 @@ fn ready_without_public_ip(reason: &str) -> NetworkFamilyCapability {
 
 #[cfg(test)]
 mod tests {
-    use super::probe_family_with_route;
-    use reqwest::Client;
+    use super::{build_probe_request, capability_from_fallback, probe_family_with_route};
+    use reqwest::{Client, header};
+    use std::net::IpAddr;
 
     #[tokio::test]
     async fn disabled_family_does_not_probe() {
-        let result =
-            probe_family_with_route(&Client::new(), "not-a-url", false, true, Ok(())).await;
+        let result = probe_family_with_route(
+            &Client::new(),
+            "not-a-url",
+            "not-a-url",
+            "token",
+            false,
+            true,
+            Ok(()),
+        )
+        .await;
         assert!(!result.supported);
         assert!(!result.ready);
         assert_eq!(result.reason.as_deref(), Some("disabled_by_configuration"));
@@ -253,6 +335,8 @@ mod tests {
         let result = probe_family_with_route(
             &Client::new(),
             "not-a-url",
+            "not-a-url",
+            "token",
             true,
             true,
             Err("route lookup failed".into()),
@@ -268,8 +352,16 @@ mod tests {
 
     #[tokio::test]
     async fn public_ip_probe_failure_does_not_disable_scanning() {
-        let result =
-            probe_family_with_route(&Client::new(), "not-a-url", true, false, Ok(())).await;
+        let result = probe_family_with_route(
+            &Client::new(),
+            "not-a-url",
+            "not-a-url",
+            "token",
+            true,
+            false,
+            Ok(()),
+        )
+        .await;
         assert!(result.supported);
         assert!(result.ready);
         assert!(result.public_ip.is_none());
@@ -277,7 +369,51 @@ mod tests {
             result
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.starts_with("probe_request_failed:"))
+                .is_some_and(|reason| reason.starts_with("server_probe_failed:"))
+        );
+    }
+
+    #[test]
+    fn runtime_token_is_only_attached_to_server_probe() {
+        let client = Client::new();
+        let server_request = build_probe_request(
+            &client,
+            "https://server.example/public-ip",
+            Some("runtime-secret"),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            server_request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer runtime-secret")
+        );
+
+        let fallback_request = build_probe_request(&client, "https://fallback.example/ip", None)
+            .build()
+            .unwrap();
+        assert!(
+            !fallback_request
+                .headers()
+                .contains_key(header::AUTHORIZATION)
+        );
+    }
+
+    #[test]
+    fn successful_fallback_preserves_public_ip_and_diagnostic() {
+        let result = capability_from_fallback(
+            "http_status: 404 Not Found".into(),
+            Ok("203.0.113.20".parse::<IpAddr>().unwrap()),
+        );
+        assert!(result.ready);
+        assert_eq!(result.public_ip.as_deref(), Some("203.0.113.20"));
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("fallback_probe_succeeded"))
         );
     }
 }

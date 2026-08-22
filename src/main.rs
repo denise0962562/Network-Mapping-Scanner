@@ -297,7 +297,12 @@ async fn run() -> Result<(), ScannerError> {
     )?;
 
     let uploader = Uploader::new(cfg.upload.endpoint.clone(), server_client.clone());
-    let network_detector = NetworkDetector::new(cfg.network.clone(), cfg.scanner.verify_tls)?;
+    let network_detector = NetworkDetector::new(
+        cfg.network.clone(),
+        cfg.scanner.verify_tls,
+        cfg.scanner.public_ip_url(),
+        cfg.scanner.runtime_token.clone(),
+    )?;
     let network_capabilities = SharedNetworkCapabilities::new(network_detector.detect().await);
     let scan_capabilities = ScanCapabilities::from_config(&cfg.service_detection);
     let network_probe_handle = network_detector.spawn(network_capabilities.clone());
