@@ -3,6 +3,7 @@ use crate::http_client::{ServerHttpClient, response_decode_error, response_error
 use crate::network::{NetworkCapabilities, SharedNetworkCapabilities};
 use crate::scan::ScanCapabilities;
 use crate::sysinfo::SystemInfo;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -11,6 +12,12 @@ use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
 const MAX_LEASE_TTL_MS: u64 = 86_400_000;
+const LATENCY_PROTOCOL_VERSION: u16 = 1;
+const MAX_LATENCY_US: i64 = 120_000_000;
+const LATENCY_VERSION_HEADER: HeaderName = HeaderName::from_static("nm-latency-version");
+const LATENCY_PROBE_HEADER: HeaderName = HeaderName::from_static("nm-latency-probe");
+const SERVER_PROCESSING_HEADER: HeaderName = HeaderName::from_static("nm-server-processing-us");
+const SERVER_SENT_AT_HEADER: HeaderName = HeaderName::from_static("nm-server-sent-at-ms");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TaskCancellationReason {
@@ -152,6 +159,18 @@ struct HeartbeatPayload {
     system: SystemInfo,
     network_capabilities: NetworkCapabilities,
     scan_capabilities: ScanCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_report: Option<LatencyReport>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LatencyReport {
+    version: u16,
+    probe_id: Uuid,
+    rtt_us: i64,
+    server_processing_us: i64,
+    network_rtt_us: i64,
+    server_sent_at_ms: i64,
 }
 
 #[derive(Serialize)]
@@ -199,6 +218,7 @@ pub(crate) struct HeartbeatClient {
     scanner_id: Uuid,
     network_capabilities: SharedNetworkCapabilities,
     scan_capabilities: ScanCapabilities,
+    pending_latency: Arc<RwLock<Option<LatencyReport>>>,
 }
 
 pub(crate) struct HeartbeatEndpoints {
@@ -230,6 +250,7 @@ impl HeartbeatClient {
             scanner_id,
             network_capabilities,
             scan_capabilities,
+            pending_latency: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -253,6 +274,7 @@ impl HeartbeatClient {
             system: SystemInfo::gather()?,
             network_capabilities: self.network_capabilities.get().await,
             scan_capabilities: self.scan_capabilities.clone(),
+            latency_report: self.pending_latency.read().await.clone(),
         };
         tracing::debug!(
             scanner_id = %self.scanner_id,
@@ -261,16 +283,37 @@ impl HeartbeatClient {
             stopping,
             "sending heartbeat"
         );
+        let probe_id = Uuid::now_v7();
+        let mut headers = HeaderMap::new();
+        headers.insert(LATENCY_VERSION_HEADER, HeaderValue::from_static("1"));
+        headers.insert(
+            LATENCY_PROBE_HEADER,
+            HeaderValue::from_str(&probe_id.to_string()).map_err(|error| {
+                ScannerError::Http(format!("failed to build latency probe header: {error}"))
+            })?,
+        );
+        let started = Instant::now();
         let response = self
             .client
-            .post_json(&self.heartbeat_url, &payload, "send heartbeat")
+            .post_json_with_headers(&self.heartbeat_url, &payload, headers, "send heartbeat")
             .await?;
+        let elapsed = started.elapsed();
+        let latency = parse_latency_response(response.headers(), probe_id, elapsed);
         tracing::debug!(status = %response.status(), state, "heartbeat endpoint responded");
         if response.status().is_success() {
             let response = response
                 .json()
                 .await
                 .map_err(|error| response_decode_error(error, "send heartbeat"))?;
+            if let Some(latency) = &latency {
+                tracing::debug!(
+                    rtt_ms = latency.rtt_us as f64 / 1_000.0,
+                    network_rtt_ms = latency.network_rtt_us as f64 / 1_000.0,
+                    server_processing_ms = latency.server_processing_us as f64 / 1_000.0,
+                    "heartbeat latency measured"
+                );
+            }
+            *self.pending_latency.write().await = latency;
             tracing::debug!(response = ?response, "heartbeat response decoded");
             Ok(response)
         } else {
@@ -367,6 +410,52 @@ impl HeartbeatClient {
     }
 }
 
+fn parse_latency_response(
+    headers: &HeaderMap,
+    expected_probe_id: Uuid,
+    elapsed: Duration,
+) -> Option<LatencyReport> {
+    let version = headers
+        .get(&LATENCY_VERSION_HEADER)?
+        .to_str()
+        .ok()?
+        .parse::<u16>()
+        .ok()?;
+    if version != LATENCY_PROTOCOL_VERSION {
+        return None;
+    }
+    let probe_id = headers
+        .get(&LATENCY_PROBE_HEADER)?
+        .to_str()
+        .ok()
+        .and_then(|value| Uuid::parse_str(value).ok())?;
+    if probe_id != expected_probe_id {
+        return None;
+    }
+    let server_processing_us = parse_non_negative_header(headers, &SERVER_PROCESSING_HEADER)?;
+    let server_sent_at_ms = parse_non_negative_header(headers, &SERVER_SENT_AT_HEADER)?;
+    let rtt_us = i64::try_from(elapsed.as_micros()).ok()?;
+    if rtt_us > MAX_LATENCY_US
+        || server_processing_us > MAX_LATENCY_US
+        || server_processing_us > rtt_us
+    {
+        return None;
+    }
+    Some(LatencyReport {
+        version,
+        probe_id,
+        rtt_us,
+        server_processing_us,
+        network_rtt_us: rtt_us.saturating_sub(server_processing_us),
+        server_sent_at_ms,
+    })
+}
+
+fn parse_non_negative_header(headers: &HeaderMap, name: &HeaderName) -> Option<i64> {
+    let value = headers.get(name)?.to_str().ok()?.parse::<i64>().ok()?;
+    (value >= 0).then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +483,44 @@ mod tests {
             active.cancellation_reason(),
             Some(TaskCancellationReason::LeaseLost)
         );
+    }
+
+    #[test]
+    fn parses_matching_latency_headers_and_subtracts_server_time() {
+        let probe_id = Uuid::now_v7();
+        let mut headers = HeaderMap::new();
+        headers.insert(LATENCY_VERSION_HEADER, HeaderValue::from_static("1"));
+        headers.insert(
+            LATENCY_PROBE_HEADER,
+            HeaderValue::from_str(&probe_id.to_string()).unwrap(),
+        );
+        headers.insert(SERVER_PROCESSING_HEADER, HeaderValue::from_static("7000"));
+        headers.insert(
+            SERVER_SENT_AT_HEADER,
+            HeaderValue::from_static("1787361234567"),
+        );
+
+        let report = parse_latency_response(&headers, probe_id, Duration::from_millis(42)).unwrap();
+        assert_eq!(report.rtt_us, 42_000);
+        assert_eq!(report.network_rtt_us, 35_000);
+        assert_eq!(report.server_processing_us, 7_000);
+    }
+
+    #[test]
+    fn rejects_mismatched_probe_or_impossible_processing_time() {
+        let probe_id = Uuid::now_v7();
+        let mut headers = HeaderMap::new();
+        headers.insert(LATENCY_VERSION_HEADER, HeaderValue::from_static("1"));
+        headers.insert(
+            LATENCY_PROBE_HEADER,
+            HeaderValue::from_str(&probe_id.to_string()).unwrap(),
+        );
+        headers.insert(SERVER_PROCESSING_HEADER, HeaderValue::from_static("50000"));
+        headers.insert(SERVER_SENT_AT_HEADER, HeaderValue::from_static("1"));
+
+        assert!(
+            parse_latency_response(&headers, Uuid::now_v7(), Duration::from_millis(60)).is_none()
+        );
+        assert!(parse_latency_response(&headers, probe_id, Duration::from_millis(40)).is_none());
     }
 }
