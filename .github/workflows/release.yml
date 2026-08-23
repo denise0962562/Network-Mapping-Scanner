@@ -1,0 +1,119 @@
+name: Build release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Build and package Linux x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout scanner
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libssl-dev pkg-config
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Build scanner
+        run: cargo build --locked --release
+
+      - name: Resolve package metadata
+        id: package
+        run: |
+          set -euo pipefail
+          package_id="$(cargo pkgid)"
+          version="${package_id##*@}"
+          if [[ -z "$version" || "$version" == "$package_id" ]]; then
+            echo 'Unable to read scanner version from Cargo.toml' >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == 'push' && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version v$version" >&2
+            exit 1
+          fi
+          archive="network-mapping-scanner-v${version}-x86_64-unknown-linux-gnu"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble release archive
+        env:
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          test -x target/release/scanner-rs
+
+          stage_parent="$RUNNER_TEMP/network-mapping-scanner-release"
+          package_root="$stage_parent/$ARCHIVE_NAME"
+
+          mkdir -p "$package_root" release
+          install -m 0755 target/release/scanner-rs "$package_root/scanner-rs"
+          install -m 0644 config.toml "$package_root/config.example.toml"
+          sed -E -i \
+            -e 's/^([[:space:]]*(scanner_id|runtime_token)[[:space:]]*=).*/\1 ""/' \
+            -e 's/^([[:space:]]*c_server[[:space:]]*=).*/\1 "127.0.0.1"/' \
+            "$package_root/config.example.toml"
+          cp -a README.md LICENSE docs "$package_root/"
+
+          cat > "$package_root/BUILD-INFO" <<EOF
+          scanner-version=${{ steps.package.outputs.version }}
+          scanner-commit=$GITHUB_SHA
+          target=x86_64-unknown-linux-gnu
+          rustc=$(rustc --version)
+          EOF
+
+          tar -C "$stage_parent" -czf "release/$ARCHIVE_NAME.tar.gz" "$ARCHIVE_NAME"
+          (
+            cd release
+            sha256sum "$ARCHIVE_NAME.tar.gz" > "$ARCHIVE_NAME.tar.gz.sha256"
+          )
+
+          archive_contents="$RUNNER_TEMP/scanner-archive-contents.txt"
+          tar -tzf "release/$ARCHIVE_NAME.tar.gz" > "$archive_contents"
+          if grep -E '/(src|target|\.git|logs)(/|$)' "$archive_contents"; then
+            echo 'Archive contains an excluded path' >&2
+            exit 1
+          fi
+
+      - name: Upload manual build artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release/* \
+              --verify-tag \
+              --generate-notes \
+              --title "$RELEASE_TAG"
+          fi
