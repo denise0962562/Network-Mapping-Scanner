@@ -1,30 +1,32 @@
 use serde_json::Value;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum ScanObservation {
     Port(PortObservation),
     Service(ServiceObservation),
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PortObservation {
     pub(crate) ip: String,
     pub(crate) port: u16,
     pub(crate) protocol: String,
-    pub(crate) state: &'static str,
-    pub(crate) source: &'static str,
+    pub(crate) state: String,
+    pub(crate) source: String,
+    pub(crate) observed_at: i64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ServiceObservation {
     pub(crate) ip: String,
     pub(crate) port: u16,
     pub(crate) protocol: String,
     pub(crate) service: Option<String>,
     pub(crate) banner: Option<String>,
-    pub(crate) source: &'static str,
+    pub(crate) source: String,
     pub(crate) data: Option<Value>,
+    pub(crate) observed_at: i64,
 }
 
 impl ScanObservation {

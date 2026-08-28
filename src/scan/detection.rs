@@ -338,8 +338,9 @@ pub(crate) fn aggregate(
                 protocol: "tcp".into(),
                 service: selected.map(|candidate| candidate.service.clone()),
                 banner,
-                source: "zgrab2",
+                source: "zgrab2".into(),
                 data: Some(data),
+                observed_at: chrono::Utc::now().timestamp_millis(),
             }
         })
         .collect()
@@ -526,8 +527,9 @@ mod tests {
             ip: "192.0.2.1".into(),
             port,
             protocol: "tcp".into(),
-            state: "open",
-            source: "masscan",
+            state: "open".into(),
+            source: "masscan".into(),
+            observed_at: 1,
         }
     }
 

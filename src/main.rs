@@ -73,6 +73,10 @@ struct Cli {
     /// Directory for daily JSON log files
     #[arg(long, default_value = "./logs")]
     log_directory: PathBuf,
+
+    /// Durable state file used to resume result uploads after a restart
+    #[arg(long, default_value = "./scanner-state.json")]
+    state_file: PathBuf,
 }
 
 // ---- globals ------------------------------------------------------------
@@ -341,7 +345,16 @@ async fn run() -> Result<(), ScannerError> {
         heartbeat_interval_seconds = cfg.scanner.heartbeat_interval_seconds,
         "runtime clients initialized"
     );
-    let mut cache = CacheManager::default();
+    let mut cache = CacheManager::load(cli.state_file.clone())?;
+    if cache.has_pending_task() {
+        tracing::warn!(
+            task_id = ?cache.task_id,
+            upload_id = ?cache.upload_id,
+            next_batch_index = cache.next_batch_index,
+            observation_count = cache.observations.len(),
+            "resuming durable result upload state"
+        );
+    }
 
     if !stop_requested() {
         scan_loop(

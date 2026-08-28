@@ -315,8 +315,9 @@ fn parse_discovered(line: &str) -> Option<PortObservation> {
         ip,
         port,
         protocol,
-        state: "open",
-        source: "masscan",
+        state: "open".into(),
+        source: "masscan".into(),
+        observed_at: chrono::Utc::now().timestamp_millis(),
     })
 }
 
