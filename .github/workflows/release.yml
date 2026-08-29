@@ -17,6 +17,9 @@ jobs:
   build-release:
     name: Build and package Linux x86_64
     runs-on: ubuntu-24.04
+    container:
+      image: debian:12
+      
     steps:
       - name: Checkout scanner
         uses: actions/checkout@v5
