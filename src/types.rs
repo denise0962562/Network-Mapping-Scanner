@@ -1,11 +1,14 @@
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 // ---- Cache data model ---------------------------------------------------
 
 /// In-memory scan result cache. Accumulates results until flushed.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CacheManager {
+    #[serde(skip)]
+    pub(crate) state_file: Option<PathBuf>,
     pub(crate) task_id: Option<Uuid>,
     pub(crate) upload_id: Option<Uuid>,
     pub(crate) observations: Vec<crate::scan::ScanObservation>,
@@ -13,11 +16,74 @@ pub(crate) struct CacheManager {
 }
 
 impl CacheManager {
+    pub(crate) fn load(state_file: PathBuf) -> Result<Self, crate::error::ScannerError> {
+        if !state_file.exists() {
+            return Ok(Self {
+                state_file: Some(state_file),
+                ..Self::default()
+            });
+        }
+        let bytes = std::fs::read(&state_file).map_err(crate::error::ScannerError::Io)?;
+        let mut cache: Self = serde_json::from_slice(&bytes).map_err(|error| {
+            crate::error::ScannerError::Config(format!(
+                "failed to parse scanner state {}: {error}",
+                state_file.display()
+            ))
+        })?;
+        cache.state_file = Some(state_file);
+        Ok(cache)
+    }
+
+    pub(crate) fn persist(&self) -> Result<(), crate::error::ScannerError> {
+        use std::io::Write;
+
+        let Some(state_file) = self.state_file.as_deref() else {
+            return Ok(());
+        };
+        if let Some(parent) = state_file
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(crate::error::ScannerError::Io)?;
+        }
+        let temporary = state_file.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(self).map_err(|error| {
+            crate::error::ScannerError::Upload(format!(
+                "failed to serialize scanner state: {error}"
+            ))
+        })?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(crate::error::ScannerError::Io)?;
+        file.write_all(&bytes)
+            .map_err(crate::error::ScannerError::Io)?;
+        file.sync_all().map_err(crate::error::ScannerError::Io)?;
+        drop(file);
+        std::fs::rename(&temporary, state_file).map_err(crate::error::ScannerError::Io)?;
+        let parent = state_file
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(crate::error::ScannerError::Io)
+    }
+
     pub(crate) fn clear(&mut self) {
         self.task_id = None;
         self.upload_id = None;
         self.observations.clear();
         self.next_batch_index = 0;
+        if let Err(error) = self.persist() {
+            tracing::error!(%error, "failed to persist cleared scanner result cache");
+        }
     }
 }
 
@@ -241,6 +307,13 @@ impl ScannerConfig {
         )
     }
 
+    pub(crate) fn maintenance_url(&self) -> String {
+        format!(
+            "https://{}:{}/api/scanner/maintenance?scannerid={}",
+            self.c_server, self.c_port, self.scanner_id
+        )
+    }
+
     pub(crate) fn task_failure_url(&self) -> String {
         format!(
             "https://{}:{}/api/scanner/task/fail",
@@ -286,7 +359,7 @@ fn default_lease_safety_margin() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssignedTask, ScannerConfig};
+    use super::{AssignedTask, CacheManager, ScannerConfig};
 
     #[test]
     fn assigned_task_matches_server_response() {
@@ -356,6 +429,10 @@ mod tests {
             "https://scanner.example:443/api/scanner/network/public-ip?scannerid=019c0000-0000-7000-8000-000000000001"
         );
         assert_eq!(
+            config.maintenance_url(),
+            "https://scanner.example:443/api/scanner/maintenance?scannerid=019c0000-0000-7000-8000-000000000001"
+        );
+        assert_eq!(
             config.task_failure_url(),
             "https://scanner.example:443/api/scanner/task/fail"
         );
@@ -395,6 +472,36 @@ mod tests {
         assert!(task.validate_targets().is_err());
         task.task_target = vec!["1.0.0.0/24".into()];
         assert!(task.validate_targets().is_ok());
+    }
+
+    #[test]
+    fn durable_cache_round_trips_task_identity_and_progress() {
+        let state_file = std::env::temp_dir().join(format!(
+            "network-mapping-scanner-state-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        let task_id = uuid::Uuid::now_v7();
+        let mut cache = CacheManager {
+            state_file: Some(state_file.clone()),
+            ..CacheManager::default()
+        };
+        cache.begin_task(task_id).unwrap();
+        cache.mark_batch_uploaded(0).unwrap();
+
+        let restored = CacheManager::load(state_file.clone()).unwrap();
+        assert_eq!(restored.task_id, Some(task_id));
+        assert_eq!(restored.upload_id, cache.upload_id);
+        assert_eq!(restored.next_batch_index, 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&state_file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_file(state_file).unwrap();
     }
 }
 

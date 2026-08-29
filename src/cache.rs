@@ -19,7 +19,7 @@ impl CacheManager {
         self.task_id = Some(task_id);
         self.upload_id = Some(Uuid::now_v7());
         self.next_batch_index = 0;
-        Ok(())
+        self.persist()
     }
 
     pub(crate) fn insert(&mut self, observation: &ScanObservation) -> Result<(), ScannerError> {
@@ -36,7 +36,7 @@ impl CacheManager {
         {
             self.observations.push(observation.clone());
         }
-        Ok(())
+        self.persist()
     }
 
     pub(crate) fn has_pending_task(&self) -> bool {
@@ -100,7 +100,7 @@ impl CacheManager {
         self.next_batch_index = self.next_batch_index.checked_add(1).ok_or_else(|| {
             ScannerError::Upload("uploaded batch index exceeded protocol limit".into())
         })?;
-        Ok(())
+        self.persist()
     }
 
     #[cfg(test)]
@@ -199,8 +199,9 @@ mod tests {
                 ip: "192.0.2.1".into(),
                 port: 443,
                 protocol: "tcp".into(),
-                state: "open",
-                source: "masscan",
+                state: "open".into(),
+                source: "masscan".into(),
+                observed_at: 1,
             }))
             .unwrap();
         cache
@@ -210,8 +211,9 @@ mod tests {
                 protocol: "tcp".into(),
                 service: Some("https".into()),
                 banner: None,
-                source: "zgrab2",
+                source: "zgrab2".into(),
                 data: None,
+                observed_at: 2,
             }))
             .unwrap();
 
@@ -248,8 +250,9 @@ mod tests {
                     ip: "192.0.2.1".into(),
                     port,
                     protocol: "tcp".into(),
-                    state: "open",
-                    source: "masscan",
+                    state: "open".into(),
+                    source: "masscan".into(),
+                    observed_at: 1,
                 }))
                 .unwrap();
         }
@@ -278,10 +281,11 @@ mod tests {
                     protocol: "tcp".into(),
                     service: Some("https".into()),
                     banner: None,
-                    source: "zgrab2",
+                    source: "zgrab2".into(),
                     data: Some(serde_json::json!({
                         "evidence": [{"result": "x".repeat(5 * 1024 * 1024)}]
                     })),
+                    observed_at: 1,
                 }))
                 .unwrap();
         }
@@ -307,10 +311,11 @@ mod tests {
                 protocol: "tcp".into(),
                 service: Some("https".into()),
                 banner: None,
-                source: "zgrab2",
+                source: "zgrab2".into(),
                 data: Some(serde_json::json!({
                     "evidence": [{"result": "x".repeat(UPLOAD_BATCH_MAX_BYTES)}]
                 })),
+                observed_at: 1,
             }))
             .unwrap();
 

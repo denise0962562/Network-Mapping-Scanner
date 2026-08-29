@@ -22,7 +22,7 @@ src/
 │   └── engines/
 │       ├── masscan.rs # masscan 端口发现、进程控制与输出解析
 │       └── zgrab2.rs  # zgrab2 服务识别、进程控制与 JSON 归一化
-├── cache.rs         # 按任务隔离的内存结果缓存
+├── cache.rs         # 按任务隔离、可持久恢复的结果缓存
 ├── upload.rs        # 结果上报：HTTPS POST JSON
 ├── register.rs      # 扫描器注册：POST /api/scanner/register
 ├── http_client.rs   # 底层 HTTP GET / POST
@@ -143,6 +143,20 @@ impl CacheManager {
 `upload_batches()` 每 500 条生成一批；空任务也生成一个最终空批，只有最后一批设置
 `is_final=true`。缓存同时记录下一待确认批次，重试时跳过已收到成功响应的批次；若响应
 丢失，则用相同批身份重试当前批。
+
+每次开始任务、新增观察或确认批次都会先序列化状态，再通过临时文件原子改名写入
+`--state-file`（默认 `./scanner-state.json`）。启动时若存在待处理状态，扫描器在领取新任务
+前先恢复上传；`observed_at`、`upload_id` 和 `batch_index` 因而不会因重启改变。
+
+### 服务端维护协作
+
+服务端进入维护模式后停止分配新任务，并在心跳响应中携带
+`task_action=finish_and_cache`。已经领取任务的 Scanner 不会终止扫描：服务端冻结任务
+租约，Scanner 在本地完成扫描并把结果写入持久状态文件。服务端不可访问或仍处于维护
+状态时不上传结果，每隔 `retry_after_seconds` 探测一次维护状态。
+
+管理员手动退出维护后，Scanner 优先补传缓存结果，再恢复领取任务。服务端默认保留
+24 小时补传宽限期；宽限期内任务不会分配给其他 Scanner，超期后才回收任务。
 
 #### `upload.rs`
 
@@ -552,7 +566,8 @@ scanner-rs
       "port": 80,
       "protocol": "tcp",
       "state": "open",
-      "source": "masscan"
+      "source": "masscan",
+      "observed_at": 1787922000000
     },
     {
       "kind": "service",
@@ -562,6 +577,7 @@ scanner-rs
       "service": "http",
       "banner": "HTTP/1.1 200 OK",
       "source": "zgrab2",
+      "observed_at": 1787922001000,
       "data": {
         "schema_version": 2,
         "confidence": 100,

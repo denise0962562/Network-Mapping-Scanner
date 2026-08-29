@@ -4,3 +4,5 @@
 
 logs/
 test-resource/
+scanner-state.json
+scanner-state.json.tmp

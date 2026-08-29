@@ -1,8 +1,8 @@
-use crate::error::ServerError;
+use crate::error::{MaintenanceInfo, ServerError};
 use crate::types::AssignedTask;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const USER_AGENT: &str = "Scanner/1.0";
@@ -140,7 +140,20 @@ pub(crate) async fn validate_credentials(
 pub(crate) async fn response_error(response: Response, operation: &'static str) -> ServerError {
     let status = response.status();
     let retry_after = parse_retry_after(response.headers());
-    let detail = response_detail(response).await;
+    let maintenance_version = response
+        .headers()
+        .get("NM-Maintenance-Version")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response_body(response).await;
+    let detail = response_detail(&body);
+    if let Some(info) = parse_maintenance_response(status, maintenance_version.as_deref(), &body) {
+        return ServerError::Maintenance {
+            operation,
+            detail,
+            info: Box::new(info),
+        };
+    }
     classify_status(status, detail, retry_after, operation)
 }
 
@@ -199,18 +212,40 @@ fn classify_status(
     }
 }
 
-async fn response_detail(mut response: Response) -> String {
-    const DETAIL_BODY_LIMIT: usize = 1_024;
+#[derive(Deserialize)]
+struct MaintenanceEnvelope {
+    code: String,
+    maintenance: MaintenanceInfo,
+}
+
+fn parse_maintenance_response(
+    status: StatusCode,
+    version: Option<&str>,
+    body: &[u8],
+) -> Option<MaintenanceInfo> {
+    if status != StatusCode::SERVICE_UNAVAILABLE || version != Some("1") {
+        return None;
+    }
+    let envelope: MaintenanceEnvelope = serde_json::from_slice(body).ok()?;
+    (envelope.code == "scanner_maintenance").then_some(envelope.maintenance)
+}
+
+async fn response_body(mut response: Response) -> Vec<u8> {
+    const RESPONSE_BODY_LIMIT: usize = 4_096;
     let mut body = Vec::new();
-    while body.len() < DETAIL_BODY_LIMIT {
+    while body.len() < RESPONSE_BODY_LIMIT {
         let chunk = match response.chunk().await {
             Ok(Some(chunk)) => chunk,
             Ok(None) | Err(_) => break,
         };
-        let remaining = DETAIL_BODY_LIMIT - body.len();
+        let remaining = RESPONSE_BODY_LIMIT - body.len();
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
-    let body = String::from_utf8_lossy(&body);
+    body
+}
+
+fn response_detail(body: &[u8]) -> String {
+    let body = String::from_utf8_lossy(body);
     let detail: String = body
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -239,7 +274,7 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerHttpClient, classify_status, parse_retry_after};
+    use super::{ServerHttpClient, classify_status, parse_maintenance_response, parse_retry_after};
     use crate::error::ServerError;
     use reqwest::StatusCode;
     use reqwest::header::RETRY_AFTER;
@@ -275,6 +310,28 @@ mod tests {
             classify_status(StatusCode::CONFLICT, "lease lost".into(), None, "test"),
             ServerError::Rejected { .. }
         ));
+    }
+
+    #[test]
+    fn maintenance_requires_versioned_structured_response() {
+        let body = br#"{
+            "code":"scanner_maintenance",
+            "maintenance":{"phase":"active","message":"upgrade","retry_after_seconds":600}
+        }"#;
+        let info = parse_maintenance_response(StatusCode::SERVICE_UNAVAILABLE, Some("1"), body)
+            .expect("valid maintenance response");
+        assert!(info.enabled);
+        assert_eq!(info.phase, "active");
+        assert_eq!(info.retry_delay(), Duration::from_secs(600));
+        assert!(parse_maintenance_response(StatusCode::SERVICE_UNAVAILABLE, None, body).is_none());
+        assert!(
+            parse_maintenance_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("1"),
+                br#"{"code":"other"}"#,
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ pub(crate) enum ConnectionState {
     Connecting,
     Online,
     Reconnecting,
+    Maintenance,
     AuthRejected,
     PolicyBlocked,
 }

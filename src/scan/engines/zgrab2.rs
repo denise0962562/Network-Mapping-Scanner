@@ -476,8 +476,9 @@ mod tests {
             ip: ip.into(),
             port,
             protocol: protocol.into(),
-            state: "open",
-            source: "masscan",
+            state: "open".into(),
+            source: "masscan".into(),
+            observed_at: 1,
         }
     }
 
