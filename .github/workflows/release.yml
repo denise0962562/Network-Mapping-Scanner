@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: debian:12
-      
+
     steps:
       - name: Checkout scanner
         uses: actions/checkout@v5
@@ -28,8 +28,8 @@ jobs:
 
       - name: Install system build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes libssl-dev pkg-config
+          apt-get update
+          apt-get install --yes libssl-dev pkg-config
 
       - name: Install Rust stable
         run: |
