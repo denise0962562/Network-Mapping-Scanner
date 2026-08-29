@@ -191,6 +191,8 @@ struct TaskCancelledPayload {
 pub(crate) struct HeartbeatResponse {
     command: Option<HeartbeatCommand>,
     lease: Option<HeartbeatLease>,
+    #[serde(default)]
+    maintenance: Option<MaintenanceInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -418,11 +420,23 @@ impl HeartbeatClient {
         }
     }
 
-    pub(crate) async fn apply_command(&self, response: HeartbeatResponse, active: &ActiveTask) {
+    pub(crate) async fn apply_command(
+        &self,
+        response: HeartbeatResponse,
+        active: &ActiveTask,
+    ) -> Option<MaintenanceInfo> {
         if let Some(lease) = response.lease {
             match lease.status.as_str() {
                 "renewed" if active.get().await == Some(lease.task_id) => {
                     active.renew_lease(lease.ttl_ms).await;
+                }
+                "held" if active.get().await == Some(lease.task_id) => {
+                    active.renew_lease(lease.ttl_ms).await;
+                    tracing::info!(
+                        task_id = %lease.task_id,
+                        grace_ttl_ms = lease.ttl_ms,
+                        "active task lease frozen for maintenance result upload"
+                    );
                 }
                 "lost" => active.request_lease_lost(lease.task_id).await,
                 status => tracing::warn!(%status, task_id = %lease.task_id, "unknown lease status"),
@@ -440,6 +454,7 @@ impl HeartbeatClient {
         } else {
             tracing::debug!("heartbeat contained no actionable command");
         }
+        response.maintenance
     }
 }
 

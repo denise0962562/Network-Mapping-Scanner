@@ -11,6 +11,14 @@ fn default_maintenance_retry_seconds() -> u64 {
     600
 }
 
+fn default_result_upload_grace_hours() -> u64 {
+    24
+}
+
+fn default_maintenance_task_action() -> String {
+    "finish_and_cache".into()
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct MaintenanceInfo {
     #[serde(default = "maintenance_enabled_by_default")]
@@ -26,6 +34,10 @@ pub(crate) struct MaintenanceInfo {
     pub(crate) expected_end_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default = "default_maintenance_retry_seconds")]
     pub(crate) retry_after_seconds: u64,
+    #[serde(default = "default_maintenance_task_action")]
+    pub(crate) task_action: String,
+    #[serde(default = "default_result_upload_grace_hours")]
+    pub(crate) result_upload_grace_hours: u64,
     #[serde(default)]
     pub(crate) revision: i64,
 }
@@ -33,6 +45,14 @@ pub(crate) struct MaintenanceInfo {
 impl MaintenanceInfo {
     pub(crate) fn retry_delay(&self) -> Duration {
         Duration::from_secs(self.retry_after_seconds.clamp(60, 86_400))
+    }
+
+    pub(crate) fn result_upload_grace_ttl(&self) -> Duration {
+        Duration::from_secs(
+            self.result_upload_grace_hours
+                .clamp(1, 24 * 7)
+                .saturating_mul(60 * 60),
+        )
     }
 }
 

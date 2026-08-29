@@ -148,6 +148,16 @@ impl CacheManager {
 `--state-file`（默认 `./scanner-state.json`）。启动时若存在待处理状态，扫描器在领取新任务
 前先恢复上传；`observed_at`、`upload_id` 和 `batch_index` 因而不会因重启改变。
 
+### 服务端维护协作
+
+服务端进入维护模式后停止分配新任务，并在心跳响应中携带
+`task_action=finish_and_cache`。已经领取任务的 Scanner 不会终止扫描：服务端冻结任务
+租约，Scanner 在本地完成扫描并把结果写入持久状态文件。服务端不可访问或仍处于维护
+状态时不上传结果，每隔 `retry_after_seconds` 探测一次维护状态。
+
+管理员手动退出维护后，Scanner 优先补传缓存结果，再恢复领取任务。服务端默认保留
+24 小时补传宽限期；宽限期内任务不会分配给其他 Scanner，超期后才回收任务。
+
 #### `upload.rs`
 
 ```rust

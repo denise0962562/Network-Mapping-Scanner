@@ -546,7 +546,36 @@ fn spawn_heartbeat(
             match send_result {
                 Ok(response) => {
                     backoff.reset();
-                    client.apply_command(response, &active_task).await;
+                    let maintenance = client.apply_command(response, &active_task).await;
+                    if let Some(info) = maintenance.filter(|info| info.enabled) {
+                        publish_connection_state(&connection_tx, ConnectionState::Maintenance);
+                        tracing::warn!(
+                            maintenance_id = ?info.id,
+                            phase = %info.phase,
+                            message = %info.message,
+                            task_action = %info.task_action,
+                            result_upload_grace_hours = info.result_upload_grace_hours,
+                            "maintenance announced by heartbeat; active scan will finish locally"
+                        );
+                        match wait_for_maintenance_exit(&client, &active_task, info).await {
+                            Ok(true) => {
+                                publish_connection_state(
+                                    &connection_tx,
+                                    ConnectionState::Connecting,
+                                );
+                                tracing::info!(
+                                    "scanner maintenance ended; resuming heartbeat and cached uploads"
+                                );
+                                continue;
+                            }
+                            Ok(false) => break,
+                            Err(error) => {
+                                tracing::error!(%error, "maintenance probe stopped unexpectedly");
+                                request_stop();
+                                break;
+                            }
+                        }
+                    }
                     publish_connection_state(&connection_tx, ConnectionState::Online);
                     let next_interval = if active_task.get().await.is_some() {
                         active_task
@@ -567,9 +596,6 @@ fn spawn_heartbeat(
                 }
                 Err(ScannerError::Server(ServerError::Maintenance { info, .. })) => {
                     publish_connection_state(&connection_tx, ConnectionState::Maintenance);
-                    if let Some(task_id) = active_task_id {
-                        active_task.request_lease_lost(task_id).await;
-                    }
                     tracing::warn!(
                         maintenance_id = ?info.id,
                         phase = %info.phase,
@@ -577,10 +603,12 @@ fn spawn_heartbeat(
                         started_at = ?info.started_at,
                         expected_end_at = ?info.expected_end_at,
                         revision = info.revision,
+                        task_action = %info.task_action,
+                        result_upload_grace_hours = info.result_upload_grace_hours,
                         retry_delay_seconds = info.retry_delay().as_secs(),
-                        "scanner entered maintenance sleep"
+                        "scanner entered maintenance sleep; active scan will finish locally"
                     );
-                    match wait_for_maintenance_exit(&client, *info).await {
+                    match wait_for_maintenance_exit(&client, &active_task, *info).await {
                         Ok(true) => {
                             backoff.reset();
                             publish_connection_state(&connection_tx, ConnectionState::Connecting);
@@ -674,8 +702,10 @@ fn spawn_heartbeat(
 
 async fn wait_for_maintenance_exit(
     client: &HeartbeatClient,
+    active_task: &ActiveTask,
     mut info: MaintenanceInfo,
 ) -> Result<bool, ScannerError> {
+    renew_maintenance_hold(active_task, &info).await;
     loop {
         let delay = info.retry_delay();
         if sleep_or_stop(delay).await {
@@ -683,6 +713,7 @@ async fn wait_for_maintenance_exit(
         }
         match client.maintenance_status().await {
             Ok(next) if next.enabled => {
+                renew_maintenance_hold(active_task, &next).await;
                 tracing::info!(
                     maintenance_id = ?next.id,
                     phase = %next.phase,
@@ -695,8 +726,12 @@ async fn wait_for_maintenance_exit(
                 );
                 info = next;
             }
-            Ok(_) => return Ok(true),
+            Ok(next) => {
+                renew_maintenance_hold(active_task, &next).await;
+                return Ok(true);
+            }
             Err(ScannerError::Server(ServerError::Maintenance { info: next, .. })) => {
+                renew_maintenance_hold(active_task, &next).await;
                 info = *next;
             }
             Err(error @ ScannerError::Server(ServerError::AuthRejected { .. }))
@@ -711,6 +746,14 @@ async fn wait_for_maintenance_exit(
                 );
             }
         }
+    }
+}
+
+async fn renew_maintenance_hold(active_task: &ActiveTask, info: &MaintenanceInfo) {
+    if active_task.get().await.is_some() {
+        let ttl_ms =
+            u64::try_from(info.result_upload_grace_ttl().as_millis()).unwrap_or(86_400_000);
+        active_task.renew_lease(ttl_ms).await;
     }
 }
 
@@ -1333,6 +1376,17 @@ async fn report_task_status_with_retry(
         };
         match result {
             Ok(()) => return true,
+            Err(ScannerError::Server(ServerError::Maintenance { info, .. })) => {
+                renew_maintenance_hold(active_task, &info).await;
+                tracing::warn!(
+                    task_id = %task_id,
+                    retry_delay_seconds = info.retry_delay().as_secs(),
+                    "task status report paused for maintenance"
+                );
+                if sleep_or_stop(info.retry_delay()).await {
+                    return false;
+                }
+            }
             Err(ScannerError::Server(error)) if error.is_retryable() => {
                 if active_task.lease_safety_expired(lease_safety_margin).await {
                     active_task.request_lease_lost(task_id).await;
