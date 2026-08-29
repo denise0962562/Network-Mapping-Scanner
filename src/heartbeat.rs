@@ -1,4 +1,4 @@
-use crate::error::ScannerError;
+use crate::error::{MaintenanceInfo, ScannerError, ServerError};
 use crate::http_client::{ServerHttpClient, response_decode_error, response_error};
 use crate::network::{NetworkCapabilities, SharedNetworkCapabilities};
 use crate::scan::ScanCapabilities;
@@ -215,6 +215,7 @@ pub(crate) struct HeartbeatClient {
     heartbeat_url: String,
     failure_url: String,
     cancelled_url: String,
+    maintenance_url: String,
     scanner_id: Uuid,
     network_capabilities: SharedNetworkCapabilities,
     scan_capabilities: ScanCapabilities,
@@ -225,6 +226,13 @@ pub(crate) struct HeartbeatEndpoints {
     pub(crate) heartbeat: String,
     pub(crate) failure: String,
     pub(crate) cancelled: String,
+    pub(crate) maintenance: String,
+}
+
+#[derive(Deserialize)]
+struct MaintenanceProbeResponse {
+    success: bool,
+    maintenance: MaintenanceInfo,
 }
 
 impl HeartbeatClient {
@@ -247,11 +255,36 @@ impl HeartbeatClient {
             heartbeat_url: endpoints.heartbeat,
             failure_url: endpoints.failure,
             cancelled_url: endpoints.cancelled,
+            maintenance_url: endpoints.maintenance,
             scanner_id,
             network_capabilities,
             scan_capabilities,
             pending_latency: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub(crate) async fn maintenance_status(&self) -> Result<MaintenanceInfo, ScannerError> {
+        let response = self
+            .client
+            .get(&self.maintenance_url, "check scanner maintenance")
+            .await?;
+        if !response.status().is_success() {
+            return Err(response_error(response, "check scanner maintenance")
+                .await
+                .into());
+        }
+        let response: MaintenanceProbeResponse = response
+            .json()
+            .await
+            .map_err(|error| response_decode_error(error, "check scanner maintenance"))?;
+        if !response.success {
+            return Err(ServerError::InvalidResponse {
+                operation: "check scanner maintenance",
+                detail: "maintenance probe returned success=false".into(),
+            }
+            .into());
+        }
+        Ok(response.maintenance)
     }
 
     pub(crate) async fn send(

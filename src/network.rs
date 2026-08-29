@@ -1,4 +1,5 @@
 use crate::error::ScannerError;
+use crate::reconnect::ConnectionState;
 use crate::types::NetworkConfig;
 use reqwest::Client;
 use serde::Serialize;
@@ -6,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::sync::watch;
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct NetworkCapabilities {
@@ -116,11 +118,19 @@ impl NetworkDetector {
         NetworkCapabilities { ipv4, ipv6 }
     }
 
-    pub(crate) fn spawn(self, state: SharedNetworkCapabilities) -> tokio::task::JoinHandle<()> {
+    pub(crate) fn spawn(
+        self,
+        state: SharedNetworkCapabilities,
+        connection: watch::Receiver<ConnectionState>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let interval = Duration::from_secs(self.config.probe_interval_seconds.max(30));
             loop {
                 tokio::time::sleep(interval).await;
+                if *connection.borrow() == ConnectionState::Maintenance {
+                    tracing::debug!("network capability probe paused for maintenance");
+                    continue;
+                }
                 state.set(self.detect().await).await;
             }
         })

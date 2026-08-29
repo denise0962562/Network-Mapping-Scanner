@@ -1,9 +1,50 @@
 use reqwest::StatusCode;
+use serde::Deserialize;
 use std::time::Duration;
 use thiserror::Error;
 
+fn maintenance_enabled_by_default() -> bool {
+    true
+}
+
+fn default_maintenance_retry_seconds() -> u64 {
+    600
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct MaintenanceInfo {
+    #[serde(default = "maintenance_enabled_by_default")]
+    pub(crate) enabled: bool,
+    #[serde(default, alias = "maintenance_id")]
+    pub(crate) id: Option<uuid::Uuid>,
+    pub(crate) phase: String,
+    #[serde(default)]
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub(crate) expected_end_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default = "default_maintenance_retry_seconds")]
+    pub(crate) retry_after_seconds: u64,
+    #[serde(default)]
+    pub(crate) revision: i64,
+}
+
+impl MaintenanceInfo {
+    pub(crate) fn retry_delay(&self) -> Duration {
+        Duration::from_secs(self.retry_after_seconds.clamp(60, 86_400))
+    }
+}
+
 #[derive(Error, Debug)]
 pub(crate) enum ServerError {
+    #[error("{operation} paused for scanner maintenance: {detail}")]
+    Maintenance {
+        operation: &'static str,
+        detail: String,
+        info: Box<MaintenanceInfo>,
+    },
+
     #[error("{operation} timed out: {detail}")]
     Timeout {
         operation: &'static str,
@@ -78,6 +119,7 @@ impl ServerError {
 
     pub(crate) fn retry_after(&self) -> Option<Duration> {
         match self {
+            Self::Maintenance { info, .. } => Some(info.retry_delay()),
             Self::RetryableStatus { retry_after, .. } => *retry_after,
             _ => None,
         }
@@ -85,6 +127,7 @@ impl ServerError {
 
     pub(crate) fn status(&self) -> Option<StatusCode> {
         match self {
+            Self::Maintenance { .. } => Some(StatusCode::SERVICE_UNAVAILABLE),
             Self::RetryableStatus { status, .. } | Self::Rejected { status, .. } => Some(*status),
             Self::AuthRejected { .. } => Some(StatusCode::UNAUTHORIZED),
             Self::PolicyBlocked { .. } => Some(StatusCode::FORBIDDEN),

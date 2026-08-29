@@ -14,7 +14,7 @@ mod types;
 mod upload;
 
 use crate::config::load;
-use crate::error::{ScannerError, ServerError};
+use crate::error::{MaintenanceInfo, ScannerError, ServerError};
 use crate::health::health_check;
 use crate::heartbeat::{ActiveTask, HeartbeatClient, HeartbeatEndpoints, TaskCancellationReason};
 use crate::http_client::{FetchTaskOutcome, ServerHttpClient, fetch_task};
@@ -301,6 +301,7 @@ async fn run() -> Result<(), ScannerError> {
     )?;
 
     let uploader = Uploader::new(cfg.upload.endpoint.clone(), server_client.clone());
+    let (connection_tx, connection_rx) = watch::channel(ConnectionState::Connecting);
     let network_detector = NetworkDetector::new(
         cfg.network.clone(),
         cfg.scanner.verify_tls,
@@ -309,13 +310,15 @@ async fn run() -> Result<(), ScannerError> {
     )?;
     let network_capabilities = SharedNetworkCapabilities::new(network_detector.detect().await);
     let scan_capabilities = ScanCapabilities::from_config(&cfg.service_detection);
-    let network_probe_handle = network_detector.spawn(network_capabilities.clone());
+    let network_probe_handle =
+        network_detector.spawn(network_capabilities.clone(), connection_rx.clone());
     let heartbeat_client = HeartbeatClient::new(
         server_client.clone(),
         HeartbeatEndpoints {
             heartbeat: cfg.scanner.heartbeat_url(),
             failure: cfg.scanner.task_failure_url(),
             cancelled: cfg.scanner.task_cancelled_url(),
+            maintenance: cfg.scanner.maintenance_url(),
         },
         scanner_id,
         network_capabilities,
@@ -323,7 +326,6 @@ async fn run() -> Result<(), ScannerError> {
     );
     let active_task = ActiveTask::default();
     let stop_bridge_handle = spawn_active_task_stop_bridge(active_task.clone());
-    let (connection_tx, connection_rx) = watch::channel(ConnectionState::Connecting);
     let heartbeat_handle = spawn_heartbeat(
         heartbeat_client.clone(),
         active_task.clone(),
@@ -563,6 +565,50 @@ fn spawn_heartbeat(
                         break;
                     }
                 }
+                Err(ScannerError::Server(ServerError::Maintenance { info, .. })) => {
+                    publish_connection_state(&connection_tx, ConnectionState::Maintenance);
+                    if let Some(task_id) = active_task_id {
+                        active_task.request_lease_lost(task_id).await;
+                    }
+                    tracing::warn!(
+                        maintenance_id = ?info.id,
+                        phase = %info.phase,
+                        message = %info.message,
+                        started_at = ?info.started_at,
+                        expected_end_at = ?info.expected_end_at,
+                        revision = info.revision,
+                        retry_delay_seconds = info.retry_delay().as_secs(),
+                        "scanner entered maintenance sleep"
+                    );
+                    match wait_for_maintenance_exit(&client, *info).await {
+                        Ok(true) => {
+                            backoff.reset();
+                            publish_connection_state(&connection_tx, ConnectionState::Connecting);
+                            tracing::info!("scanner maintenance ended; resuming heartbeat");
+                        }
+                        Ok(false) => break,
+                        Err(ScannerError::Server(ServerError::AuthRejected { .. })) => {
+                            publish_connection_state(&connection_tx, ConnectionState::AuthRejected);
+                            active_task.request_shutdown().await;
+                            request_stop();
+                            break;
+                        }
+                        Err(ScannerError::Server(ServerError::PolicyBlocked { .. })) => {
+                            publish_connection_state(
+                                &connection_tx,
+                                ConnectionState::PolicyBlocked,
+                            );
+                            active_task.request_shutdown().await;
+                            request_stop();
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "maintenance probe stopped unexpectedly");
+                            request_stop();
+                            break;
+                        }
+                    }
+                }
                 Err(ScannerError::Server(error)) if error.is_retryable() => {
                     publish_connection_state(&connection_tx, ConnectionState::Reconnecting);
                     if let Some(task_id) = active_task_id
@@ -626,6 +672,48 @@ fn spawn_heartbeat(
     })
 }
 
+async fn wait_for_maintenance_exit(
+    client: &HeartbeatClient,
+    mut info: MaintenanceInfo,
+) -> Result<bool, ScannerError> {
+    loop {
+        let delay = info.retry_delay();
+        if sleep_or_stop(delay).await {
+            return Ok(false);
+        }
+        match client.maintenance_status().await {
+            Ok(next) if next.enabled => {
+                tracing::info!(
+                    maintenance_id = ?next.id,
+                    phase = %next.phase,
+                    message = %next.message,
+                    started_at = ?next.started_at,
+                    expected_end_at = ?next.expected_end_at,
+                    revision = next.revision,
+                    retry_delay_seconds = next.retry_delay().as_secs(),
+                    "scanner maintenance is still active"
+                );
+                info = next;
+            }
+            Ok(_) => return Ok(true),
+            Err(ScannerError::Server(ServerError::Maintenance { info: next, .. })) => {
+                info = *next;
+            }
+            Err(error @ ScannerError::Server(ServerError::AuthRejected { .. }))
+            | Err(error @ ScannerError::Server(ServerError::PolicyBlocked { .. })) => {
+                return Err(error);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    retry_delay_seconds = delay.as_secs(),
+                    "maintenance probe failed; remaining asleep"
+                );
+            }
+        }
+    }
+}
+
 fn publish_connection_state(sender: &watch::Sender<ConnectionState>, state: ConnectionState) {
     if *sender.borrow() != state {
         tracing::info!(?state, "server connection state changed");
@@ -642,7 +730,9 @@ async fn wait_until_online(receiver: &mut watch::Receiver<ConnectionState>) -> b
         match *receiver.borrow() {
             ConnectionState::Online => return true,
             ConnectionState::AuthRejected | ConnectionState::PolicyBlocked => return false,
-            ConnectionState::Connecting | ConnectionState::Reconnecting => {}
+            ConnectionState::Connecting
+            | ConnectionState::Reconnecting
+            | ConnectionState::Maintenance => {}
         }
         tokio::select! {
             changed = receiver.changed() => {
@@ -797,6 +887,21 @@ async fn scan_loop(
                     upload_backoff.reset();
                     active_task.clear().await;
                 }
+                FlushAttempt::Completed(Err(ScannerError::Server(ServerError::Maintenance {
+                    info,
+                    ..
+                }))) => {
+                    tracing::warn!(
+                        phase = %info.phase,
+                        message = %info.message,
+                        retry_delay_seconds = info.retry_delay().as_secs(),
+                        "result upload paused for maintenance; cached task retained"
+                    );
+                    if sleep_or_stop(info.retry_delay()).await {
+                        break;
+                    }
+                    continue;
+                }
                 FlushAttempt::Completed(Err(ScannerError::Server(error)))
                     if error.is_retryable() =>
                 {
@@ -865,6 +970,18 @@ async fn scan_loop(
                 fetch_backoff.reset();
                 tracing::debug!(retry_delay_seconds = 5, "no scan task available");
                 if sleep_or_stop(Duration::from_secs(5)).await {
+                    break;
+                }
+                continue;
+            }
+            Err(ServerError::Maintenance { info, .. }) => {
+                tracing::warn!(
+                    phase = %info.phase,
+                    message = %info.message,
+                    retry_delay_seconds = info.retry_delay().as_secs(),
+                    "task assignment paused for maintenance"
+                );
+                if sleep_or_stop(info.retry_delay()).await {
                     break;
                 }
                 continue;
