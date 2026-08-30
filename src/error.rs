@@ -164,6 +164,9 @@ pub(crate) enum ScannerError {
     #[error("{0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("SQLite state database error: {0}")]
+    Database(#[from] rusqlite::Error),
+
     #[error("{0}")]
     Toml(String),
 

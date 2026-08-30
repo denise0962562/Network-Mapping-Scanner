@@ -15,7 +15,8 @@
 ```
 src/
 ├── main.rs          # 入口、CLI、编排主循环、身份注册
-├── config.rs        # TOML 配置加载/验证/回写（注释保留）
+├── config.rs        # TOML 静态配置加载/验证及旧身份字段清理
+├── storage.rs       # SQLite schema、身份和待上传状态持久化
 ├── scan/            # 扫描流水线、阶段编排与扫描引擎适配器
 │   ├── orchestrator.rs # 阶段顺序、取消传播和失败策略
 │   ├── plan.rs       # 版本化扫描计划与阶段白名单校验
@@ -43,8 +44,8 @@ src/
 
 | 函数 | 说明 |
 |------|------|
-| `run()` | 主入口：系统信息 → 身份处理 → 配置加载 → health check / 扫描 |
-| `handle_identity()` | 处理 `--id` / `--token`，执行注册 POST，触发配置回写 |
+| `run()` | 主入口：系统信息 → TOML/SQLite 加载与迁移 → 身份处理 → health check / 扫描 |
+| `handle_identity()` | 处理 `--id` / `--token`，执行注册 POST，触发 SQLite 身份写入 |
 | `scan_loop()` | 循环体：领取任务 → 扫描 → 按任务缓存 → 上传；无任务时持续轮询 |
 | `flush()` | 构造包含 scanner_id/task_id 的上传载荷并提交 |
 | `spawn_signal_handler()` | SIGINT/SIGTERM 注册 |
@@ -59,13 +60,25 @@ pub(crate) fn load(path: &str) -> Result<LoadedConfig, ScannerError>
 
 ```rust
 impl LoadedConfig {
-    pub(crate) fn save_scanner_identity(&self) -> Result<(), ScannerError>
+    pub(crate) fn clear_legacy_identity(&self) -> Result<(), ScannerError>
 }
 ```
 
-将当前 `scanner_id` 和 `runtime_token` 写回 **当前使用的配置文件**（`--config` 指定的路径）。旧 `token` 字段会在成功注册后移除。
-实现方式为重新解析原始文件内容 → 修改 `[scanner]` 段 → 序列化写回，
-**原有注释、空行、键顺序全部保留**。
+静态配置始终来自 `--config` 指定的 TOML。升级时若 TOML 中仍包含旧
+`scanner_id` / `runtime_token` 或 `token`，身份成功导入 SQLite 后会以临时文件、`fsync`
+和原子改名方式清空这些字段；**原有注释、空行、键顺序全部保留**。新注册不再向 TOML
+写入身份或令牌。
+
+#### `storage.rs`
+
+`StateStore` 使用内置 SQLite，schema 由 `PRAGMA user_version` 版本化。数据库同时保存：
+
+- 以规范化服务端 origin 为键的 `scanner_id` / `runtime_token`；
+- 当前待上传任务绑定的 `scanner_id`、`task_id`、稳定 `upload_id` 和下一批序号；
+- 按稳定 sequence 排序、按业务 identity 唯一约束的 observation JSON。
+
+数据库使用外键、5 秒 busy timeout、`synchronous=FULL` 和立即事务。Unix 数据库文件权限
+设置为 `0600`。身份按服务端隔离，切换 `c_server` / `c_port` 不会静默复用其他服务端令牌。
 
 #### `scan/orchestrator.rs`
 
@@ -131,28 +144,29 @@ zgrab2 子进程。
 
 ```rust
 impl CacheManager {
-    pub(crate) fn begin_task(&mut self, task_id: Uuid) -> Result
-    pub(crate) fn insert(&mut self, observation: &ScanObservation) -> Result
+    pub(crate) fn begin_task_with_observations(&mut self, task_id: Uuid, observations: &[ScanObservation]) -> Result
     pub(crate) fn upload_batches(&self, scanner_id: Uuid) -> Result<Vec<ScannerResultBatchUpload>, ScannerError>
-    pub(crate) fn clear(&mut self)
+    pub(crate) fn clear(&mut self) -> Result
 }
 ```
 
 缓存保存类型化的 `Port` 与 `Service` observations，并按类型、IP、端口、协议、服务名和来源
-生成稳定身份去重。每个任务在 `begin_task()` 时生成一次 `upload_id`，重试期间保持不变。
+生成稳定身份去重。每个任务在 `begin_task_with_observations()` 时生成一次 `upload_id`，并在
+一个 SQLite 事务中保存任务和全部去重结果，重试期间保持不变。
 `upload_batches()` 每 500 条生成一批；空任务也生成一个最终空批，只有最后一批设置
 `is_final=true`。缓存同时记录下一待确认批次，重试时跳过已收到成功响应的批次；若响应
 丢失，则用相同批身份重试当前批。
 
-每次开始任务、新增观察或确认批次都会先序列化状态，再通过临时文件原子改名写入
-`--state-file`（默认 `./scanner-state.json`）。启动时若存在待处理状态，扫描器在领取新任务
-前先恢复上传；`observed_at`、`upload_id` 和 `batch_index` 因而不会因重启改变。
+`--database` 默认为 `./scanner-state.sqlite3`。启动时若数据库存在待处理状态，扫描器在领取
+新任务前先恢复上传；`observed_at`、`upload_id` 和 `batch_index` 因而不会因重启改变。
+旧 `--state-file`（默认 `./scanner-state.json`）只作为升级迁移输入：数据库无待处理任务且
+旧文件存在时，将其事务导入后改名为 `.json.migrated`。
 
 ### 服务端维护协作
 
 服务端进入维护模式后停止分配新任务，并在心跳响应中携带
 `task_action=finish_and_cache`。已经领取任务的 Scanner 不会终止扫描：服务端冻结任务
-租约，Scanner 在本地完成扫描并把结果写入持久状态文件。服务端不可访问或仍处于维护
+租约，Scanner 在本地完成扫描并把结果写入 SQLite 持久状态。服务端不可访问或仍处于维护
 状态时不上传结果，每隔 `retry_after_seconds` 探测一次维护状态。
 
 管理员手动退出维护后，Scanner 优先补传缓存结果，再恢复领取任务。服务端默认保留
@@ -375,9 +389,8 @@ source_port = 61000
 verify_tls = true
 # Path to masscan binary
 scanner_path = "./a"
-# Auto-generated scanner identity (UUIDv7) — do not edit manually
-scanner_id = "019eb66c-6ac6-7530-b73f-454037448fa2"
-# Runtime token — written automatically after successful one-time registration
+# Legacy migration fields; active identity is stored in scanner-state.sqlite3
+scanner_id = ""
 runtime_token = ""
 connect_timeout_seconds = 5
 request_timeout_seconds = 15
@@ -419,8 +432,8 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.source_port` | int | `61000` | masscan 源端口，范围 1-65535 |
 | `scanner.verify_tls` | bool | `false` | 是否验证 TLS 证书 |
 | `scanner.scanner_path` | string | `"./a"` | 扫描器二进制路径；也可填写能从 `PATH` 解析的命令名 |
-| `scanner.scanner_id` | string | 自动生成 | UUIDv7，首次启动自动生成 |
-| `scanner.runtime_token` | string | `""` | 注册成功后由程序自动写入的运行令牌 |
+| `scanner.scanner_id` | string | `""` | 仅用于从旧 TOML 迁移 UUIDv7 身份；新身份存入 SQLite |
+| `scanner.runtime_token` | string | `""` | 仅用于从旧 TOML 迁移运行令牌；新令牌存入 SQLite |
 | `scanner.connect_timeout_seconds` | int | `5` | 建立服务端连接的超时，范围 1-60 秒 |
 | `scanner.request_timeout_seconds` | int | `15` | 单次请求总超时，不小于建连超时且不超过 300 秒 |
 | `scanner.reconnect_initial_delay_seconds` | int | `1` | 首次自动重连退避，范围 1-60 秒 |
@@ -459,9 +472,13 @@ endpoint = "https://example.com/api/scanner/result"
 
 扫描器在启动扫描循环前检查 `scanner_path`，启用服务识别时还会检查 `zgrab_path`。显式的相对路径或绝对路径会直接检查；不含目录的命令名会从 `PATH` 查找。注册、`--health-check` 和 `--get-system-info` 模式不执行扫描，因此跳过该检查。
 
-### 配置回写（注释保留）
+### 静态配置与运行状态
 
-注册时必须同时提供 `--id` 和 `--token`。`--token` 是不落盘的一次性注册令牌；旧配置中的 `scanner.token` 不会被当作运行令牌，升级后需重新注册。只有注册成功后，程序才会将 `scanner_id` / `runtime_token` 写回当前配置文件，并移除旧 `token` 字段。写回时保留其余注释和键顺序。
+TOML 保存服务端、扫描引擎、网络与超时等静态部署配置；SQLite 保存身份和待上传运行状态。
+注册时必须同时提供 `--id` 和 `--token`，其中 `--token` 是不落盘的一次性注册令牌。成功后
+`scanner_id` / `runtime_token` 写入 `--database` 指定的 SQLite，而不是配置文件。旧配置中的
+`scanner.token` 不会被当作运行令牌；旧 `scanner_id` / `runtime_token` 会在首次升级启动时
+导入 SQLite。清理旧字段时保留其余注释和键顺序。
 
 ---
 
@@ -474,6 +491,9 @@ scanner-rs [OPTIONS]
   -d, --debug             启用 DEBUG 日志
   -i, --get-system-info   打印系统信息后退出
   -f, --config <PATH>     指定配置文件路径（默认 config.toml）
+      --database <PATH>   身份和持久状态数据库（默认 scanner-state.sqlite3）
+      --state-file <PATH> 旧 JSON 状态迁移来源（默认 scanner-state.json）
+      --log-directory <PATH> JSON 日志目录（默认 ./logs）
       --id <UUID>         扫描器标识（UUIDv7）
       --token <TOKEN>     注册令牌
   -h, --help              显示帮助
@@ -492,17 +512,19 @@ scanner-rs --id "019eb66c-..." --token "sLJiUUS6..."
 1. 从 CLI 读取 `--id` 和 `--token`
 2. 使用 `Authorization: Bearer <registration_token>` POST `{ scanner_id }` 到注册接口
 3. 收到响应：
-   - **200** → 解析 `runtime_token`，与 id 一起写入 `config.toml` 后退出
+   - **200** → 解析 `runtime_token`，与 id 一起写入 SQLite 后退出
    - **401** → 凭证无效或过期，不写入配置
    - **5xx/网络错误** → 返回失败，不覆盖现有运行凭据
-4. 后续运行无需再传 `--id` / `--token`，程序自动从配置文件读取
+4. 后续运行无需再传 `--id` / `--token`，程序按当前服务端 origin 从 SQLite 读取
 
-重新注册时必须再次同时提供新的 `--id` 和一次性 `--token`。
+重新注册时必须再次同时提供新的 `--id` 和一次性 `--token`。若当前身份仍有 SQLite 或旧
+JSON 待上传结果，不允许改成另一 scanner ID；需先用原身份完成补传或确认放弃并由管理员
+处理持久状态，避免结果归属到错误扫描器。
 
 ### 普通运行
 
 ```bash
-# 从 config.toml 读取已有身份，直接启动扫描
+# 从 SQLite 读取已有身份，直接启动扫描
 scanner-rs
 ```
 
@@ -629,6 +651,11 @@ cargo build --release
 # 指定配置文件
 ./target/release/scanner-rs --config /etc/scanner/config.toml
 
+# 将身份和待上传状态放在持久数据目录
+./target/release/scanner-rs \
+  --config /etc/scanner/config.toml \
+  --database /var/lib/network-mapping-scanner/scanner-state.sqlite3
+
 # 健康检查
 ./target/release/scanner-rs --health-check
 
@@ -665,9 +692,15 @@ cargo test
 
 ### 添加新的配置项
 
-1. 在 `types.rs` 对应 Config 结构体中加字段（`#[serde(default)]` 实现可选）
+静态部署配置继续保持易扩展：
+
+1. 在 `types.rs` 对应 Config 结构体中加字段（`#[serde(default)]` 实现向后兼容）
 2. 在 `config.rs` 的 `validate()` 中添加验证规则
-3. 在 `main.rs` 中使用新字段
+3. 在 `config.toml` 和字段说明中补充示例
+4. 在 `main.rs` 或对应模块中使用新字段
+
+需要跨重启修改的运行状态则加入 `storage.rs`：提升 `SCHEMA_VERSION`，按旧版本顺序执行
+事务迁移，并为升级和新建数据库各添加测试。不要把一次性注册令牌写入任何表。
 
 ---
 

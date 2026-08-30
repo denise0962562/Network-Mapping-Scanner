@@ -1,89 +1,151 @@
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use uuid::Uuid;
 
 // ---- Cache data model ---------------------------------------------------
 
-/// In-memory scan result cache. Accumulates results until flushed.
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+/// In-memory view of scan results durably stored in SQLite until flushed.
+#[derive(Default)]
 pub(crate) struct CacheManager {
-    #[serde(skip)]
-    pub(crate) state_file: Option<PathBuf>,
+    pub(crate) store: Option<crate::storage::StateStore>,
+    pub(crate) server_origin: String,
+    pub(crate) scanner_id: String,
+    pub(crate) identities: HashSet<String>,
     pub(crate) task_id: Option<Uuid>,
     pub(crate) upload_id: Option<Uuid>,
     pub(crate) observations: Vec<crate::scan::ScanObservation>,
     pub(crate) next_batch_index: u32,
 }
 
+#[derive(serde::Deserialize)]
+struct LegacyCacheState {
+    task_id: Option<Uuid>,
+    upload_id: Option<Uuid>,
+    observations: Vec<crate::scan::ScanObservation>,
+    next_batch_index: u32,
+}
+
 impl CacheManager {
-    pub(crate) fn load(state_file: PathBuf) -> Result<Self, crate::error::ScannerError> {
-        if !state_file.exists() {
-            return Ok(Self {
-                state_file: Some(state_file),
-                ..Self::default()
-            });
+    pub(crate) fn legacy_state_has_pending(
+        path: &std::path::Path,
+    ) -> Result<bool, crate::error::ScannerError> {
+        if !path.exists() {
+            return Ok(false);
         }
-        let bytes = std::fs::read(&state_file).map_err(crate::error::ScannerError::Io)?;
-        let mut cache: Self = serde_json::from_slice(&bytes).map_err(|error| {
+        let bytes = std::fs::read(path).map_err(crate::error::ScannerError::Io)?;
+        let legacy: LegacyCacheState = serde_json::from_slice(&bytes).map_err(|error| {
             crate::error::ScannerError::Config(format!(
-                "failed to parse scanner state {}: {error}",
-                state_file.display()
+                "failed to parse legacy scanner state {}: {error}",
+                path.display()
             ))
         })?;
-        cache.state_file = Some(state_file);
-        Ok(cache)
+        Ok(legacy.task_id.is_some())
     }
 
-    pub(crate) fn persist(&self) -> Result<(), crate::error::ScannerError> {
-        use std::io::Write;
+    pub(crate) fn load(
+        mut store: crate::storage::StateStore,
+        server_origin: String,
+        scanner_id: String,
+        legacy_state_file: PathBuf,
+    ) -> Result<Self, crate::error::ScannerError> {
+        let mut stored = store.load_upload(&server_origin, &scanner_id)?;
+        if stored.is_none() && legacy_state_file.exists() {
+            let bytes =
+                std::fs::read(&legacy_state_file).map_err(crate::error::ScannerError::Io)?;
+            let legacy: LegacyCacheState = serde_json::from_slice(&bytes).map_err(|error| {
+                crate::error::ScannerError::Config(format!(
+                    "failed to parse legacy scanner state {}: {error}",
+                    legacy_state_file.display()
+                ))
+            })?;
+            if let Some(task_id) = legacy.task_id {
+                let upload_id = legacy.upload_id.ok_or_else(|| {
+                    crate::error::ScannerError::Config(
+                        "legacy scanner state has a task_id but no upload_id".into(),
+                    )
+                })?;
+                let upload = crate::storage::StoredUpload {
+                    scanner_id: scanner_id.clone(),
+                    task_id,
+                    upload_id,
+                    next_batch_index: legacy.next_batch_index,
+                    observations: legacy.observations,
+                };
+                store.import_upload(&server_origin, &upload)?;
+                stored = Some(upload);
+            } else if legacy.upload_id.is_some()
+                || !legacy.observations.is_empty()
+                || legacy.next_batch_index != 0
+            {
+                return Err(crate::error::ScannerError::Config(
+                    "legacy scanner state has upload data but no task_id".into(),
+                ));
+            }
+            archive_legacy_state(&legacy_state_file);
+        }
 
-        let Some(state_file) = self.state_file.as_deref() else {
-            return Ok(());
-        };
-        if let Some(parent) = state_file
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent).map_err(crate::error::ScannerError::Io)?;
-        }
-        let temporary = state_file.with_extension("json.tmp");
-        let bytes = serde_json::to_vec(self).map_err(|error| {
-            crate::error::ScannerError::Upload(format!(
-                "failed to serialize scanner state: {error}"
-            ))
-        })?;
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temporary)
-            .map_err(crate::error::ScannerError::Io)?;
-        file.write_all(&bytes)
-            .map_err(crate::error::ScannerError::Io)?;
-        file.sync_all().map_err(crate::error::ScannerError::Io)?;
-        drop(file);
-        std::fs::rename(&temporary, state_file).map_err(crate::error::ScannerError::Io)?;
-        let parent = state_file
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(crate::error::ScannerError::Io)
+        let (task_id, upload_id, next_batch_index, observations) = stored.map_or_else(
+            || (None, None, 0, Vec::new()),
+            |upload| {
+                (
+                    Some(upload.task_id),
+                    Some(upload.upload_id),
+                    upload.next_batch_index,
+                    upload.observations,
+                )
+            },
+        );
+        let identities = observations
+            .iter()
+            .map(crate::scan::ScanObservation::identity)
+            .collect();
+        Ok(Self {
+            store: Some(store),
+            server_origin,
+            scanner_id,
+            identities,
+            task_id,
+            upload_id,
+            observations,
+            next_batch_index,
+        })
     }
 
-    pub(crate) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) -> Result<(), crate::error::ScannerError> {
+        if let Some(store) = self.store.as_mut() {
+            store.clear_upload(&self.server_origin)?;
+        }
         self.task_id = None;
         self.upload_id = None;
+        self.identities.clear();
         self.observations.clear();
         self.next_batch_index = 0;
-        if let Err(error) = self.persist() {
-            tracing::error!(%error, "failed to persist cleared scanner result cache");
-        }
+        Ok(())
+    }
+}
+
+fn archive_legacy_state(path: &std::path::Path) {
+    let archive = path.with_extension("json.migrated");
+    if archive.exists() {
+        tracing::warn!(
+            legacy_state_path = %path.display(),
+            archive_path = %archive.display(),
+            "legacy scanner state was imported but could not be archived because the target exists"
+        );
+        return;
+    }
+    match std::fs::rename(path, &archive) {
+        Ok(()) => tracing::info!(
+            legacy_state_path = %path.display(),
+            archive_path = %archive.display(),
+            "legacy scanner state imported into SQLite"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            legacy_state_path = %path.display(),
+            "legacy scanner state was imported but could not be archived"
+        ),
     }
 }
 
@@ -246,10 +308,6 @@ fn default_scanner_path() -> String {
     "./a".into()
 }
 
-fn default_scanner_id() -> String {
-    uuid::Uuid::now_v7().to_string()
-}
-
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct ScannerConfig {
     pub(crate) c_server: String,
@@ -259,10 +317,10 @@ pub(crate) struct ScannerConfig {
     pub(crate) verify_tls: bool,
     #[serde(default = "default_scanner_path")]
     pub(crate) scanner_path: String,
-    /// Scanner identity — auto-generated UUIDv7 on first run.
-    #[serde(default = "default_scanner_id")]
+    /// Legacy TOML identity, imported into SQLite during upgrade.
+    #[serde(default)]
     pub(crate) scanner_id: String,
-    /// Runtime token returned after one-time registration.
+    /// Legacy TOML runtime token, imported into SQLite during upgrade.
     #[serde(default)]
     pub(crate) runtime_token: String,
     #[serde(default = "default_heartbeat_interval")]
@@ -282,6 +340,17 @@ pub(crate) struct ScannerConfig {
 }
 
 impl ScannerConfig {
+    pub(crate) fn server_origin(&self) -> String {
+        format!(
+            "https://{}:{}",
+            self.c_server
+                .trim()
+                .trim_end_matches('.')
+                .to_ascii_lowercase(),
+            self.c_port
+        )
+    }
+
     pub(crate) fn task_url(&self, dry_run: bool) -> String {
         let mut url = format!(
             "https://{}:{}/api/task/apply?scannerid={}",
@@ -476,32 +545,92 @@ mod tests {
 
     #[test]
     fn durable_cache_round_trips_task_identity_and_progress() {
-        let state_file = std::env::temp_dir().join(format!(
-            "network-mapping-scanner-state-{}.json",
+        let database = std::env::temp_dir().join(format!(
+            "network-mapping-scanner-state-{}.sqlite3",
             uuid::Uuid::now_v7()
         ));
+        let legacy_state = database.with_extension("json");
+        let server_origin = "https://scanner.example:443".to_owned();
         let task_id = uuid::Uuid::now_v7();
-        let mut cache = CacheManager {
-            state_file: Some(state_file.clone()),
-            ..CacheManager::default()
-        };
+        let store = crate::storage::StateStore::open(database.clone()).unwrap();
+        let scanner_id = uuid::Uuid::now_v7().to_string();
+        let mut cache = CacheManager::load(
+            store,
+            server_origin.clone(),
+            scanner_id.clone(),
+            legacy_state.clone(),
+        )
+        .unwrap();
         cache.begin_task(task_id).unwrap();
         cache.mark_batch_uploaded(0).unwrap();
+        let upload_id = cache.upload_id;
+        drop(cache);
 
-        let restored = CacheManager::load(state_file.clone()).unwrap();
+        let store = crate::storage::StateStore::open(database.clone()).unwrap();
+        let mut restored =
+            CacheManager::load(store, server_origin, scanner_id, legacy_state).unwrap();
         assert_eq!(restored.task_id, Some(task_id));
-        assert_eq!(restored.upload_id, cache.upload_id);
+        assert_eq!(restored.upload_id, upload_id);
         assert_eq!(restored.next_batch_index, 1);
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                std::fs::metadata(&state_file).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
                 0o600
             );
         }
-        std::fs::remove_file(state_file).unwrap();
+        restored.clear().unwrap();
+        drop(restored);
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn legacy_json_state_is_imported_and_archived() {
+        let database = std::env::temp_dir().join(format!(
+            "network-mapping-scanner-state-{}.sqlite3",
+            uuid::Uuid::now_v7()
+        ));
+        let legacy_state = database.with_extension("json");
+        let archive = legacy_state.with_extension("json.migrated");
+        let task_id = uuid::Uuid::now_v7();
+        let upload_id = uuid::Uuid::now_v7();
+        let observation = crate::scan::ScanObservation::Port(crate::scan::PortObservation {
+            ip: "192.0.2.1".into(),
+            port: 443,
+            protocol: "tcp".into(),
+            state: "open".into(),
+            source: "masscan".into(),
+            observed_at: 1,
+        });
+        let legacy = serde_json::json!({
+            "task_id": task_id,
+            "upload_id": upload_id,
+            "observations": [observation],
+            "next_batch_index": 0
+        });
+        std::fs::write(&legacy_state, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(CacheManager::legacy_state_has_pending(&legacy_state).unwrap());
+
+        let store = crate::storage::StateStore::open(database.clone()).unwrap();
+        let mut cache = CacheManager::load(
+            store,
+            "https://scanner.example:443".into(),
+            uuid::Uuid::now_v7().to_string(),
+            legacy_state.clone(),
+        )
+        .unwrap();
+        assert_eq!(cache.task_id, Some(task_id));
+        assert_eq!(cache.upload_id, Some(upload_id));
+        assert_eq!(cache.observations.len(), 1);
+        assert!(!legacy_state.exists());
+        assert!(archive.exists());
+
+        cache.clear().unwrap();
+        drop(cache);
+        std::fs::remove_file(database).unwrap();
+        std::fs::remove_file(archive).unwrap();
     }
 }
 

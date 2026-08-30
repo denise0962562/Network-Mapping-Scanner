@@ -81,8 +81,14 @@ lease_safety_margin_seconds = 10
 masscan/zgrab2 进程会被取消，过期结果不会上传。已经生成的上传批次在租约仍有效时使用
 原有 `upload_id` 和 `batch_index` 重试，因此响应丢失不会造成重复入库。
 
-任务身份、观察、真实观察时间和下一批序号会原子持久化到 `./scanner-state.json`；可用
-`--state-file` 指定其他路径。进程或主机重启后会先恢复并上传该状态，再领取新任务。
+扫描器身份、运行令牌、任务身份、观察、真实观察时间和下一批序号会持久化到
+`./scanner-state.sqlite3`；可用 `--database` 指定其他路径。身份按目标服务端隔离，任务结果和
+上传进度使用 SQLite 事务原子更新。进程或主机重启后会先恢复并上传待处理状态，再领取新任务。
+
+升级时如果 TOML 中已有 `scanner_id` / `runtime_token`，扫描器会先导入数据库，再将旧字段
+清空；如果存在旧的 `./scanner-state.json`，也会自动导入并改名为
+`scanner-state.json.migrated`。`--state-file` 仅用于指定这一旧 JSON 的迁移来源。数据库文件
+包含运行令牌，应位于持久化本地磁盘并限制访问权限；程序在 Unix 上会将其设置为 `0600`。
 
 ## IPv4/IPv6 自动探测
 
