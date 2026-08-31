@@ -58,7 +58,7 @@ impl MaintenanceInfo {
 
 #[derive(Error, Debug)]
 pub(crate) enum ServerError {
-    #[error("{operation} paused for scanner maintenance: {detail}")]
+    #[error("{operation} paused for system maintenance: {detail}")]
     Maintenance {
         operation: &'static str,
         detail: String,

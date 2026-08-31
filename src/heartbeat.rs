@@ -268,20 +268,20 @@ impl HeartbeatClient {
     pub(crate) async fn maintenance_status(&self) -> Result<MaintenanceInfo, ScannerError> {
         let response = self
             .client
-            .get(&self.maintenance_url, "check scanner maintenance")
+            .get(&self.maintenance_url, "check system maintenance")
             .await?;
         if !response.status().is_success() {
-            return Err(response_error(response, "check scanner maintenance")
+            return Err(response_error(response, "check system maintenance")
                 .await
                 .into());
         }
         let response: MaintenanceProbeResponse = response
             .json()
             .await
-            .map_err(|error| response_decode_error(error, "check scanner maintenance"))?;
+            .map_err(|error| response_decode_error(error, "check system maintenance"))?;
         if !response.success {
             return Err(ServerError::InvalidResponse {
-                operation: "check scanner maintenance",
+                operation: "check system maintenance",
                 detail: "maintenance probe returned success=false".into(),
             }
             .into());

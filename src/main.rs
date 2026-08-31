@@ -632,7 +632,7 @@ fn spawn_heartbeat(
                                     ConnectionState::Connecting,
                                 );
                                 tracing::info!(
-                                    "scanner maintenance ended; resuming heartbeat and cached uploads"
+                                    "system maintenance ended; resuming heartbeat and cached uploads"
                                 );
                                 continue;
                             }
@@ -674,13 +674,13 @@ fn spawn_heartbeat(
                         task_action = %info.task_action,
                         result_upload_grace_hours = info.result_upload_grace_hours,
                         retry_delay_seconds = info.retry_delay().as_secs(),
-                        "scanner entered maintenance sleep; active scan will finish locally"
+                            "system maintenance started; scanner will sleep after its active scan finishes locally"
                     );
                     match wait_for_maintenance_exit(&client, &active_task, *info).await {
                         Ok(true) => {
                             backoff.reset();
                             publish_connection_state(&connection_tx, ConnectionState::Connecting);
-                            tracing::info!("scanner maintenance ended; resuming heartbeat");
+                            tracing::info!("system maintenance ended; resuming heartbeat");
                         }
                         Ok(false) => break,
                         Err(ScannerError::Server(ServerError::AuthRejected { .. })) => {
@@ -790,7 +790,7 @@ async fn wait_for_maintenance_exit(
                     expected_end_at = ?next.expected_end_at,
                     revision = next.revision,
                     retry_delay_seconds = next.retry_delay().as_secs(),
-                    "scanner maintenance is still active"
+                    "system maintenance is still active"
                 );
                 info = next;
             }
