@@ -1,7 +1,6 @@
 use crate::error::ScannerError;
 use crate::scan::ScanObservation;
 use crate::types::{CacheManager, ScannerResultBatchUpload};
-#[cfg(test)]
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -10,6 +9,7 @@ pub(crate) const UPLOAD_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const RESULT_PROTOCOL_VERSION: u16 = 2;
 
 impl CacheManager {
+    #[cfg(test)]
     pub(crate) fn begin_task(&mut self, task_id: Uuid) -> Result<(), ScannerError> {
         if self.task_id.is_some() || !self.observations.is_empty() {
             return Err(ScannerError::Scan(
@@ -17,11 +17,56 @@ impl CacheManager {
             ));
         }
         self.task_id = Some(task_id);
-        self.upload_id = Some(Uuid::now_v7());
+        let upload_id = Uuid::now_v7();
+        if let Some(store) = self.store.as_mut() {
+            store.begin_upload(
+                &self.server_origin,
+                &self.scanner_id,
+                task_id,
+                upload_id,
+                &[],
+            )?;
+        }
+        self.upload_id = Some(upload_id);
         self.next_batch_index = 0;
-        self.persist()
+        Ok(())
     }
 
+    pub(crate) fn begin_task_with_observations(
+        &mut self,
+        task_id: Uuid,
+        observations: &[ScanObservation],
+    ) -> Result<(), ScannerError> {
+        if self.task_id.is_some() || !self.observations.is_empty() {
+            return Err(ScannerError::Scan(
+                "cannot start a new task while results are pending".into(),
+            ));
+        }
+        let mut identities = HashSet::new();
+        let observations: Vec<_> = observations
+            .iter()
+            .filter(|item| identities.insert(item.identity()))
+            .cloned()
+            .collect();
+        let upload_id = Uuid::now_v7();
+        if let Some(store) = self.store.as_mut() {
+            store.begin_upload(
+                &self.server_origin,
+                &self.scanner_id,
+                task_id,
+                upload_id,
+                &observations,
+            )?;
+        }
+        self.task_id = Some(task_id);
+        self.upload_id = Some(upload_id);
+        self.next_batch_index = 0;
+        self.identities = identities;
+        self.observations = observations;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert(&mut self, observation: &ScanObservation) -> Result<(), ScannerError> {
         if self.task_id.is_none() || self.upload_id.is_none() {
             return Err(ScannerError::Scan(
@@ -29,14 +74,21 @@ impl CacheManager {
             ));
         }
         let identity = observation.identity();
-        if !self
-            .observations
-            .iter()
-            .any(|existing| existing.identity() == identity)
-        {
-            self.observations.push(observation.clone());
+        if self.identities.contains(&identity) {
+            return Ok(());
         }
-        self.persist()
+        if let Some(store) = self.store.as_ref()
+            && !store.append_observation(
+                &self.server_origin,
+                self.observations.len(),
+                observation,
+            )?
+        {
+            return Ok(());
+        }
+        self.identities.insert(identity);
+        self.observations.push(observation.clone());
+        Ok(())
     }
 
     pub(crate) fn has_pending_task(&self) -> bool {
@@ -97,10 +149,14 @@ impl CacheManager {
                 self.next_batch_index
             )));
         }
-        self.next_batch_index = self.next_batch_index.checked_add(1).ok_or_else(|| {
+        let next_batch_index = self.next_batch_index.checked_add(1).ok_or_else(|| {
             ScannerError::Upload("uploaded batch index exceeded protocol limit".into())
         })?;
-        self.persist()
+        if let Some(store) = self.store.as_ref() {
+            store.set_next_batch_index(&self.server_origin, next_batch_index)?;
+        }
+        self.next_batch_index = next_batch_index;
+        Ok(())
     }
 
     #[cfg(test)]

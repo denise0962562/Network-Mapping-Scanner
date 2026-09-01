@@ -9,6 +9,7 @@ mod network;
 mod reconnect;
 mod register;
 mod scan;
+mod storage;
 mod sysinfo;
 mod types;
 mod upload;
@@ -25,6 +26,7 @@ use crate::scan::{
     ScanCapabilities, ScanObservation, ScanOutcome, ScanPlan, run_scan, validate_scanner_binary,
     validate_zgrab_binary,
 };
+use crate::storage::{StateStore, StoredIdentity};
 use crate::sysinfo::SystemInfo;
 use crate::types::{CacheManager, TargetParams};
 use crate::upload::Uploader;
@@ -75,8 +77,13 @@ struct Cli {
     log_directory: PathBuf,
 
     /// Durable state file used to resume result uploads after a restart
+    /// (legacy JSON input; imported into --database when present)
     #[arg(long, default_value = "./scanner-state.json")]
     state_file: PathBuf,
+
+    /// SQLite database for scanner identity and durable upload state
+    #[arg(long, default_value = "./scanner-state.sqlite3")]
+    database: PathBuf,
 }
 
 // ---- globals ------------------------------------------------------------
@@ -161,13 +168,69 @@ async fn run() -> Result<(), ScannerError> {
 
     tracing::debug!(config_path = %cli.config, "configuration loaded and validated");
 
+    let server_origin = loaded.app.scanner.server_origin();
+    let state_store = StateStore::open(cli.database.clone())?;
+    let legacy_identity_present = loaded.has_legacy_runtime_token();
+    let legacy_secret_present = loaded.has_legacy_secret();
+    if let Some(identity) = state_store.load_identity(&server_origin)? {
+        if legacy_identity_present
+            && (loaded.app.scanner.scanner_id != identity.scanner_id
+                || loaded.app.scanner.runtime_token != identity.runtime_token)
+        {
+            tracing::warn!(
+                server_origin,
+                "SQLite identity overrides a different legacy TOML identity"
+            );
+        }
+        loaded.app.scanner.scanner_id = identity.scanner_id;
+        loaded.app.scanner.runtime_token = identity.runtime_token;
+    } else if legacy_identity_present {
+        Uuid::parse_str(&loaded.app.scanner.scanner_id).map_err(|error| {
+            ScannerError::Config(format!("invalid legacy scanner.scanner_id: {error}"))
+        })?;
+        state_store.save_identity(
+            &server_origin,
+            &StoredIdentity {
+                scanner_id: loaded.app.scanner.scanner_id.clone(),
+                runtime_token: loaded.app.scanner.runtime_token.clone(),
+            },
+        )?;
+        tracing::info!(server_origin, "legacy TOML identity imported into SQLite");
+    }
+    if legacy_secret_present && let Err(error) = loaded.clear_legacy_identity() {
+        tracing::warn!(%error, "identity is stored in SQLite but could not be removed from TOML");
+    }
+
+    if let Some(requested_scanner_id) = cli.id.as_deref()
+        && let Some(pending_scanner_id) = state_store.pending_upload_scanner_id(&server_origin)?
+        && pending_scanner_id != requested_scanner_id
+    {
+        return Err(ScannerError::Config(format!(
+            "cannot register scanner {requested_scanner_id} while results for scanner {pending_scanner_id} are pending upload"
+        )));
+    }
+    if let Some(requested_scanner_id) = cli.id.as_deref()
+        && requested_scanner_id != loaded.app.scanner.scanner_id
+        && CacheManager::legacy_state_has_pending(&cli.state_file)?
+    {
+        return Err(ScannerError::Config(format!(
+            "cannot register scanner {requested_scanner_id} while legacy JSON results for scanner {} are pending migration",
+            loaded.app.scanner.scanner_id
+        )));
+    }
+
     // ---- handle --id / --token ----
     let identity_changed = handle_identity(&cli, &mut loaded).await?;
 
     if identity_changed {
-        // Identity was updated — save back to config preserving comments.
-        loaded.save_scanner_identity()?;
-        println!("\x1b[32mconfig updated\x1b[0m");
+        state_store.save_identity(
+            &server_origin,
+            &StoredIdentity {
+                scanner_id: loaded.app.scanner.scanner_id.clone(),
+                runtime_token: loaded.app.scanner.runtime_token.clone(),
+            },
+        )?;
+        println!("\x1b[32mscanner identity stored in SQLite\x1b[0m");
         // When --id/--token are explicitly passed, registration is the goal; exit.
         if cli.id.is_some() || cli.token.is_some() {
             return Ok(());
@@ -309,7 +372,7 @@ async fn run() -> Result<(), ScannerError> {
         cfg.scanner.runtime_token.clone(),
     )?;
     let network_capabilities = SharedNetworkCapabilities::new(network_detector.detect().await);
-    let scan_capabilities = ScanCapabilities::from_config(&cfg.service_detection);
+    let scan_capabilities = ScanCapabilities::from_config(&cfg.service_detection, &cfg.dns);
     let network_probe_handle =
         network_detector.spawn(network_capabilities.clone(), connection_rx.clone());
     let heartbeat_client = HeartbeatClient::new(
@@ -347,7 +410,12 @@ async fn run() -> Result<(), ScannerError> {
         heartbeat_interval_seconds = cfg.scanner.heartbeat_interval_seconds,
         "runtime clients initialized"
     );
-    let mut cache = CacheManager::load(cli.state_file.clone())?;
+    let mut cache = CacheManager::load(
+        state_store,
+        server_origin,
+        cfg.scanner.scanner_id.clone(),
+        cli.state_file.clone(),
+    )?;
     if cache.has_pending_task() {
         tracing::warn!(
             task_id = ?cache.task_id,
@@ -367,6 +435,7 @@ async fn run() -> Result<(), ScannerError> {
                 scanner_id,
                 rate: cfg.scanner.rate as i32,
                 service_detection: &cfg.service_detection,
+                dns: &cfg.dns,
                 retry_policy: RetryPolicy::new(
                     Duration::from_secs(cfg.scanner.reconnect_initial_delay_seconds),
                     Duration::from_secs(cfg.scanner.reconnect_max_delay_seconds),
@@ -402,7 +471,7 @@ async fn run() -> Result<(), ScannerError> {
 
 // ---- identity management ------------------------------------------------
 
-/// Returns `true` if any config field was changed.
+/// Returns `true` if the runtime identity was changed.
 async fn handle_identity(
     cli: &Cli,
     loaded: &mut config::LoadedConfig,
@@ -564,7 +633,7 @@ fn spawn_heartbeat(
                                     ConnectionState::Connecting,
                                 );
                                 tracing::info!(
-                                    "scanner maintenance ended; resuming heartbeat and cached uploads"
+                                    "system maintenance ended; resuming heartbeat and cached uploads"
                                 );
                                 continue;
                             }
@@ -606,13 +675,13 @@ fn spawn_heartbeat(
                         task_action = %info.task_action,
                         result_upload_grace_hours = info.result_upload_grace_hours,
                         retry_delay_seconds = info.retry_delay().as_secs(),
-                        "scanner entered maintenance sleep; active scan will finish locally"
+                            "system maintenance started; scanner will sleep after its active scan finishes locally"
                     );
                     match wait_for_maintenance_exit(&client, &active_task, *info).await {
                         Ok(true) => {
                             backoff.reset();
                             publish_connection_state(&connection_tx, ConnectionState::Connecting);
-                            tracing::info!("scanner maintenance ended; resuming heartbeat");
+                            tracing::info!("system maintenance ended; resuming heartbeat");
                         }
                         Ok(false) => break,
                         Err(ScannerError::Server(ServerError::AuthRejected { .. })) => {
@@ -722,7 +791,7 @@ async fn wait_for_maintenance_exit(
                     expected_end_at = ?next.expected_end_at,
                     revision = next.revision,
                     retry_delay_seconds = next.retry_delay().as_secs(),
-                    "scanner maintenance is still active"
+                    "system maintenance is still active"
                 );
                 info = next;
             }
@@ -832,7 +901,7 @@ async fn flush(
         observation_count,
         "all cached scan results uploaded"
     );
-    cache.clear();
+    cache.clear()?;
     Ok(())
 }
 
@@ -876,6 +945,7 @@ struct ScanLoopConfig<'a> {
     scanner_id: Uuid,
     rate: i32,
     service_detection: &'a crate::types::ServiceDetectionConfig,
+    dns: &'a crate::types::DnsConfig,
     retry_policy: RetryPolicy,
     lease_safety_margin: Duration,
 }
@@ -905,7 +975,10 @@ async fn scan_loop(
             }
             if active_task.cancellation_reason() == Some(TaskCancellationReason::LeaseLost) {
                 tracing::error!("discarding cached results after task lease loss");
-                cache.clear();
+                if let Err(error) = cache.clear() {
+                    tracing::error!(%error, "failed to discard cached results after lease loss");
+                    break;
+                }
                 active_task.clear().await;
                 continue;
             }
@@ -921,7 +994,10 @@ async fn scan_loop(
                 FlushAttempt::LeaseExpired(task_id) => {
                     active_task.request_lease_lost(task_id).await;
                     tracing::error!(%task_id, "result upload stopped at the lease safety deadline");
-                    cache.clear();
+                    if let Err(error) = cache.clear() {
+                        tracing::error!(%error, "failed to discard results after lease expiry");
+                        break;
+                    }
                     active_task.clear().await;
                     continue;
                 }
@@ -976,7 +1052,10 @@ async fn scan_loop(
                     if is_stale_task_error(&error) =>
                 {
                     tracing::error!(%error, "server no longer accepts this task; discarding cached results");
-                    cache.clear();
+                    if let Err(clear_error) = cache.clear() {
+                        tracing::error!(%clear_error, "failed to discard rejected cached results");
+                        break;
+                    }
                     active_task.clear().await;
                     continue;
                 }
@@ -1144,8 +1223,10 @@ async fn scan_loop(
         let results = match run_scan(
             config.scanner_path,
             config.service_detection,
+            config.dns,
             &scan_plan,
             &target,
+            &assigned_task.dns_resolvers,
             &cancel_flag,
         )
         .instrument(scan_span)
@@ -1274,35 +1355,22 @@ async fn scan_loop(
             "scan execution completed"
         );
 
-        if let Err(error) = cache.begin_task(assigned_task.task_id) {
+        if let Err(error) = cache.begin_task_with_observations(assigned_task.task_id, &results) {
             tracing::error!("failed to bind results to task: {}", error);
             break;
         }
 
-        for observation in &results {
-            if stop_requested() {
-                log_event!(
-                    LogLevel::Info,
-                    "FLUSH",
-                    "flushing on stop signal",
-                    "scan_loop"
-                );
-                if let Err(error) = flush(uploader, config.scanner_id, cache).await {
-                    tracing::error!("upload during shutdown failed: {}", error);
-                }
-                return;
+        if stop_requested() {
+            log_event!(
+                LogLevel::Info,
+                "FLUSH",
+                "flushing on stop signal",
+                "scan_loop"
+            );
+            if let Err(error) = flush(uploader, config.scanner_id, cache).await {
+                tracing::error!("upload during shutdown failed: {}", error);
             }
-
-            if let Err(e) = cache.insert(observation) {
-                log_event!(
-                    LogLevel::Error,
-                    "CACHE-ERROR",
-                    "cache insert failed",
-                    "scan_loop"
-                );
-                tracing::error!("cache error: {}", e);
-                return;
-            }
+            return;
         }
 
         tracing::debug!(
@@ -1315,7 +1383,9 @@ async fn scan_loop(
     tracing::debug!(stop_requested = stop_requested(), "scan loop exiting");
 
     if active_task.cancellation_reason() == Some(TaskCancellationReason::LeaseLost) {
-        cache.clear();
+        if let Err(error) = cache.clear() {
+            tracing::error!(%error, "failed to discard cached results after lease loss");
+        }
         active_task.clear().await;
     } else {
         match flush(uploader, config.scanner_id, cache).await {

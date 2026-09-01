@@ -6,3 +6,8 @@ logs/
 test-resource/
 scanner-state.json
 scanner-state.json.tmp
+scanner-state.json.migrated
+scanner-state.sqlite3
+scanner-state.sqlite3-journal
+scanner-state.sqlite3-wal
+scanner-state.sqlite3-shm

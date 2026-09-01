@@ -1,5 +1,5 @@
 use crate::error::ScannerError;
-use crate::types::ServiceDetectionConfig;
+use crate::types::{DnsConfig, ServiceDetectionConfig};
 
 pub(crate) const SCAN_PLAN_VERSION: u16 = 1;
 
@@ -22,6 +22,7 @@ pub(crate) struct ScanStageSpec {
 pub(crate) enum ScanStageKind {
     PortDiscovery,
     ServiceDetection,
+    DnsLookup,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -29,20 +30,26 @@ pub(crate) struct ScanCapabilities {
     pub(crate) plan_versions: Vec<u16>,
     pub(crate) profiles: Vec<&'static str>,
     pub(crate) stages: Vec<&'static str>,
+    pub(crate) explicit_dns_resolvers: bool,
 }
 
 impl ScanCapabilities {
-    pub(crate) fn from_config(service: &ServiceDetectionConfig) -> Self {
+    pub(crate) fn from_config(service: &ServiceDetectionConfig, dns: &DnsConfig) -> Self {
         let mut profiles = vec!["legacy", "port_only"];
         let mut stages = vec!["port_discovery"];
         if service.enabled {
             profiles.push("service_inventory");
             stages.push("service_detection");
         }
+        if dns.enabled {
+            profiles.extend(["dns_records", "dns_ports", "dns_full"]);
+            stages.push("dns_lookup");
+        }
         Self {
             plan_versions: vec![SCAN_PLAN_VERSION],
             profiles,
             stages,
+            explicit_dns_resolvers: dns.enabled,
         }
     }
 }
@@ -75,30 +82,45 @@ impl ScanPlan {
         }
         if !matches!(
             self.profile.as_str(),
-            "legacy" | "port_only" | "service_inventory"
+            "legacy" | "port_only" | "service_inventory" | "dns_records" | "dns_ports" | "dns_full"
         ) {
             return Err(ScannerError::Scan(format!(
                 "unsupported scan profile '{}'",
                 self.profile
             )));
         }
+        let port_discovery_count = self
+            .stages
+            .iter()
+            .filter(|stage| stage.kind == ScanStageKind::PortDiscovery)
+            .count();
+        let service_detection_count = self
+            .stages
+            .iter()
+            .filter(|stage| stage.kind == ScanStageKind::ServiceDetection)
+            .count();
+        let dns_lookup_count = self
+            .stages
+            .iter()
+            .filter(|stage| stage.kind == ScanStageKind::DnsLookup)
+            .count();
         if self.stages.is_empty()
-            || self.stages[0].kind != ScanStageKind::PortDiscovery
-            || self
-                .stages
-                .iter()
-                .filter(|stage| stage.kind == ScanStageKind::PortDiscovery)
-                .count()
-                != 1
-            || self
-                .stages
-                .iter()
-                .filter(|stage| stage.kind == ScanStageKind::ServiceDetection)
-                .count()
-                > 1
+            || (matches!(
+                self.profile.as_str(),
+                "dns_records" | "dns_ports" | "dns_full"
+            ) && (dns_lookup_count != 1
+                || port_discovery_count != usize::from(self.profile != "dns_records")
+                || service_detection_count != 0))
+            || (!matches!(
+                self.profile.as_str(),
+                "dns_records" | "dns_ports" | "dns_full"
+            ) && (self.stages[0].kind != ScanStageKind::PortDiscovery
+                || port_discovery_count != 1
+                || service_detection_count > 1
+                || dns_lookup_count != 0))
         {
             return Err(ScannerError::Scan(
-                "scan plan must start with exactly one port_discovery stage and contain at most one service_detection stage".into(),
+                "scan plan has unsupported stage ordering or duplication".into(),
             ));
         }
         match self.profile.as_str() {
@@ -114,6 +136,22 @@ impl ScanPlan {
             {
                 return Err(ScannerError::Scan(
                     "service_inventory profile requires port_discovery followed by required service_detection".into(),
+                ));
+            }
+            "dns_records"
+                if self.stages.len() != 1 || self.stages[0].kind != ScanStageKind::DnsLookup =>
+            {
+                return Err(ScannerError::Scan(
+                    "dns_records profile requires only dns_lookup".into(),
+                ));
+            }
+            "dns_ports" | "dns_full"
+                if self.stages.len() != 2
+                    || self.stages[0].kind != ScanStageKind::DnsLookup
+                    || self.stages[1].kind != ScanStageKind::PortDiscovery =>
+            {
+                return Err(ScannerError::Scan(
+                    "DNS port profiles require dns_lookup followed by port_discovery".into(),
                 ));
             }
             _ => {}
@@ -135,6 +173,33 @@ mod tests {
         }))
         .unwrap();
         assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_dns_only_plan() {
+        let plan: ScanPlan = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "profile": "dns_records",
+            "stages": [{"type": "dns_lookup", "required": true}]
+        }))
+        .unwrap();
+        assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_dns_then_port_plans() {
+        for profile in ["dns_ports", "dns_full"] {
+            let plan: ScanPlan = serde_json::from_value(serde_json::json!({
+                "version": 1,
+                "profile": profile,
+                "stages": [
+                    {"type": "dns_lookup", "required": true},
+                    {"type": "port_discovery", "required": true}
+                ]
+            }))
+            .unwrap();
+            assert!(plan.validate().is_ok());
+        }
     }
 
     #[test]
@@ -164,15 +229,30 @@ mod tests {
 
     #[test]
     fn capabilities_follow_local_engine_configuration() {
-        let ports = ScanCapabilities::from_config(&ServiceDetectionConfig::default());
-        assert!(ports.profiles.contains(&"port_only"));
-        assert!(!ports.profiles.contains(&"service_inventory"));
+        let default_capabilities = ScanCapabilities::from_config(
+            &ServiceDetectionConfig::default(),
+            &DnsConfig::default(),
+        );
+        assert!(default_capabilities.profiles.contains(&"port_only"));
+        assert!(default_capabilities.profiles.contains(&"dns_records"));
+        assert!(!default_capabilities.profiles.contains(&"service_inventory"));
+        assert!(default_capabilities.explicit_dns_resolvers);
 
         let service = ServiceDetectionConfig {
             enabled: true,
             ..ServiceDetectionConfig::default()
         };
-        let inventory = ScanCapabilities::from_config(&service);
+        let inventory = ScanCapabilities::from_config(&service, &DnsConfig::default());
         assert!(inventory.profiles.contains(&"service_inventory"));
+
+        let dns = DnsConfig {
+            enabled: true,
+            ..DnsConfig::default()
+        };
+        let dns_capabilities =
+            ScanCapabilities::from_config(&ServiceDetectionConfig::default(), &dns);
+        assert!(dns_capabilities.profiles.contains(&"dns_records"));
+        assert!(dns_capabilities.profiles.contains(&"dns_ports"));
+        assert!(dns_capabilities.profiles.contains(&"dns_full"));
     }
 }

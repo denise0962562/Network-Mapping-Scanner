@@ -36,12 +36,28 @@ pub(crate) fn load(path: &str) -> Result<LoadedConfig, ScannerError> {
 }
 
 impl LoadedConfig {
-    /// Persist `scanner_id` and the runtime token back to `[scanner]`.
-    ///
-    /// Re-parses the original file content so that all comments, whitespace,
-    /// and ordering are preserved exactly as they were on disk.
-    pub(crate) fn save_scanner_identity(&self) -> Result<(), ScannerError> {
-        tracing::debug!(config_path = %self.path, "persisting scanner identity");
+    pub(crate) fn has_legacy_runtime_token(&self) -> bool {
+        !self.app.scanner.runtime_token.is_empty()
+    }
+
+    pub(crate) fn has_legacy_secret(&self) -> bool {
+        if self.has_legacy_runtime_token() {
+            return true;
+        }
+        self.raw
+            .parse::<toml_edit::DocumentMut>()
+            .ok()
+            .and_then(|doc| {
+                doc.get("scanner")
+                    .and_then(toml_edit::Item::as_table)
+                    .map(|scanner| scanner.contains_key("token"))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Remove runtime identity from the legacy TOML after it has been stored in SQLite.
+    pub(crate) fn clear_legacy_identity(&self) -> Result<(), ScannerError> {
+        tracing::debug!(config_path = %self.path, "removing legacy scanner identity");
         let mut doc: toml_edit::DocumentMut = self.raw.parse().map_err(|e| {
             ScannerError::Config(format!("failed to re-parse config for saving: {}", e))
         })?;
@@ -49,12 +65,46 @@ impl LoadedConfig {
             ScannerError::Config("scanner configuration must be a TOML table".into())
         })?;
         scanner.remove("token");
-        scanner["scanner_id"] = toml_edit::value(&self.app.scanner.scanner_id);
-        scanner["runtime_token"] = toml_edit::value(&self.app.scanner.runtime_token);
-        std::fs::write(&self.path, doc.to_string()).map_err(ScannerError::Io)?;
-        tracing::debug!(config_path = %self.path, "scanner identity persisted");
+        scanner["scanner_id"] = toml_edit::value("");
+        scanner["runtime_token"] = toml_edit::value("");
+        atomic_write(&self.path, doc.to_string().as_bytes())?;
+        tracing::debug!(config_path = %self.path, "legacy scanner identity removed");
         Ok(())
     }
+}
+
+fn atomic_write(path: &str, contents: &[u8]) -> Result<(), ScannerError> {
+    use std::io::Write;
+
+    let path = std::path::Path::new(path);
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| ScannerError::Config("config path has no valid file name".into()))?;
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::now_v7()));
+    let original_permissions = std::fs::metadata(path)
+        .map_err(ScannerError::Io)?
+        .permissions();
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    let write_result = (|| {
+        let mut file = options.open(&temporary).map_err(ScannerError::Io)?;
+        std::fs::set_permissions(&temporary, original_permissions).map_err(ScannerError::Io)?;
+        file.write_all(contents).map_err(ScannerError::Io)?;
+        file.sync_all().map_err(ScannerError::Io)
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    std::fs::rename(&temporary, path).map_err(ScannerError::Io)?;
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(ScannerError::Io)
 }
 
 fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
@@ -166,6 +216,16 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
             !(1_024..=1_048_576).contains(&cfg.service_detection.max_result_bytes),
             "must be between 1024 and 1048576",
         ),
+        (
+            "dns.query_timeout_seconds",
+            !(1..=60).contains(&cfg.dns.query_timeout_seconds),
+            "must be between 1 and 60",
+        ),
+        (
+            "dns.record_types",
+            cfg.dns.record_types.is_empty() || cfg.dns.record_types.len() > 8,
+            "must contain 1 to 8 entries",
+        ),
     ];
 
     for &(field, failed, msg) in rules {
@@ -173,6 +233,46 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
             return Err(ScannerError::Config(format!("{}: {}", field, msg)));
         }
     }
+    if cfg.dns.record_types.iter().any(|record_type| {
+        !matches!(
+            record_type.trim().to_ascii_uppercase().as_str(),
+            "A" | "AAAA"
+        )
+    }) {
+        return Err(ScannerError::Config(
+            "dns.record_types currently supports only A and AAAA".into(),
+        ));
+    }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clearing_legacy_identity_preserves_other_config_content() {
+        let path =
+            std::env::temp_dir().join(format!("scanner-config-{}.toml", uuid::Uuid::now_v7()));
+        let raw = include_str!("../config.toml")
+            .replace(
+                "scanner_id = \"\"",
+                "scanner_id = \"019c0000-0000-7000-8000-000000000001\"",
+            )
+            .replace("runtime_token = \"\"", "runtime_token = \"runtime-secret\"")
+            .replace("[scanner]", "[scanner]\ntoken = \"one-time-secret\"");
+        std::fs::write(&path, raw).unwrap();
+
+        let loaded = load(path.to_str().unwrap()).unwrap();
+        assert!(loaded.has_legacy_secret());
+        loaded.clear_legacy_identity().unwrap();
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("# Target API server hostname"));
+        assert!(updated.contains("scanner_id = \"\""));
+        assert!(updated.contains("runtime_token = \"\""));
+        assert!(!updated.contains("one-time-secret"));
+        std::fs::remove_file(path).unwrap();
+    }
 }

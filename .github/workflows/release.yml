@@ -17,6 +17,12 @@ jobs:
   build-release:
     name: Build and package Linux x86_64
     runs-on: ubuntu-24.04
+    container:
+      image: rust:1.98.0-bookworm
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: Checkout scanner
         uses: actions/checkout@v5
@@ -25,16 +31,41 @@ jobs:
 
       - name: Install system build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes libssl-dev pkg-config
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            binutils \
+            build-essential \
+            gh \
+            libssl-dev \
+            pkg-config
+          rm -rf /var/lib/apt/lists/*
 
-      - name: Install Rust stable
+      - name: Verify Debian 12 build environment
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          source /etc/os-release
+          test "$ID" = 'debian'
+          test "$VERSION_ID" = '12'
+          test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.36'
+          rustc --version
+          cargo --version
 
       - name: Build scanner
-        run: cargo build --locked --release
+        run: |
+          cargo build --locked --release
+
+          required_glibc="$({
+            objdump -T target/release/scanner-rs \
+              | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p'
+          } | sort -V | tail -n 1)"
+          if [[ -z "$required_glibc" ]]; then
+            echo 'Unable to determine the scanner GLIBC requirement' >&2
+            exit 1
+          fi
+          if dpkg --compare-versions "$required_glibc" gt '2.36'; then
+            echo "Scanner requires GLIBC_$required_glibc, newer than Debian 12 GLIBC_2.36" >&2
+            exit 1
+          fi
+          echo "Scanner maximum GLIBC requirement: GLIBC_$required_glibc"
 
       - name: Resolve package metadata
         id: package
@@ -106,6 +137,7 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail

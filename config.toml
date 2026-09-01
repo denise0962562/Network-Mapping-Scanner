@@ -9,9 +9,9 @@ rate = 10000000
 verify_tls = true
 # Path to masscan binary (port discovery only)
 scanner_path = "./a"
-# Auto-generated scanner identity (UUIDv7) — do not edit manually
+# Legacy identity migration field; runtime identity is stored in scanner-state.sqlite3
 scanner_id = ""
-# Runtime token — written automatically after successful one-time registration
+# Legacy runtime-token migration field; new registrations do not write this file
 runtime_token = ""
 # HTTP and automatic reconnect settings
 connect_timeout_seconds = 5
@@ -41,6 +41,12 @@ connect_timeout_seconds = 5
 target_timeout_seconds = 15
 # Maximum structured zgrab2 detail retained per service result.
 max_result_bytes = 65536
+
+[dns]
+# 默认使用系统递归解析器，任务也可指定 UDP/TCP DNS 服务器；当前仅查询 A/AAAA。设为 false 可禁用 DNS 任务。
+enabled = true
+record_types = ["A", "AAAA"]
+query_timeout_seconds = 5
 
 [network]
 # 自动探测协议公网出口；可关闭某个地址族或替换为自建的 IP 回显 API。

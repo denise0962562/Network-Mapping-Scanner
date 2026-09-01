@@ -58,7 +58,7 @@ impl MaintenanceInfo {
 
 #[derive(Error, Debug)]
 pub(crate) enum ServerError {
-    #[error("{operation} paused for scanner maintenance: {detail}")]
+    #[error("{operation} paused for system maintenance: {detail}")]
     Maintenance {
         operation: &'static str,
         detail: String,
@@ -163,6 +163,9 @@ pub(crate) enum ScannerError {
 
     #[error("{0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("SQLite state database error: {0}")]
+    Database(#[from] rusqlite::Error),
 
     #[error("{0}")]
     Toml(String),

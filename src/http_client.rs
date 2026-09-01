@@ -227,7 +227,7 @@ fn parse_maintenance_response(
         return None;
     }
     let envelope: MaintenanceEnvelope = serde_json::from_slice(body).ok()?;
-    (envelope.code == "scanner_maintenance").then_some(envelope.maintenance)
+    (envelope.code == "system_maintenance").then_some(envelope.maintenance)
 }
 
 async fn response_body(mut response: Response) -> Vec<u8> {
@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn maintenance_requires_versioned_structured_response() {
         let body = br#"{
-            "code":"scanner_maintenance",
+            "code":"system_maintenance",
             "maintenance":{"phase":"active","message":"upgrade","retry_after_seconds":600}
         }"#;
         let info = parse_maintenance_response(StatusCode::SERVICE_UNAVAILABLE, Some("1"), body)
