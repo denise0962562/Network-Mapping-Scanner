@@ -48,7 +48,7 @@ impl SystemInfo {
 // ---- /proc readers ------------------------------------------------------
 
 fn read_file(path: &str) -> Result<String, ScannerError> {
-    std::fs::read_to_string(path).map_err(|e| ScannerError::Io(e))
+    std::fs::read_to_string(path).map_err(ScannerError::Io)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -130,10 +130,10 @@ fn read_cpu_cores() -> Result<u32, ScannerError> {
             cores += 1;
         }
         // Also try "cpu cores" field which gives per-socket core count
-        if let Some(val) = line.strip_prefix("cpu cores") {
-            if let Ok(n) = val.split(':').nth(1).unwrap_or("").trim().parse::<u32>() {
-                seen.insert(n);
-            }
+        if let Some(val) = line.strip_prefix("cpu cores")
+            && let Ok(n) = val.split(':').nth(1).unwrap_or("").trim().parse::<u32>()
+        {
+            seen.insert(n);
         }
     }
 
