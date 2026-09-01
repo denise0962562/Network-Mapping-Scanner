@@ -30,6 +30,7 @@ pub(crate) struct ScanCapabilities {
     pub(crate) plan_versions: Vec<u16>,
     pub(crate) profiles: Vec<&'static str>,
     pub(crate) stages: Vec<&'static str>,
+    pub(crate) explicit_dns_resolvers: bool,
 }
 
 impl ScanCapabilities {
@@ -48,6 +49,7 @@ impl ScanCapabilities {
             plan_versions: vec![SCAN_PLAN_VERSION],
             profiles,
             stages,
+            explicit_dns_resolvers: dns.enabled,
         }
     }
 }

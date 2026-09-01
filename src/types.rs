@@ -160,9 +160,44 @@ pub(crate) struct AssignedTask {
     #[serde(default)]
     pub(crate) scan_plan: Option<crate::scan::ScanPlan>,
     #[serde(default)]
+    pub(crate) dns_resolvers: Vec<DnsResolver>,
+    #[serde(default)]
     pub(crate) lease_expires_at_ms: Option<i64>,
     #[serde(default = "default_task_lease_ttl_ms")]
     pub(crate) lease_ttl_ms: u64,
+}
+
+/// A DNS server selected by the user for one task. DNS task configuration is
+/// delivered by the control plane instead of being taken from the scanner's
+/// host configuration, so a result can always be attributed to its source.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct DnsResolver {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) ip: String,
+    pub(crate) port: u16,
+    pub(crate) transport: String,
+}
+
+impl DnsResolver {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.id.trim().is_empty() || self.id.len() > 64 {
+            return Err("DNS resolver id must contain 1 to 64 characters".into());
+        }
+        if self.label.trim().is_empty() || self.label.len() > 128 {
+            return Err("DNS resolver label must contain 1 to 128 characters".into());
+        }
+        if self.ip.parse::<std::net::IpAddr>().is_err() {
+            return Err("DNS resolver ip must be an IP address".into());
+        }
+        if self.port == 0 {
+            return Err("DNS resolver port must be between 1 and 65535".into());
+        }
+        if !matches!(self.transport.as_str(), "udp" | "tcp") {
+            return Err("DNS resolver transport must be udp or tcp".into());
+        }
+        Ok(())
+    }
 }
 
 impl AssignedTask {
@@ -180,6 +215,16 @@ impl AssignedTask {
                     .any(|target| !is_valid_dns_domain(target))
             {
                 return Err("DNS task contains an invalid domain target".into());
+            }
+            if self.dns_resolvers.len() > 8 {
+                return Err("DNS task contains more than 8 resolvers".into());
+            }
+            let mut resolver_ids = std::collections::HashSet::new();
+            for resolver in &self.dns_resolvers {
+                resolver.validate()?;
+                if !resolver_ids.insert(resolver.id.as_str()) {
+                    return Err("DNS task contains duplicate resolver ids".into());
+                }
             }
             return Ok(());
         }
@@ -479,7 +524,25 @@ fn default_lease_safety_margin() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssignedTask, CacheManager, ScannerConfig};
+    use super::{AssignedTask, CacheManager, DnsResolver, ScannerConfig};
+
+    #[test]
+    fn explicit_dns_resolver_requires_a_literal_address_and_supported_transport() {
+        let valid = DnsResolver {
+            id: "dns-a".into(),
+            label: "DNS A".into(),
+            ip: "192.0.2.53".into(),
+            port: 53,
+            transport: "udp".into(),
+        };
+        assert!(valid.validate().is_ok());
+        let invalid = DnsResolver {
+            ip: "resolver.example".into(),
+            transport: "doh".into(),
+            ..valid
+        };
+        assert!(invalid.validate().is_err());
+    }
 
     #[test]
     fn assigned_task_matches_server_response() {

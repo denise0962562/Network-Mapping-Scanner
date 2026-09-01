@@ -20,6 +20,7 @@ pub(crate) async fn run_scan(
     dns_config: &DnsConfig,
     plan: &ScanPlan,
     target: &TargetParams,
+    dns_resolvers: &[crate::types::DnsResolver],
     cancel_requested: &AtomicBool,
 ) -> Result<ScanOutcome, ScannerError> {
     plan.validate()?;
@@ -92,14 +93,15 @@ pub(crate) async fn run_scan(
                     "task requires dns_lookup but this scanner has DNS disabled".into(),
                 ));
             }
-            ScanStageKind::DnsLookup => match dns::run(dns_config, target, cancel_requested).await?
-            {
-                Some(results) => {
-                    dns_observations = results.observations;
-                    resolved_ips = results.resolved_ips;
+            ScanStageKind::DnsLookup => {
+                match dns::run(dns_config, target, dns_resolvers, cancel_requested).await? {
+                    Some(results) => {
+                        dns_observations = results.observations;
+                        resolved_ips = results.resolved_ips;
+                    }
+                    None => return Ok(ScanOutcome::Cancelled),
                 }
-                None => return Ok(ScanOutcome::Cancelled),
-            },
+            }
         }
     }
     let mut observations =
@@ -157,6 +159,7 @@ mod tests {
             &DnsConfig::default(),
             &plan,
             &target,
+            &[],
             &AtomicBool::new(false),
         )
         .await
@@ -212,6 +215,7 @@ mod tests {
             &DnsConfig::default(),
             &plan,
             &target,
+            &[],
             &AtomicBool::new(false),
         )
         .await;

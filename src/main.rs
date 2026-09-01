@@ -1226,6 +1226,7 @@ async fn scan_loop(
             config.dns,
             &scan_plan,
             &target,
+            &assigned_task.dns_resolvers,
             &cancel_flag,
         )
         .instrument(scan_span)

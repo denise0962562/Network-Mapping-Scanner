@@ -48,6 +48,12 @@ pub(crate) struct DnsObservation {
     #[serde(default)]
     pub(crate) additional: Vec<DnsAnswer>,
     pub(crate) resolver_ip: Option<String>,
+    #[serde(default)]
+    pub(crate) resolver_id: Option<String>,
+    #[serde(default)]
+    pub(crate) resolver_label: Option<String>,
+    #[serde(default)]
+    pub(crate) resolver_port: Option<u16>,
     pub(crate) resolver_transport: Option<String>,
     pub(crate) latency_ms: Option<u32>,
 }
@@ -89,8 +95,12 @@ impl ScanObservation {
                 item.source
             ),
             Self::Dns(item) => format!(
-                "dns|{}|{}|{}|{}",
-                item.question.name, item.question.record_type, item.response_code, item.observed_at
+                "dns|{}|{}|{}|{}|{}",
+                item.question.name,
+                item.question.record_type,
+                item.resolver_id.as_deref().unwrap_or("system"),
+                item.response_code,
+                item.observed_at
             ),
         }
     }
