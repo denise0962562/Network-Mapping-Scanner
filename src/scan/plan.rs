@@ -41,7 +41,7 @@ impl ScanCapabilities {
             stages.push("service_detection");
         }
         if dns.enabled {
-            profiles.push("dns_records");
+            profiles.extend(["dns_records", "dns_ports", "dns_full"]);
             stages.push("dns_lookup");
         }
         Self {
@@ -80,7 +80,7 @@ impl ScanPlan {
         }
         if !matches!(
             self.profile.as_str(),
-            "legacy" | "port_only" | "service_inventory" | "dns_records"
+            "legacy" | "port_only" | "service_inventory" | "dns_records" | "dns_ports" | "dns_full"
         ) {
             return Err(ScannerError::Scan(format!(
                 "unsupported scan profile '{}'",
@@ -103,15 +103,19 @@ impl ScanPlan {
             .filter(|stage| stage.kind == ScanStageKind::DnsLookup)
             .count();
         if self.stages.is_empty()
-            || (self.profile == "dns_records"
-                && (dns_lookup_count != 1
-                    || port_discovery_count != 0
-                    || service_detection_count != 0))
-            || (self.profile != "dns_records"
-                && (self.stages[0].kind != ScanStageKind::PortDiscovery
-                    || port_discovery_count != 1
-                    || service_detection_count > 1
-                    || dns_lookup_count != 0))
+            || (matches!(
+                self.profile.as_str(),
+                "dns_records" | "dns_ports" | "dns_full"
+            ) && (dns_lookup_count != 1
+                || port_discovery_count != usize::from(self.profile != "dns_records")
+                || service_detection_count != 0))
+            || (!matches!(
+                self.profile.as_str(),
+                "dns_records" | "dns_ports" | "dns_full"
+            ) && (self.stages[0].kind != ScanStageKind::PortDiscovery
+                || port_discovery_count != 1
+                || service_detection_count > 1
+                || dns_lookup_count != 0))
         {
             return Err(ScannerError::Scan(
                 "scan plan has unsupported stage ordering or duplication".into(),
@@ -137,6 +141,15 @@ impl ScanPlan {
             {
                 return Err(ScannerError::Scan(
                     "dns_records profile requires only dns_lookup".into(),
+                ));
+            }
+            "dns_ports" | "dns_full"
+                if self.stages.len() != 2
+                    || self.stages[0].kind != ScanStageKind::DnsLookup
+                    || self.stages[1].kind != ScanStageKind::PortDiscovery =>
+            {
+                return Err(ScannerError::Scan(
+                    "DNS port profiles require dns_lookup followed by port_discovery".into(),
                 ));
             }
             _ => {}
@@ -169,6 +182,22 @@ mod tests {
         }))
         .unwrap();
         assert!(plan.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_dns_then_port_plans() {
+        for profile in ["dns_ports", "dns_full"] {
+            let plan: ScanPlan = serde_json::from_value(serde_json::json!({
+                "version": 1,
+                "profile": profile,
+                "stages": [
+                    {"type": "dns_lookup", "required": true},
+                    {"type": "port_discovery", "required": true}
+                ]
+            }))
+            .unwrap();
+            assert!(plan.validate().is_ok());
+        }
     }
 
     #[test]
@@ -219,5 +248,7 @@ mod tests {
         let dns_capabilities =
             ScanCapabilities::from_config(&ServiceDetectionConfig::default(), &dns);
         assert!(dns_capabilities.profiles.contains(&"dns_records"));
+        assert!(dns_capabilities.profiles.contains(&"dns_ports"));
+        assert!(dns_capabilities.profiles.contains(&"dns_full"));
     }
 }

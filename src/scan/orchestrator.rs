@@ -26,10 +26,29 @@ pub(crate) async fn run_scan(
     let mut ports = Vec::new();
     let mut services = Vec::new();
     let mut dns_observations = Vec::new();
+    let mut resolved_ips = Vec::new();
     for stage in &plan.stages {
         match stage.kind {
             ScanStageKind::PortDiscovery => {
-                ports = match masscan::run(scanner_path, target, cancel_requested).await? {
+                let port_target = if matches!(plan.profile.as_str(), "dns_ports" | "dns_full") {
+                    if resolved_ips.is_empty() {
+                        tracing::info!("DNS task has no A/AAAA answers; skipping port discovery");
+                        continue;
+                    }
+                    TargetParams {
+                        ip: resolved_ips
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        port: target.port.clone(),
+                        rate: target.rate,
+                        address_family: target.address_family.clone(),
+                    }
+                } else {
+                    target.clone()
+                };
+                ports = match masscan::run(scanner_path, &port_target, cancel_requested).await? {
                     masscan::EngineOutcome::Completed(results) => results,
                     masscan::EngineOutcome::Cancelled => return Ok(ScanOutcome::Cancelled),
                 };
@@ -75,16 +94,21 @@ pub(crate) async fn run_scan(
             }
             ScanStageKind::DnsLookup => match dns::run(dns_config, target, cancel_requested).await?
             {
-                Some(results) => dns_observations = results,
+                Some(results) => {
+                    dns_observations = results.observations;
+                    resolved_ips = results.resolved_ips;
+                }
                 None => return Ok(ScanOutcome::Cancelled),
             },
         }
     }
     let mut observations =
         Vec::with_capacity(ports.len() + services.len() + dns_observations.len());
+    if plan.profile != "dns_ports" {
+        observations.extend(dns_observations.into_iter().map(ScanObservation::Dns));
+    }
     observations.extend(ports.into_iter().map(ScanObservation::Port));
     observations.extend(services.into_iter().map(ScanObservation::Service));
-    observations.extend(dns_observations.into_iter().map(ScanObservation::Dns));
     Ok(ScanOutcome::Completed(observations))
 }
 

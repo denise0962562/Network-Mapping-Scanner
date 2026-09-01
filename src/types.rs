@@ -167,11 +167,12 @@ pub(crate) struct AssignedTask {
 
 impl AssignedTask {
     pub(crate) fn validate_targets(&self) -> Result<(), String> {
-        if self
-            .scan_plan
-            .as_ref()
-            .is_some_and(|plan| plan.profile == "dns_records")
-        {
+        if self.scan_plan.as_ref().is_some_and(|plan| {
+            matches!(
+                plan.profile.as_str(),
+                "dns_records" | "dns_ports" | "dns_full"
+            )
+        }) {
             if self.task_target.is_empty()
                 || self
                     .task_target

@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use std::{collections::BTreeSet, net::IpAddr};
 
 use hickory_resolver::TokioResolver;
 use hickory_resolver::proto::rr::RecordType;
@@ -8,17 +9,23 @@ use crate::error::ScannerError;
 use crate::scan::{DnsAnswer, DnsObservation, DnsQuestion};
 use crate::types::{DnsConfig, TargetParams};
 
+pub(crate) struct DnsLookupResult {
+    pub(crate) observations: Vec<DnsObservation>,
+    pub(crate) resolved_ips: Vec<IpAddr>,
+}
+
 pub(crate) async fn run(
     config: &DnsConfig,
     target: &TargetParams,
     cancel_requested: &AtomicBool,
-) -> Result<Option<Vec<DnsObservation>>, ScannerError> {
+) -> Result<Option<DnsLookupResult>, ScannerError> {
     let resolver = TokioResolver::builder_tokio()
         .map_err(|error| {
             ScannerError::Scan(format!("failed to create DNS system resolver: {error}"))
         })?
         .build();
     let mut observations = Vec::new();
+    let mut resolved_ips = BTreeSet::new();
     for domain in target
         .ip
         .split(',')
@@ -29,18 +36,25 @@ pub(crate) async fn run(
             if cancel_requested.load(Ordering::Relaxed) {
                 return Ok(None);
             }
-            observations.push(
-                query(
-                    &resolver,
-                    domain,
-                    parse_record_type(record_type)?,
-                    config.query_timeout_seconds,
-                )
-                .await,
-            );
+            let observation = query(
+                &resolver,
+                domain,
+                parse_record_type(record_type)?,
+                config.query_timeout_seconds,
+            )
+            .await;
+            resolved_ips.extend(observation.answers.iter().filter_map(|answer| {
+                matches!(answer.record_type.as_str(), "A" | "AAAA")
+                    .then(|| answer.value.parse::<IpAddr>().ok())
+                    .flatten()
+            }));
+            observations.push(observation);
         }
     }
-    Ok(Some(observations))
+    Ok(Some(DnsLookupResult {
+        observations,
+        resolved_ips: resolved_ips.into_iter().collect(),
+    }))
 }
 
 fn parse_record_type(value: &str) -> Result<RecordType, ScannerError> {
