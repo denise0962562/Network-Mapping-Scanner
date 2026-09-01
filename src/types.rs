@@ -167,6 +167,21 @@ pub(crate) struct AssignedTask {
 
 impl AssignedTask {
     pub(crate) fn validate_targets(&self) -> Result<(), String> {
+        if self
+            .scan_plan
+            .as_ref()
+            .is_some_and(|plan| plan.profile == "dns_records")
+        {
+            if self.task_target.is_empty()
+                || self
+                    .task_target
+                    .iter()
+                    .any(|target| !is_valid_dns_domain(target))
+            {
+                return Err("DNS task contains an invalid domain target".into());
+            }
+            return Ok(());
+        }
         for target in &self.task_target {
             let address = target
                 .split_once('/')
@@ -183,6 +198,21 @@ impl AssignedTask {
         }
         Ok(())
     }
+}
+
+fn is_valid_dns_domain(value: &str) -> bool {
+    let value = value.trim().trim_end_matches('.');
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 fn default_address_family() -> String {
@@ -225,6 +255,8 @@ pub(crate) struct AppConfig {
     pub(crate) network: NetworkConfig,
     #[serde(default)]
     pub(crate) service_detection: ServiceDetectionConfig,
+    #[serde(default)]
+    pub(crate) dns: DnsConfig,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -276,6 +308,24 @@ impl Default for ServiceDetectionConfig {
             connect_timeout_seconds: 5,
             target_timeout_seconds: 15,
             max_result_bytes: 65_536,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct DnsConfig {
+    pub(crate) enabled: bool,
+    pub(crate) record_types: Vec<String>,
+    pub(crate) query_timeout_seconds: u64,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            record_types: vec!["A".into(), "AAAA".into()],
+            query_timeout_seconds: 5,
         }
     }
 }

@@ -1,8 +1,8 @@
-use super::engines::{masscan, zgrab2};
+use super::engines::{dns, masscan, zgrab2};
 use super::observation::ScanObservation;
 use super::plan::{ScanPlan, ScanStageKind};
 use crate::error::ScannerError;
-use crate::types::{ServiceDetectionConfig, TargetParams};
+use crate::types::{DnsConfig, ServiceDetectionConfig, TargetParams};
 use std::sync::atomic::AtomicBool;
 
 pub(crate) enum ScanOutcome {
@@ -17,6 +17,7 @@ pub(crate) enum ScanOutcome {
 pub(crate) async fn run_scan(
     scanner_path: &str,
     service_detection: &ServiceDetectionConfig,
+    dns_config: &DnsConfig,
     plan: &ScanPlan,
     target: &TargetParams,
     cancel_requested: &AtomicBool,
@@ -24,6 +25,7 @@ pub(crate) async fn run_scan(
     plan.validate()?;
     let mut ports = Vec::new();
     let mut services = Vec::new();
+    let mut dns_observations = Vec::new();
     for stage in &plan.stages {
         match stage.kind {
             ScanStageKind::PortDiscovery => {
@@ -66,11 +68,23 @@ pub(crate) async fn run_scan(
                     }
                 }
             }
+            ScanStageKind::DnsLookup if !dns_config.enabled => {
+                return Err(ScannerError::Scan(
+                    "task requires dns_lookup but this scanner has DNS disabled".into(),
+                ));
+            }
+            ScanStageKind::DnsLookup => match dns::run(dns_config, target, cancel_requested).await?
+            {
+                Some(results) => dns_observations = results,
+                None => return Ok(ScanOutcome::Cancelled),
+            },
         }
     }
-    let mut observations = Vec::with_capacity(ports.len() + services.len());
+    let mut observations =
+        Vec::with_capacity(ports.len() + services.len() + dns_observations.len());
     observations.extend(ports.into_iter().map(ScanObservation::Port));
     observations.extend(services.into_iter().map(ScanObservation::Service));
+    observations.extend(dns_observations.into_iter().map(ScanObservation::Dns));
     Ok(ScanOutcome::Completed(observations))
 }
 
@@ -116,6 +130,7 @@ mod tests {
         let outcome = run_scan(
             path.to_str().unwrap(),
             &service,
+            &DnsConfig::default(),
             &plan,
             &target,
             &AtomicBool::new(false),
@@ -170,6 +185,7 @@ mod tests {
         let result = run_scan(
             path.to_str().unwrap(),
             &service,
+            &DnsConfig::default(),
             &plan,
             &target,
             &AtomicBool::new(false),

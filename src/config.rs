@@ -216,12 +216,32 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
             !(1_024..=1_048_576).contains(&cfg.service_detection.max_result_bytes),
             "must be between 1024 and 1048576",
         ),
+        (
+            "dns.query_timeout_seconds",
+            !(1..=60).contains(&cfg.dns.query_timeout_seconds),
+            "must be between 1 and 60",
+        ),
+        (
+            "dns.record_types",
+            cfg.dns.record_types.is_empty() || cfg.dns.record_types.len() > 8,
+            "must contain 1 to 8 entries",
+        ),
     ];
 
     for &(field, failed, msg) in rules {
         if failed {
             return Err(ScannerError::Config(format!("{}: {}", field, msg)));
         }
+    }
+    if cfg.dns.record_types.iter().any(|record_type| {
+        !matches!(
+            record_type.trim().to_ascii_uppercase().as_str(),
+            "A" | "AAAA"
+        )
+    }) {
+        return Err(ScannerError::Config(
+            "dns.record_types currently supports only A and AAAA".into(),
+        ));
     }
 
     Ok(())

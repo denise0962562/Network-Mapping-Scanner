@@ -372,7 +372,7 @@ async fn run() -> Result<(), ScannerError> {
         cfg.scanner.runtime_token.clone(),
     )?;
     let network_capabilities = SharedNetworkCapabilities::new(network_detector.detect().await);
-    let scan_capabilities = ScanCapabilities::from_config(&cfg.service_detection);
+    let scan_capabilities = ScanCapabilities::from_config(&cfg.service_detection, &cfg.dns);
     let network_probe_handle =
         network_detector.spawn(network_capabilities.clone(), connection_rx.clone());
     let heartbeat_client = HeartbeatClient::new(
@@ -435,6 +435,7 @@ async fn run() -> Result<(), ScannerError> {
                 scanner_id,
                 rate: cfg.scanner.rate as i32,
                 service_detection: &cfg.service_detection,
+                dns: &cfg.dns,
                 retry_policy: RetryPolicy::new(
                     Duration::from_secs(cfg.scanner.reconnect_initial_delay_seconds),
                     Duration::from_secs(cfg.scanner.reconnect_max_delay_seconds),
@@ -944,6 +945,7 @@ struct ScanLoopConfig<'a> {
     scanner_id: Uuid,
     rate: i32,
     service_detection: &'a crate::types::ServiceDetectionConfig,
+    dns: &'a crate::types::DnsConfig,
     retry_policy: RetryPolicy,
     lease_safety_margin: Duration,
 }
@@ -1221,6 +1223,7 @@ async fn scan_loop(
         let results = match run_scan(
             config.scanner_path,
             config.service_detection,
+            config.dns,
             &scan_plan,
             &target,
             &cancel_flag,
