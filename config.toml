@@ -43,8 +43,8 @@ target_timeout_seconds = 15
 max_result_bytes = 65536
 
 [dns]
-# DNS 任务须显式启用；默认使用系统递归解析器，任务也可指定 UDP/TCP DNS 服务器；当前仅查询 A/AAAA。
-enabled = false
+# 默认使用系统递归解析器，任务也可指定 UDP/TCP DNS 服务器；当前仅查询 A/AAAA。设为 false 可禁用 DNS 任务。
+enabled = true
 record_types = ["A", "AAAA"]
 query_timeout_seconds = 5
 

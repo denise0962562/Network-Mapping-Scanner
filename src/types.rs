@@ -369,7 +369,7 @@ pub(crate) struct DnsConfig {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             record_types: vec!["A".into(), "AAAA".into()],
             query_timeout_seconds: 5,
         }

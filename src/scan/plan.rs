@@ -229,12 +229,14 @@ mod tests {
 
     #[test]
     fn capabilities_follow_local_engine_configuration() {
-        let ports = ScanCapabilities::from_config(
+        let default_capabilities = ScanCapabilities::from_config(
             &ServiceDetectionConfig::default(),
             &DnsConfig::default(),
         );
-        assert!(ports.profiles.contains(&"port_only"));
-        assert!(!ports.profiles.contains(&"service_inventory"));
+        assert!(default_capabilities.profiles.contains(&"port_only"));
+        assert!(default_capabilities.profiles.contains(&"dns_records"));
+        assert!(!default_capabilities.profiles.contains(&"service_inventory"));
+        assert!(default_capabilities.explicit_dns_resolvers);
 
         let service = ServiceDetectionConfig {
             enabled: true,
