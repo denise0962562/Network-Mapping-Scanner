@@ -247,10 +247,15 @@ impl AssignedTask {
 }
 
 fn is_valid_dns_domain(value: &str) -> bool {
-    let value = value.trim().trim_end_matches('.');
+    let value = value.trim();
+    let value = value.strip_suffix('.').unwrap_or(value);
+    let labels = value.split('.').collect::<Vec<_>>();
+    let wire_length = 1 + labels.iter().map(|label| 1 + label.len()).sum::<usize>();
     !value.is_empty()
         && value.len() <= 253
-        && value.split('.').all(|label| {
+        && labels.len() >= 2
+        && wire_length <= 255
+        && labels.iter().all(|label| {
             !label.is_empty()
                 && label.len() <= 63
                 && !label.starts_with('-')
@@ -562,7 +567,33 @@ fn default_lease_safety_margin() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssignedTask, CacheManager, DnsResolver, ScannerConfig};
+    use super::{AssignedTask, CacheManager, DnsResolver, ScannerConfig, is_valid_dns_domain};
+
+    #[test]
+    fn dns_task_domains_require_dot_separation_and_obey_wire_limits() {
+        let label_63 = "a".repeat(63);
+        let maximum = format!(
+            "{label_63}.{}.{}.{}",
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        let oversized_name = format!(
+            "{label_63}.{}.{}.{}",
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
+
+        assert!(!is_valid_dns_domain("a"));
+        assert!(is_valid_dns_domain("a.example"));
+        assert!(is_valid_dns_domain(&format!("{label_63}.example")));
+        assert!(!is_valid_dns_domain(&format!("{}.example", "a".repeat(64))));
+        assert!(!is_valid_dns_domain("a.example.."));
+        assert_eq!(maximum.len(), 253);
+        assert!(is_valid_dns_domain(&maximum));
+        assert!(!is_valid_dns_domain(&oversized_name));
+    }
 
     #[test]
     fn explicit_dns_resolver_requires_a_literal_address_and_supported_transport() {

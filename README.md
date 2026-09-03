@@ -80,6 +80,8 @@ Nuclei 只接收端口发现阶段产生的目标。上传结果不包含原始 
 `vulnerability_scan`、`port_only` 或 `service_inventory`；域名的前三种模式由 DNS 节点先执行
 `dns_records`，服务端再将授权的 A/AAAA 地址按 IPv4/IPv6 拆成对应 profile 的子任务。
 “仅 DNS”只运行 DNS engine，不启动 masscan、zgrab2 或 Nuclei。
+域名扫描目标必须至少包含两个由 `.` 分隔的标签，仅允许 ASCII 字母、数字和非首尾连字符；
+每个标签最多 63 octets，完整 wire name 最多 255 octets（无末尾根点的点分形式最多 253 octets）。
 
 完整的模板治理、参数语义、上线顺序和故障排查参见
 [Nuclei 漏洞扫描部署与运维](docs/NUCLEI.md)。

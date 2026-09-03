@@ -105,6 +105,10 @@ pub(crate) async fn run_scan(
 地址族拆分 `vulnerability_scan`、`port_only` 或 `service_inventory` 子任务。域名选择“仅 DNS”
 时不会生成子任务。`dns_ports` 与 `dns_full` 仅为滚动升级兼容保留。
 
+扫描器会防御性复核域名目标：必须至少包含两个由 `.` 分隔的标签，只接受 ASCII 字母、数字
+和非首尾连字符；单标签最多 63 octets，完整 wire name 最多 255 octets（不含末尾根点的
+点分形式最多 253 octets）。
+
 心跳通过 `scan_capabilities` 上报支持的计划版本、profile 和阶段。本地关闭 zgrab2 时仅
 声明 `legacy`、`port_only` 和 `port_discovery`；启用并验证 zgrab2 后才声明
 `service_inventory` 与 `service_detection`。启用并验证 Nuclei 二进制及模板目录后才声明
