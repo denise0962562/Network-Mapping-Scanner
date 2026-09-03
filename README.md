@@ -76,6 +76,11 @@ Nuclei 只接收端口发现阶段产生的目标。上传结果不包含原始 
 写入扫描缓存和服务端。启用节点会在心跳中声明 `vulnerability_scan` 能力，只有这类节点会领取
 漏洞扫描任务。
 
+控制端创建页提供“全部”“仅端口”“服务识别”“仅 DNS”四种模式。IP/CIDR 任务直接映射为
+`vulnerability_scan`、`port_only` 或 `service_inventory`；域名的前三种模式由 DNS 节点先执行
+`dns_records`，服务端再将授权的 A/AAAA 地址按 IPv4/IPv6 拆成对应 profile 的子任务。
+“仅 DNS”只运行 DNS engine，不启动 masscan、zgrab2 或 Nuclei。
+
 完整的模板治理、参数语义、上线顺序和故障排查参见
 [Nuclei 漏洞扫描部署与运维](docs/NUCLEI.md)。
 

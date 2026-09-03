@@ -100,6 +100,11 @@ pub(crate) async fn run_scan(
 `dns_full`。没有 `scan_plan` 的旧服务端任务会按本地配置生成兼容计划。计划只描述白名单阶段，
 不接收二进制路径或任意 CLI 参数。
 
+新控制端把用户模式统一为“全部”“仅端口”“服务识别”“仅 DNS”。域名选择前三种时，扫描器
+收到的父任务仍是只含 `dns_lookup` 的 `dns_records`；服务端从上传的 A/AAAA 结果生成并按
+地址族拆分 `vulnerability_scan`、`port_only` 或 `service_inventory` 子任务。域名选择“仅 DNS”
+时不会生成子任务。`dns_ports` 与 `dns_full` 仅为滚动升级兼容保留。
+
 心跳通过 `scan_capabilities` 上报支持的计划版本、profile 和阶段。本地关闭 zgrab2 时仅
 声明 `legacy`、`port_only` 和 `port_discovery`；启用并验证 zgrab2 后才声明
 `service_inventory` 与 `service_detection`。启用并验证 Nuclei 二进制及模板目录后才声明

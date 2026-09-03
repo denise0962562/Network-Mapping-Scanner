@@ -10,6 +10,10 @@
 4. 使用节点本地审核模板运行 Nuclei；
 5. 将结构化漏洞元数据作为结果协议版本 3 上传。
 
+控制端的“全部”模式映射为 `vulnerability_scan`。目标为域名时，DNS 扫描器先完成
+`dns_records`，服务端仅把命中授权 CIDR 且未被排除的 A/AAAA 地址按地址族生成
+`vulnerability_scan` 子任务；Nuclei 不直接接收域名解析器返回的未授权地址。
+
 任务不能指定 Nuclei 二进制、模板路径或额外 CLI 参数。Nuclei 不会扫描 masscan 未发现的
 端点。没有开放端口时漏洞阶段直接成功并返回空结果。
 
