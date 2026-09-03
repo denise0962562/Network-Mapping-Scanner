@@ -76,6 +76,9 @@ Nuclei 只接收端口发现阶段产生的目标。上传结果不包含原始 
 写入扫描缓存和服务端。启用节点会在心跳中声明 `vulnerability_scan` 能力，只有这类节点会领取
 漏洞扫描任务。
 
+完整的模板治理、参数语义、上线顺序和故障排查参见
+[Nuclei 漏洞扫描部署与运维](docs/NUCLEI.md)。
+
 运行时会将结构化 JSON 日志按天写入 `./logs/scanner.log.YYYY-MM-DD`，同时保留终端输出。可以使用 `--log-directory` 指定其他目录，使用 `--debug` 将终端和文件日志级别切换为 debug：
 
 ```sh
