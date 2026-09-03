@@ -48,6 +48,22 @@ enabled = true
 record_types = ["A", "AAAA"]
 query_timeout_seconds = 5
 
+[nuclei]
+# 安全漏洞扫描默认关闭。启用前安装 nuclei，并使用经过审核和固定版本的模板目录。
+enabled = false
+path = "nuclei"
+templates_path = "/opt/nuclei-templates/safe"
+severities = ["medium", "high", "critical"]
+rate_limit = 20
+bulk_size = 5
+concurrency = 5
+timeout_seconds = 10
+retries = 1
+max_runtime_seconds = 1800
+max_findings = 10000
+# 单条 JSONL 结果的最大字节数；原始请求/响应不会进入上传数据。
+max_result_bytes = 262144
+
 [network]
 # 自动探测协议公网出口；可关闭某个地址族或替换为自建的 IP 回显 API。
 ipv4_enabled = true

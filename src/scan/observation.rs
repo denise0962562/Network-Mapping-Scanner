@@ -6,6 +6,33 @@ pub(crate) enum ScanObservation {
     Port(PortObservation),
     Service(ServiceObservation),
     Dns(DnsObservation),
+    Vulnerability(VulnerabilityObservation),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct VulnerabilityObservation {
+    pub(crate) ip: String,
+    pub(crate) port: u16,
+    pub(crate) protocol: String,
+    pub(crate) template_id: String,
+    pub(crate) name: String,
+    pub(crate) severity: String,
+    pub(crate) matcher_name: Option<String>,
+    pub(crate) matched_at: String,
+    #[serde(default)]
+    pub(crate) description: Option<String>,
+    #[serde(default)]
+    pub(crate) remediation: Option<String>,
+    #[serde(default)]
+    pub(crate) tags: Vec<String>,
+    #[serde(default)]
+    pub(crate) references: Vec<String>,
+    #[serde(default)]
+    pub(crate) classification: Option<Value>,
+    #[serde(default)]
+    pub(crate) extracted_results: Vec<String>,
+    pub(crate) source: String,
+    pub(crate) observed_at: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -101,6 +128,14 @@ impl ScanObservation {
                 item.resolver_id.as_deref().unwrap_or("system"),
                 item.response_code,
                 item.observed_at
+            ),
+            Self::Vulnerability(item) => format!(
+                "vulnerability|{}|{}|{}|{}|{}",
+                item.ip,
+                item.port,
+                item.template_id,
+                item.matcher_name.as_deref().unwrap_or(""),
+                item.matched_at
             ),
         }
     }

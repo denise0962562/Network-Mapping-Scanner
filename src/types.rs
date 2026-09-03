@@ -303,6 +303,44 @@ pub(crate) struct AppConfig {
     pub(crate) service_detection: ServiceDetectionConfig,
     #[serde(default)]
     pub(crate) dns: DnsConfig,
+    #[serde(default)]
+    pub(crate) nuclei: NucleiConfig,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct NucleiConfig {
+    pub(crate) enabled: bool,
+    pub(crate) path: String,
+    pub(crate) templates_path: String,
+    pub(crate) severities: Vec<String>,
+    pub(crate) rate_limit: u32,
+    pub(crate) bulk_size: usize,
+    pub(crate) concurrency: usize,
+    pub(crate) timeout_seconds: u64,
+    pub(crate) retries: u8,
+    pub(crate) max_runtime_seconds: u64,
+    pub(crate) max_findings: usize,
+    pub(crate) max_result_bytes: usize,
+}
+
+impl Default for NucleiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: "nuclei".into(),
+            templates_path: String::new(),
+            severities: vec!["medium".into(), "high".into(), "critical".into()],
+            rate_limit: 20,
+            bulk_size: 5,
+            concurrency: 5,
+            timeout_seconds: 10,
+            retries: 1,
+            max_runtime_seconds: 1_800,
+            max_findings: 10_000,
+            max_result_bytes: 262_144,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

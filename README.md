@@ -18,7 +18,7 @@ cd Network-Mapping-Scanner
 cargo build --release
 ```
 
-普通扫描需要同时安装 `masscan` 和 `zgrab2`。masscan 只负责发现开放端口，zgrab2
+普通扫描需要安装 `masscan`；服务识别还需要 `zgrab2`。masscan 只负责发现开放端口，zgrab2
 按端口映射执行 SSH、HTTP(S)、TLS、邮件、数据库等应用层握手。可在配置中关闭服务识别，
 以兼容只部署 masscan 的节点：
 
@@ -51,6 +51,30 @@ max_result_bytes = 65536
 - 未配置 `[service_detection]` 的旧配置默认关闭该功能。
 - zgrab2 使用系统 TCP 栈，`senders` 和 `server_rate_limit` 应从较低值开始压测，不能照搬
   masscan 的发包速率。
+
+漏洞扫描默认关闭。节点安装 Nuclei 后，应将 `templates_path` 指向经过审核并固定版本的模板
+目录，再显式启用；扫描器禁用 Interactsh、未签名模板和自动更新，并限制并发、速率、运行时间
+与结果数量。仅在已授权的资产范围内启用：
+
+```toml
+[nuclei]
+enabled = true
+path = "nuclei"
+templates_path = "/opt/nuclei-templates/safe"
+severities = ["medium", "high", "critical"]
+rate_limit = 20
+bulk_size = 5
+concurrency = 5
+timeout_seconds = 10
+retries = 1
+max_runtime_seconds = 1800
+max_findings = 10000
+max_result_bytes = 262144
+```
+
+Nuclei 只接收端口发现阶段产生的目标。上传结果不包含原始 HTTP 请求或响应，避免把敏感内容
+写入扫描缓存和服务端。启用节点会在心跳中声明 `vulnerability_scan` 能力，只有这类节点会领取
+漏洞扫描任务。
 
 运行时会将结构化 JSON 日志按天写入 `./logs/scanner.log.YYYY-MM-DD`，同时保留终端输出。可以使用 `--log-directory` 指定其他目录，使用 `--debug` 将终端和文件日志级别切换为 debug：
 

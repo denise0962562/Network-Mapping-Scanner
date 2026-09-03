@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 pub(crate) const UPLOAD_BATCH_SIZE: usize = 500;
 pub(crate) const UPLOAD_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
-const RESULT_PROTOCOL_VERSION: u16 = 2;
+const RESULT_PROTOCOL_VERSION: u16 = 3;
 
 impl CacheManager {
     #[cfg(test)]
@@ -281,7 +281,7 @@ mod tests {
         assert_eq!(first[0].observations.len(), 2);
         assert_eq!(cache.observation_identities().len(), 2);
         let json = serde_json::to_value(&first[0]).unwrap();
-        assert_eq!(json["protocol_version"], 2);
+        assert_eq!(json["protocol_version"], 3);
         assert_eq!(json["observations"][0]["kind"], "port");
         assert_eq!(json["observations"][1]["kind"], "service");
     }

@@ -575,7 +575,7 @@ scanner-rs
 
 ```json
 {
-  "protocol_version": 2,
+  "protocol_version": 3,
   "scanner_id": "019c0000-0000-7000-8000-000000000001",
   "task_id": "019c0000-0000-7000-8000-000000000002",
   "upload_id": "019c0000-0000-7000-8000-000000000003",
@@ -673,7 +673,17 @@ cargo test
 
 ## 如何扩展
 
-### 添加新扫描器（如 nuclei）
+### Nuclei 漏洞扫描
+
+Nuclei 适配器位于 `scan/engines/nuclei.rs`。它只使用服务端下发的固定
+`vulnerability_scan` 计划和节点本地配置，不接受任务中的模板、命令或任意 CLI 参数。
+`[nuclei]` 默认关闭；启用前必须准备经过审核、固定版本且仅包含签名模板的目录。运行时固定
+禁用 Interactsh、未签名模板和自动更新，并应用并发、速率、超时、结果大小和数量上限。
+
+结果使用协议版本 3 的 `vulnerability` observation，上报结构化元数据而不保存 Nuclei 原始
+request/response。协议版本 1、2 仍可用于滚动升级，但版本 2 不能携带漏洞记录。
+
+### 添加新扫描器
 
 扫描流程扩展位于 `scan/orchestrator.rs`，具体工具适配器位于 `scan/engines/`：
 

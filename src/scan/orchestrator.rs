@@ -1,8 +1,8 @@
-use super::engines::{dns, masscan, zgrab2};
+use super::engines::{dns, masscan, nuclei, zgrab2};
 use super::observation::ScanObservation;
 use super::plan::{ScanPlan, ScanStageKind};
 use crate::error::ScannerError;
-use crate::types::{DnsConfig, ServiceDetectionConfig, TargetParams};
+use crate::types::{DnsConfig, NucleiConfig, ServiceDetectionConfig, TargetParams};
 use std::sync::atomic::AtomicBool;
 
 pub(crate) enum ScanOutcome {
@@ -10,23 +10,29 @@ pub(crate) enum ScanOutcome {
     Cancelled,
 }
 
+pub(crate) struct ScanRuntimeConfig<'a> {
+    pub(crate) scanner_path: &'a str,
+    pub(crate) service_detection: &'a ServiceDetectionConfig,
+    pub(crate) dns: &'a DnsConfig,
+    pub(crate) nuclei: &'a NucleiConfig,
+    pub(crate) dns_resolvers: &'a [crate::types::DnsResolver],
+}
+
 /// Execute the configured scan pipeline.
 ///
 /// Engines own process execution and output parsing. This orchestrator owns
 /// stage ordering, cancellation propagation, and stage-level failure policy.
 pub(crate) async fn run_scan(
-    scanner_path: &str,
-    service_detection: &ServiceDetectionConfig,
-    dns_config: &DnsConfig,
+    config: ScanRuntimeConfig<'_>,
     plan: &ScanPlan,
     target: &TargetParams,
-    dns_resolvers: &[crate::types::DnsResolver],
     cancel_requested: &AtomicBool,
 ) -> Result<ScanOutcome, ScannerError> {
     plan.validate()?;
     let mut ports = Vec::new();
     let mut services = Vec::new();
     let mut dns_observations = Vec::new();
+    let mut vulnerabilities = Vec::new();
     let mut resolved_ips = Vec::new();
     for stage in &plan.stages {
         match stage.kind {
@@ -49,14 +55,16 @@ pub(crate) async fn run_scan(
                 } else {
                     target.clone()
                 };
-                ports = match masscan::run(scanner_path, &port_target, cancel_requested).await? {
+                ports = match masscan::run(config.scanner_path, &port_target, cancel_requested)
+                    .await?
+                {
                     masscan::EngineOutcome::Completed(results) => results,
                     masscan::EngineOutcome::Cancelled => return Ok(ScanOutcome::Cancelled),
                 };
             }
             ScanStageKind::ServiceDetection if ports.is_empty() => {}
-            ScanStageKind::ServiceDetection if !service_detection.enabled => {
-                if plan.profile == "legacy" {
+            ScanStageKind::ServiceDetection if !config.service_detection.enabled => {
+                if plan.profile == "legacy" || !stage.required {
                     tracing::debug!(
                         "legacy service detection stage skipped by local configuration"
                     );
@@ -68,12 +76,12 @@ pub(crate) async fn run_scan(
             }
             ScanStageKind::ServiceDetection => {
                 let required = if plan.profile == "legacy" {
-                    service_detection.required
+                    config.service_detection.required
                 } else {
                     stage.required
                 };
                 match zgrab2::run(
-                    service_detection,
+                    config.service_detection,
                     &ports,
                     &target.address_family,
                     cancel_requested,
@@ -88,13 +96,13 @@ pub(crate) async fn run_scan(
                     }
                 }
             }
-            ScanStageKind::DnsLookup if !dns_config.enabled => {
+            ScanStageKind::DnsLookup if !config.dns.enabled => {
                 return Err(ScannerError::Scan(
                     "task requires dns_lookup but this scanner has DNS disabled".into(),
                 ));
             }
             ScanStageKind::DnsLookup => {
-                match dns::run(dns_config, target, dns_resolvers, cancel_requested).await? {
+                match dns::run(config.dns, target, config.dns_resolvers, cancel_requested).await? {
                     Some(results) => {
                         dns_observations = results.observations;
                         resolved_ips = results.resolved_ips;
@@ -102,15 +110,33 @@ pub(crate) async fn run_scan(
                     None => return Ok(ScanOutcome::Cancelled),
                 }
             }
+            ScanStageKind::VulnerabilityDetection if !config.nuclei.enabled => {
+                return Err(ScannerError::Scan(
+                    "task requires vulnerability_detection but this scanner has nuclei disabled"
+                        .into(),
+                ));
+            }
+            ScanStageKind::VulnerabilityDetection => {
+                match nuclei::run(config.nuclei, &ports, &services, cancel_requested).await? {
+                    nuclei::EngineOutcome::Completed(results) => vulnerabilities = results,
+                    nuclei::EngineOutcome::Cancelled => return Ok(ScanOutcome::Cancelled),
+                }
+            }
         }
     }
-    let mut observations =
-        Vec::with_capacity(ports.len() + services.len() + dns_observations.len());
+    let mut observations = Vec::with_capacity(
+        ports.len() + services.len() + dns_observations.len() + vulnerabilities.len(),
+    );
     if plan.profile != "dns_ports" {
         observations.extend(dns_observations.into_iter().map(ScanObservation::Dns));
     }
     observations.extend(ports.into_iter().map(ScanObservation::Port));
     observations.extend(services.into_iter().map(ScanObservation::Service));
+    observations.extend(
+        vulnerabilities
+            .into_iter()
+            .map(ScanObservation::Vulnerability),
+    );
     Ok(ScanOutcome::Completed(observations))
 }
 
@@ -154,12 +180,15 @@ mod tests {
         };
 
         let outcome = run_scan(
-            path.to_str().unwrap(),
-            &service,
-            &DnsConfig::default(),
+            ScanRuntimeConfig {
+                scanner_path: path.to_str().unwrap(),
+                service_detection: &service,
+                dns: &DnsConfig::default(),
+                nuclei: &NucleiConfig::default(),
+                dns_resolvers: &[],
+            },
             &plan,
             &target,
-            &[],
             &AtomicBool::new(false),
         )
         .await
@@ -210,12 +239,15 @@ mod tests {
         .unwrap();
 
         let result = run_scan(
-            path.to_str().unwrap(),
-            &service,
-            &DnsConfig::default(),
+            ScanRuntimeConfig {
+                scanner_path: path.to_str().unwrap(),
+                service_detection: &service,
+                dns: &DnsConfig::default(),
+                nuclei: &NucleiConfig::default(),
+                dns_resolvers: &[],
+            },
             &plan,
             &target,
-            &[],
             &AtomicBool::new(false),
         )
         .await;
