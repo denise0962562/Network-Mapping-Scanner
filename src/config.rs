@@ -226,6 +226,61 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
             cfg.dns.record_types.is_empty() || cfg.dns.record_types.len() > 8,
             "must contain 1 to 8 entries",
         ),
+        (
+            "nuclei.path",
+            cfg.nuclei.enabled && cfg.nuclei.path.trim().is_empty(),
+            "must not be empty when nuclei is enabled",
+        ),
+        (
+            "nuclei.templates_path",
+            cfg.nuclei.enabled && cfg.nuclei.templates_path.trim().is_empty(),
+            "must not be empty when nuclei is enabled",
+        ),
+        (
+            "nuclei.severities",
+            cfg.nuclei.severities.is_empty() || cfg.nuclei.severities.len() > 5,
+            "must contain 1 to 5 entries",
+        ),
+        (
+            "nuclei.rate_limit",
+            !(1..=10_000).contains(&cfg.nuclei.rate_limit),
+            "must be between 1 and 10000",
+        ),
+        (
+            "nuclei.bulk_size",
+            !(1..=1_000).contains(&cfg.nuclei.bulk_size),
+            "must be between 1 and 1000",
+        ),
+        (
+            "nuclei.concurrency",
+            !(1..=1_000).contains(&cfg.nuclei.concurrency),
+            "must be between 1 and 1000",
+        ),
+        (
+            "nuclei.timeout_seconds",
+            !(1..=300).contains(&cfg.nuclei.timeout_seconds),
+            "must be between 1 and 300",
+        ),
+        (
+            "nuclei.retries",
+            cfg.nuclei.retries > 10,
+            "must be between 0 and 10",
+        ),
+        (
+            "nuclei.max_runtime_seconds",
+            !(10..=86_400).contains(&cfg.nuclei.max_runtime_seconds),
+            "must be between 10 and 86400",
+        ),
+        (
+            "nuclei.max_findings",
+            !(1..=100_000).contains(&cfg.nuclei.max_findings),
+            "must be between 1 and 100000",
+        ),
+        (
+            "nuclei.max_result_bytes",
+            !(4_096..=1_048_576).contains(&cfg.nuclei.max_result_bytes),
+            "must be between 4096 and 1048576",
+        ),
     ];
 
     for &(field, failed, msg) in rules {
@@ -241,6 +296,16 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
     }) {
         return Err(ScannerError::Config(
             "dns.record_types currently supports only A and AAAA".into(),
+        ));
+    }
+    if cfg.nuclei.severities.iter().any(|severity| {
+        !matches!(
+            severity.trim().to_ascii_lowercase().as_str(),
+            "info" | "low" | "medium" | "high" | "critical"
+        )
+    }) {
+        return Err(ScannerError::Config(
+            "nuclei.severities contains an unsupported severity".into(),
         ));
     }
 

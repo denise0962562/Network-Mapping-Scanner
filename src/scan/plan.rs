@@ -1,5 +1,5 @@
 use crate::error::ScannerError;
-use crate::types::{DnsConfig, ServiceDetectionConfig};
+use crate::types::{DnsConfig, NucleiConfig, ServiceDetectionConfig};
 
 pub(crate) const SCAN_PLAN_VERSION: u16 = 1;
 
@@ -23,6 +23,7 @@ pub(crate) enum ScanStageKind {
     PortDiscovery,
     ServiceDetection,
     DnsLookup,
+    VulnerabilityDetection,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -34,7 +35,11 @@ pub(crate) struct ScanCapabilities {
 }
 
 impl ScanCapabilities {
-    pub(crate) fn from_config(service: &ServiceDetectionConfig, dns: &DnsConfig) -> Self {
+    pub(crate) fn from_config(
+        service: &ServiceDetectionConfig,
+        dns: &DnsConfig,
+        nuclei: &NucleiConfig,
+    ) -> Self {
         let mut profiles = vec!["legacy", "port_only"];
         let mut stages = vec!["port_discovery"];
         if service.enabled {
@@ -44,6 +49,10 @@ impl ScanCapabilities {
         if dns.enabled {
             profiles.extend(["dns_records", "dns_ports", "dns_full"]);
             stages.push("dns_lookup");
+        }
+        if nuclei.enabled {
+            profiles.push("vulnerability_scan");
+            stages.push("vulnerability_detection");
         }
         Self {
             plan_versions: vec![SCAN_PLAN_VERSION],
@@ -82,7 +91,13 @@ impl ScanPlan {
         }
         if !matches!(
             self.profile.as_str(),
-            "legacy" | "port_only" | "service_inventory" | "dns_records" | "dns_ports" | "dns_full"
+            "legacy"
+                | "port_only"
+                | "service_inventory"
+                | "vulnerability_scan"
+                | "dns_records"
+                | "dns_ports"
+                | "dns_full"
         ) {
             return Err(ScannerError::Scan(format!(
                 "unsupported scan profile '{}'",
@@ -104,20 +119,27 @@ impl ScanPlan {
             .iter()
             .filter(|stage| stage.kind == ScanStageKind::DnsLookup)
             .count();
+        let vulnerability_count = self
+            .stages
+            .iter()
+            .filter(|stage| stage.kind == ScanStageKind::VulnerabilityDetection)
+            .count();
         if self.stages.is_empty()
             || (matches!(
                 self.profile.as_str(),
                 "dns_records" | "dns_ports" | "dns_full"
             ) && (dns_lookup_count != 1
                 || port_discovery_count != usize::from(self.profile != "dns_records")
-                || service_detection_count != 0))
+                || service_detection_count != 0
+                || vulnerability_count != 0))
             || (!matches!(
                 self.profile.as_str(),
                 "dns_records" | "dns_ports" | "dns_full"
             ) && (self.stages[0].kind != ScanStageKind::PortDiscovery
                 || port_discovery_count != 1
                 || service_detection_count > 1
-                || dns_lookup_count != 0))
+                || dns_lookup_count != 0
+                || vulnerability_count > 1))
         {
             return Err(ScannerError::Scan(
                 "scan plan has unsupported stage ordering or duplication".into(),
@@ -136,6 +158,18 @@ impl ScanPlan {
             {
                 return Err(ScannerError::Scan(
                     "service_inventory profile requires port_discovery followed by required service_detection".into(),
+                ));
+            }
+            "vulnerability_scan"
+                if self.stages.len() != 3
+                    || self.stages[0].kind != ScanStageKind::PortDiscovery
+                    || self.stages[1].kind != ScanStageKind::ServiceDetection
+                    || self.stages[1].required
+                    || self.stages[2].kind != ScanStageKind::VulnerabilityDetection
+                    || !self.stages[2].required =>
+            {
+                return Err(ScannerError::Scan(
+                    "vulnerability_scan requires port discovery, optional service detection, and required vulnerability detection".into(),
                 ));
             }
             "dns_records"
@@ -232,6 +266,7 @@ mod tests {
         let default_capabilities = ScanCapabilities::from_config(
             &ServiceDetectionConfig::default(),
             &DnsConfig::default(),
+            &NucleiConfig::default(),
         );
         assert!(default_capabilities.profiles.contains(&"port_only"));
         assert!(default_capabilities.profiles.contains(&"dns_records"));
@@ -242,17 +277,44 @@ mod tests {
             enabled: true,
             ..ServiceDetectionConfig::default()
         };
-        let inventory = ScanCapabilities::from_config(&service, &DnsConfig::default());
+        let inventory = ScanCapabilities::from_config(
+            &service,
+            &DnsConfig::default(),
+            &NucleiConfig::default(),
+        );
         assert!(inventory.profiles.contains(&"service_inventory"));
 
         let dns = DnsConfig {
             enabled: true,
             ..DnsConfig::default()
         };
-        let dns_capabilities =
-            ScanCapabilities::from_config(&ServiceDetectionConfig::default(), &dns);
+        let dns_capabilities = ScanCapabilities::from_config(
+            &ServiceDetectionConfig::default(),
+            &dns,
+            &NucleiConfig::default(),
+        );
         assert!(dns_capabilities.profiles.contains(&"dns_records"));
         assert!(dns_capabilities.profiles.contains(&"dns_ports"));
         assert!(dns_capabilities.profiles.contains(&"dns_full"));
+
+        let nuclei = NucleiConfig {
+            enabled: true,
+            ..NucleiConfig::default()
+        };
+        let vulnerability_capabilities = ScanCapabilities::from_config(
+            &ServiceDetectionConfig::default(),
+            &DnsConfig::default(),
+            &nuclei,
+        );
+        assert!(
+            vulnerability_capabilities
+                .profiles
+                .contains(&"vulnerability_scan")
+        );
+        assert!(
+            vulnerability_capabilities
+                .stages
+                .contains(&"vulnerability_detection")
+        );
     }
 }

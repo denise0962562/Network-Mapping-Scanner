@@ -23,7 +23,8 @@ use crate::logging::{LogLevel, init_logging};
 use crate::network::{NetworkDetector, SharedNetworkCapabilities};
 use crate::reconnect::{Backoff, ConnectionState, RetryPolicy};
 use crate::scan::{
-    ScanCapabilities, ScanObservation, ScanOutcome, ScanPlan, run_scan, validate_scanner_binary,
+    ScanCapabilities, ScanObservation, ScanOutcome, ScanPlan, ScanRuntimeConfig, run_scan,
+    validate_nuclei_binary, validate_nuclei_templates, validate_scanner_binary,
     validate_zgrab_binary,
 };
 use crate::storage::{StateStore, StoredIdentity};
@@ -346,6 +347,10 @@ async fn run() -> Result<(), ScannerError> {
     if cfg.service_detection.enabled {
         validate_zgrab_binary(&cfg.service_detection.zgrab_path)?;
     }
+    if cfg.nuclei.enabled {
+        validate_nuclei_binary(&cfg.nuclei.path)?;
+        validate_nuclei_templates(&cfg.nuclei.templates_path)?;
+    }
 
     println!("starting...");
 
@@ -372,7 +377,8 @@ async fn run() -> Result<(), ScannerError> {
         cfg.scanner.runtime_token.clone(),
     )?;
     let network_capabilities = SharedNetworkCapabilities::new(network_detector.detect().await);
-    let scan_capabilities = ScanCapabilities::from_config(&cfg.service_detection, &cfg.dns);
+    let scan_capabilities =
+        ScanCapabilities::from_config(&cfg.service_detection, &cfg.dns, &cfg.nuclei);
     let network_probe_handle =
         network_detector.spawn(network_capabilities.clone(), connection_rx.clone());
     let heartbeat_client = HeartbeatClient::new(
@@ -436,6 +442,7 @@ async fn run() -> Result<(), ScannerError> {
                 rate: cfg.scanner.rate as i32,
                 service_detection: &cfg.service_detection,
                 dns: &cfg.dns,
+                nuclei: &cfg.nuclei,
                 retry_policy: RetryPolicy::new(
                     Duration::from_secs(cfg.scanner.reconnect_initial_delay_seconds),
                     Duration::from_secs(cfg.scanner.reconnect_max_delay_seconds),
@@ -946,6 +953,7 @@ struct ScanLoopConfig<'a> {
     rate: i32,
     service_detection: &'a crate::types::ServiceDetectionConfig,
     dns: &'a crate::types::DnsConfig,
+    nuclei: &'a crate::types::NucleiConfig,
     retry_policy: RetryPolicy,
     lease_safety_margin: Duration,
 }
@@ -1221,12 +1229,15 @@ async fn scan_loop(
             address_family = %target.address_family,
         );
         let results = match run_scan(
-            config.scanner_path,
-            config.service_detection,
-            config.dns,
+            ScanRuntimeConfig {
+                scanner_path: config.scanner_path,
+                service_detection: config.service_detection,
+                dns: config.dns,
+                nuclei: config.nuclei,
+                dns_resolvers: &assigned_task.dns_resolvers,
+            },
             &scan_plan,
             &target,
-            &assigned_task.dns_resolvers,
             &cancel_flag,
         )
         .instrument(scan_span)

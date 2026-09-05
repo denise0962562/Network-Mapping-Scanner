@@ -247,10 +247,15 @@ impl AssignedTask {
 }
 
 fn is_valid_dns_domain(value: &str) -> bool {
-    let value = value.trim().trim_end_matches('.');
+    let value = value.trim();
+    let value = value.strip_suffix('.').unwrap_or(value);
+    let labels = value.split('.').collect::<Vec<_>>();
+    let wire_length = 1 + labels.iter().map(|label| 1 + label.len()).sum::<usize>();
     !value.is_empty()
         && value.len() <= 253
-        && value.split('.').all(|label| {
+        && labels.len() >= 2
+        && wire_length <= 255
+        && labels.iter().all(|label| {
             !label.is_empty()
                 && label.len() <= 63
                 && !label.starts_with('-')
@@ -303,6 +308,46 @@ pub(crate) struct AppConfig {
     pub(crate) service_detection: ServiceDetectionConfig,
     #[serde(default)]
     pub(crate) dns: DnsConfig,
+    #[serde(default)]
+    pub(crate) nuclei: NucleiConfig,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct NucleiConfig {
+    pub(crate) port_fallback: bool,
+    pub(crate) enabled: bool,
+    pub(crate) path: String,
+    pub(crate) templates_path: String,
+    pub(crate) severities: Vec<String>,
+    pub(crate) rate_limit: u32,
+    pub(crate) bulk_size: usize,
+    pub(crate) concurrency: usize,
+    pub(crate) timeout_seconds: u64,
+    pub(crate) retries: u8,
+    pub(crate) max_runtime_seconds: u64,
+    pub(crate) max_findings: usize,
+    pub(crate) max_result_bytes: usize,
+}
+
+impl Default for NucleiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: "nuclei".into(),
+            port_fallback: true,
+            templates_path: String::new(),
+            severities: vec!["medium".into(), "high".into(), "critical".into()],
+            rate_limit: 20,
+            bulk_size: 5,
+            concurrency: 5,
+            timeout_seconds: 10,
+            retries: 1,
+            max_runtime_seconds: 1_800,
+            max_findings: 10_000,
+            max_result_bytes: 262_144,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -524,7 +569,33 @@ fn default_lease_safety_margin() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssignedTask, CacheManager, DnsResolver, ScannerConfig};
+    use super::{AssignedTask, CacheManager, DnsResolver, ScannerConfig, is_valid_dns_domain};
+
+    #[test]
+    fn dns_task_domains_require_dot_separation_and_obey_wire_limits() {
+        let label_63 = "a".repeat(63);
+        let maximum = format!(
+            "{label_63}.{}.{}.{}",
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        let oversized_name = format!(
+            "{label_63}.{}.{}.{}",
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
+
+        assert!(!is_valid_dns_domain("a"));
+        assert!(is_valid_dns_domain("a.example"));
+        assert!(is_valid_dns_domain(&format!("{label_63}.example")));
+        assert!(!is_valid_dns_domain(&format!("{}.example", "a".repeat(64))));
+        assert!(!is_valid_dns_domain("a.example.."));
+        assert_eq!(maximum.len(), 253);
+        assert!(is_valid_dns_domain(&maximum));
+        assert!(!is_valid_dns_domain(&oversized_name));
+    }
 
     #[test]
     fn explicit_dns_resolver_requires_a_literal_address_and_supported_transport() {

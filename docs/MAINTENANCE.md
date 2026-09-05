@@ -22,7 +22,9 @@ src/
 │   ├── plan.rs       # 版本化扫描计划与阶段白名单校验
 │   └── engines/
 │       ├── masscan.rs # masscan 端口发现、进程控制与输出解析
-│       └── zgrab2.rs  # zgrab2 服务识别、进程控制与 JSON 归一化
+│       ├── zgrab2.rs  # zgrab2 服务识别、进程控制与 JSON 归一化
+│       ├── dns.rs     # DNS 查询、解析器选择与结果归一化
+│       └── nuclei.rs  # Nuclei 目标生成、受控执行与 JSONL 归一化
 ├── cache.rs         # 按任务隔离、可持久恢复的结果缓存
 ├── upload.rs        # 结果上报：HTTPS POST JSON
 ├── register.rs      # 扫描器注册：POST /api/scanner/register
@@ -84,23 +86,33 @@ impl LoadedConfig {
 
 ```rust
 pub(crate) async fn run_scan(
-    scanner_path: &str,
-    service_detection: &ServiceDetectionConfig,
+    config: ScanRuntimeConfig<'_>,
     plan: &ScanPlan,
     target: &TargetParams,
     cancel_requested: &AtomicBool,
 ) -> Result<ScanOutcome, ScannerError>
 ```
 
-先运行 `run_masscan()` 获取开放端口；服务识别启用时，再把 TCP 端点交给 zgrab2。
+编排器严格按计划执行 DNS、端口发现、服务识别和漏洞检测阶段，并统一传播取消状态。
 
-任务可携带版本化 `scan_plan`。当前支持 `legacy`、`port_only` 和
-`service_inventory` 三种 profile；没有 `scan_plan` 的旧服务端任务会按本地配置生成
-兼容计划。计划只描述白名单阶段，不接收二进制路径或任意 CLI 参数。
+任务可携带版本化 `scan_plan`。IP 任务支持 `legacy`、`port_only`、
+`service_inventory` 和 `vulnerability_scan`；DNS 任务支持 `dns_records`、`dns_ports` 和
+`dns_full`。没有 `scan_plan` 的旧服务端任务会按本地配置生成兼容计划。计划只描述白名单阶段，
+不接收二进制路径或任意 CLI 参数。
+
+新控制端把用户模式统一为“全部”“仅端口”“服务识别”“仅 DNS”。域名选择前三种时，扫描器
+收到的父任务仍是只含 `dns_lookup` 的 `dns_records`；服务端从上传的 A/AAAA 结果生成并按
+地址族拆分 `vulnerability_scan`、`port_only` 或 `service_inventory` 子任务。域名选择“仅 DNS”
+时不会生成子任务。`dns_ports` 与 `dns_full` 仅为滚动升级兼容保留。
+
+扫描器会防御性复核域名目标：必须至少包含两个由 `.` 分隔的标签，只接受 ASCII 字母、数字
+和非首尾连字符；单标签最多 63 octets，完整 wire name 最多 255 octets（不含末尾根点的
+点分形式最多 253 octets）。
 
 心跳通过 `scan_capabilities` 上报支持的计划版本、profile 和阶段。本地关闭 zgrab2 时仅
 声明 `legacy`、`port_only` 和 `port_discovery`；启用并验证 zgrab2 后才声明
-`service_inventory` 与 `service_detection`，供服务端能力调度使用。
+`service_inventory` 与 `service_detection`。启用并验证 Nuclei 二进制及模板目录后才声明
+`vulnerability_scan` 与 `vulnerability_detection`，供服务端能力调度使用。
 
 Masscan 输出行解析：
 - `Discovered <port> <protocol> <ip>` → `PortObservation`
@@ -133,8 +145,8 @@ TLS 参数。
 端口只获得 TLS 时不会提前结束，而会在剩余连接预算中优先尝试安全应用协议。
 
 若 `required=false`，zgrab2 进程启动失败或非零退出只记录警告，masscan 端口结果照常上报；
-若 `required=true`，此类错误使任务按现有可重试失败流程处理。任务取消会终止当前 masscan 或
-zgrab2 子进程。
+若 `required=true`，此类错误使任务按现有可重试失败流程处理。任务取消会终止当前 masscan、
+zgrab2 或 Nuclei 子进程。
 
 #### `cache.rs`
 
@@ -150,8 +162,9 @@ impl CacheManager {
 }
 ```
 
-缓存保存类型化的 `Port` 与 `Service` observations，并按类型、IP、端口、协议、服务名和来源
-生成稳定身份去重。每个任务在 `begin_task_with_observations()` 时生成一次 `upload_id`，并在
+缓存保存类型化的 `Port`、`Service`、`Dns` 与 `Vulnerability` observations，并按各类型的
+稳定业务字段生成身份去重。漏洞身份包含端点、模板 ID、matcher 和匹配位置。每个任务在
+`begin_task_with_observations()` 时生成一次 `upload_id`，并在
 一个 SQLite 事务中保存任务和全部去重结果，重试期间保持不变。
 `upload_batches()` 每 500 条生成一批；空任务也生成一个最终空批，只有最后一批设置
 `is_final=true`。缓存同时记录下一待确认批次，重试时跳过已收到成功响应的批次；若响应
@@ -181,7 +194,7 @@ impl Uploader {
 }
 ```
 
-`upload()` 使用运行令牌作为 Bearer 凭据，顺序发送版本 2 结果批。失败时保留任务、
+`upload()` 使用运行令牌作为 Bearer 凭据，顺序发送版本 3 结果批。失败时保留任务、
 `upload_id` 和所有 observations；再次上传会产生相同批身份，由服务端幂等确认。
 
 扩展加密：在 `upload()` 中加密 payload 后再发送，调用方无需改动。
@@ -409,6 +422,20 @@ connect_timeout_seconds = 5
 target_timeout_seconds = 15
 max_result_bytes = 65536
 
+[nuclei]
+enabled = false
+path = "nuclei"
+templates_path = "/opt/nuclei-templates/safe"
+severities = ["medium", "high", "critical"]
+rate_limit = 20
+bulk_size = 5
+concurrency = 5
+timeout_seconds = 10
+retries = 1
+max_runtime_seconds = 1800
+max_findings = 10000
+max_result_bytes = 262144
+
 [network]
 ipv4_enabled = true
 ipv6_enabled = true
@@ -448,6 +475,18 @@ endpoint = "https://example.com/api/scanner/result"
 | `service_detection.connect_timeout_seconds` | int | `5` | 建连超时，范围 1-60 秒 |
 | `service_detection.target_timeout_seconds` | int | `15` | 单目标探测总超时，不小于建连超时且不超过 300 秒 |
 | `service_detection.max_result_bytes` | int | `65536` | 单服务结构化详情上限，范围 1024-1048576 字节 |
+| `nuclei.enabled` | bool | `false` | 是否声明并执行漏洞扫描能力 |
+| `nuclei.path` | string | `"nuclei"` | Nuclei 二进制路径或 PATH 中的命令名 |
+| `nuclei.templates_path` | string | `""` | 审核并固定版本的本地签名模板目录；启用时必填 |
+| `nuclei.severities` | string[] | medium/high/critical | 允许 info、low、medium、high、critical，共 1–5 项 |
+| `nuclei.rate_limit` | int | `20` | 全局每秒请求上限，范围 1–10000 |
+| `nuclei.bulk_size` | int | `5` | 每模板主机并行度，范围 1–1000 |
+| `nuclei.concurrency` | int | `5` | 模板并行度，范围 1–1000 |
+| `nuclei.timeout_seconds` | int | `10` | 请求超时，范围 1–300 秒 |
+| `nuclei.retries` | int | `1` | 失败请求重试次数，范围 0–10 |
+| `nuclei.max_runtime_seconds` | int | `1800` | 单任务最长运行时间，范围 10–86400 秒 |
+| `nuclei.max_findings` | int | `10000` | 单任务结果数上限，范围 1–100000 |
+| `nuclei.max_result_bytes` | int | `262144` | 单行 JSONL 上限，范围 4096–1048576 字节 |
 | `network.ipv4_enabled` | bool | `true` | 是否自动探测并接受 IPv4 任务 |
 | `network.ipv6_enabled` | bool | `true` | 是否自动探测并接受 IPv6 任务 |
 | `network.ipv4_probe_url` | string | ipify IPv4 API | 服务端接口不可用时使用的 IPv4 IP 回显接口 |
@@ -466,11 +505,15 @@ endpoint = "https://example.com/api/scanner/result"
 | `scanner.source_port` | 1-65535 |
 | `scanner.scanner_path` | 普通扫描启动时必须能解析到存在且可执行的普通文件 |
 | `service_detection.zgrab_path` | enabled=true 时必须能解析到存在且可执行的普通文件 |
+| `nuclei.path` | enabled=true 时必须能解析到存在且可执行的普通文件 |
+| `nuclei.templates_path` | enabled=true 时必须是可访问目录 |
 | `network.probe_interval_seconds` | 30-86400 |
 | `network.probe_timeout_seconds` | 1-60 |
 | `upload.endpoint` | 非空 |
 
-扫描器在启动扫描循环前检查 `scanner_path`，启用服务识别时还会检查 `zgrab_path`。显式的相对路径或绝对路径会直接检查；不含目录的命令名会从 `PATH` 查找。注册、`--health-check` 和 `--get-system-info` 模式不执行扫描，因此跳过该检查。
+扫描器在启动扫描循环前检查 `scanner_path`，启用服务识别时检查 `zgrab_path`，启用漏洞扫描
+时检查 Nuclei 二进制和模板目录。显式的相对路径或绝对路径会直接检查；不含目录的命令名会从
+`PATH` 查找。注册、`--health-check` 和 `--get-system-info` 模式不执行扫描，因此跳过该检查。
 
 ### 静态配置与运行状态
 
@@ -545,9 +588,13 @@ scanner-rs
 ┌─────────────┐                             │  ⑤ zgrab2    │
 │   zgrab2    │ ◄── tagged targets ──────── │              │
 │   binary    │ ─── JSON results ─────────► │  ⑥ normalize │
-└─────────────┘                             │  ⑦ cache     │
-                                            │  ⑧ payload   │
-┌─────────────┐ POST /api/scanner/result   │  ⑨ upload    │
+└─────────────┘                             │              │
+┌─────────────┐                             │  ⑦ nuclei    │
+│   nuclei    │ ◄── open endpoints ──────── │              │
+│   binary    │ ─── JSONL findings ───────► │  ⑧ normalize │
+└─────────────┘                             │  ⑨ cache     │
+                                            │     payload   │
+┌─────────────┐ POST /api/scanner/result   │  ⑩ upload    │
 │  upload API │ ◄──── JSON ─────────────── │              │
 │  (endpoint) │                             │              │
 └─────────────┘                             └──────────────┘
@@ -568,14 +615,15 @@ scanner-rs
 5. **port discovery** — masscan 仅执行 SYN/端口发现，输出 list 格式
 6. **service dispatch** — 按开放端口选择 zgrab2 module tag，仅处理 TCP
 7. **service detection** — zgrab2 受控并发执行应用层握手，逐行输出 JSON
-8. **normalize/cache** — 分别生成 port/service observations 并进行稳定身份去重
-9. **payload/upload** — 每 500 条分批上传，最终批确认后任务完成
+8. **vulnerability detection** — 漏洞计划使用本地审核模板对开放端点运行 Nuclei
+9. **normalize/cache** — 生成 port/service/vulnerability observations 并进行稳定身份去重
+10. **payload/upload** — 每 500 条分批上传，最终批确认后任务完成
 
 ### 上传 JSON 格式
 
 ```json
 {
-  "protocol_version": 2,
+  "protocol_version": 3,
   "scanner_id": "019c0000-0000-7000-8000-000000000001",
   "task_id": "019c0000-0000-7000-8000-000000000002",
   "upload_id": "019c0000-0000-7000-8000-000000000003",
@@ -632,6 +680,7 @@ scanner-rs
 - Rust 工具链 ≥ 1.85（edition 2024）
 - masscan 二进制
 - zgrab2 二进制（仅 `service_detection.enabled=true` 时需要）
+- Nuclei 二进制和本地签名模板目录（仅 `nuclei.enabled=true` 时需要）
 
 ### 构建
 
@@ -673,7 +722,19 @@ cargo test
 
 ## 如何扩展
 
-### 添加新扫描器（如 nuclei）
+### Nuclei 漏洞扫描
+
+Nuclei 适配器位于 `scan/engines/nuclei.rs`。它只使用服务端下发的固定
+`vulnerability_scan` 计划和节点本地配置，不接受任务中的模板、命令或任意 CLI 参数。
+`[nuclei]` 默认关闭；启用前必须准备经过审核、固定版本且仅包含签名模板的目录。运行时固定
+禁用 Interactsh、未签名模板和自动更新，并应用并发、速率、超时、结果大小和数量上限。
+
+结果使用协议版本 3 的 `vulnerability` observation，上报结构化元数据而不保存 Nuclei 原始
+request/response。协议版本 1、2 仍可用于滚动升级，但版本 2 不能携带漏洞记录。
+
+完整部署、安全边界、模板更新和排障流程参见 [Nuclei 漏洞扫描部署与运维](NUCLEI.md)。
+
+### 添加新扫描器
 
 扫描流程扩展位于 `scan/orchestrator.rs`，具体工具适配器位于 `scan/engines/`：
 

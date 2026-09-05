@@ -18,7 +18,7 @@ cd Network-Mapping-Scanner
 cargo build --release
 ```
 
-普通扫描需要同时安装 `masscan` 和 `zgrab2`。masscan 只负责发现开放端口，zgrab2
+普通扫描需要安装 `masscan`；服务识别还需要 `zgrab2`。masscan 只负责发现开放端口，zgrab2
 按端口映射执行 SSH、HTTP(S)、TLS、邮件、数据库等应用层握手。可在配置中关闭服务识别，
 以兼容只部署 masscan 的节点：
 
@@ -51,6 +51,58 @@ max_result_bytes = 65536
 - 未配置 `[service_detection]` 的旧配置默认关闭该功能。
 - zgrab2 使用系统 TCP 栈，`senders` 和 `server_rate_limit` 应从较低值开始压测，不能照搬
   masscan 的发包速率。
+
+漏洞扫描默认关闭。节点安装 Nuclei 后，应将 `templates_path` 指向经过审核并固定版本的模板
+目录，再显式启用；扫描器禁用 Interactsh、未签名模板和自动更新，并限制并发、速率、运行时间
+与结果数量。仅在已授权的资产范围内启用：
+
+```toml
+[nuclei]
+enabled = true
+path = "nuclei"
+templates_path = "/opt/nuclei-templates/safe"
+severities = ["medium", "high", "critical"]
+rate_limit = 20
+bulk_size = 5
+concurrency = 5
+timeout_seconds = 10
+retries = 1
+max_runtime_seconds = 1800
+max_findings = 10000
+max_result_bytes = 262144
+port_fallback = true
+```
+
+Nuclei 按开放 TCP 端点分组串行扫描：已识别的 HTTP/HTTPS 使用 `-as -pt http`，
+其他支持的服务按内置服务标签映射使用 `-tags`，并限定 TCP/JavaScript 模板；TLS 服务使用
+`-tags ssl,tls -pt ssl`，不会当作 HTTPS。相同选择策略的目标合批，不同服务不会共享标签。
+已识别服务优先于端口推测；`port_fallback = true` 允许服务未知时按常见非 Web 端口选择
+SSH、FTP、SMTP、POP3、IMAP、SMB、MSSQL、MQTT、MySQL、RDP、PostgreSQL、VNC、Redis、MongoDB
+模板，设为 `false` 则只扫描已识别的服务。隐式 TLS 应用目前仅覆盖 TLS 检查。
+未知 Web 端口需要服务识别成功后才扫描；不支持的服务、UDP 和未知端口跳过并记录原因，
+不会回退为全模板扫描。跳过或未识别 Web 技术不代表没有漏洞。
+
+已在 Nuclei v3.11.1 核对参数。`templates_path` 同时作为 active template root 和显式模板目录，
+防止 `-as` 额外加载用户默认模板库。该目录需包含自动扫描使用的 `tech`/`detect`/`favicon`
+检测模板及所需服务标签。Web 批次使用模板条件保留这些指纹模板及配置严重级别的漏洞模板，
+避免 `-severity medium,high,critical` 排除 info 指纹模板导致 `-as` 启动失败；上传结果仍严格
+按 `severities` 筛选。裁剪模板时需验证自动识别覆盖。
+没有匹配模板时不取消过滤重试；引擎错误按任务失败处理。总超时与结果上限覆盖所有批次，
+结果按端点、模板、matcher 和匹配位置去重。映射集中在 `src/scan/engines/nuclei_selection.rs`。
+
+Nuclei 只接收端口发现阶段产生的目标。上传结果不包含原始 HTTP 请求或响应，避免把敏感内容
+写入扫描缓存和服务端。启用节点会在心跳中声明 `vulnerability_scan` 能力，只有这类节点会领取
+漏洞扫描任务。
+
+控制端创建页提供“全部”“仅端口”“服务识别”“仅 DNS”四种模式。IP/CIDR 任务直接映射为
+`vulnerability_scan`、`port_only` 或 `service_inventory`；域名的前三种模式由 DNS 节点先执行
+`dns_records`，服务端再将授权的 A/AAAA 地址按 IPv4/IPv6 拆成对应 profile 的子任务。
+“仅 DNS”只运行 DNS engine，不启动 masscan、zgrab2 或 Nuclei。
+域名扫描目标必须至少包含两个由 `.` 分隔的标签，仅允许 ASCII 字母、数字和非首尾连字符；
+每个标签最多 63 octets，完整 wire name 最多 255 octets（无末尾根点的点分形式最多 253 octets）。
+
+完整的模板治理、参数语义、上线顺序和故障排查参见
+[Nuclei 漏洞扫描部署与运维](docs/NUCLEI.md)。
 
 运行时会将结构化 JSON 日志按天写入 `./logs/scanner.log.YYYY-MM-DD`，同时保留终端输出。可以使用 `--log-directory` 指定其他目录，使用 `--debug` 将终端和文件日志级别切换为 debug：
 
