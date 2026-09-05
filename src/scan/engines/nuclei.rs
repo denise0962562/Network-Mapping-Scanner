@@ -2,7 +2,11 @@ use crate::error::ScannerError;
 use crate::scan::{PortObservation, ServiceObservation, VulnerabilityObservation};
 use crate::types::NucleiConfig;
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+
+#[path = "nuclei_selection.rs"]
+mod selection;
+use selection::{Selection, build_batches};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -103,15 +107,74 @@ pub(crate) async fn run(
     services: &[ServiceObservation],
     cancel_requested: &AtomicBool,
 ) -> Result<EngineOutcome, ScannerError> {
-    let targets = build_targets(ports, services);
-    if targets.is_empty() {
-        tracing::info!(
-            event = "VulnerabilityScanSkipped",
-            reason = "no_open_endpoints"
-        );
-        return Ok(EngineOutcome::Completed(Vec::new()));
+    let started_at = Instant::now();
+    let mut findings = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (selection, targets) in build_batches(ports, services, config.port_fallback) {
+        if cancel_requested.load(Ordering::Relaxed) {
+            return Ok(EngineOutcome::Cancelled);
+        }
+        match run_batch(
+            config,
+            &selection,
+            &targets,
+            cancel_requested,
+            started_at,
+            findings.len(),
+        )
+        .await?
+        {
+            EngineOutcome::Cancelled => return Ok(EngineOutcome::Cancelled),
+            EngineOutcome::Completed(results) => {
+                for finding in results {
+                    let key = (
+                        finding.ip.clone(),
+                        finding.port,
+                        finding.protocol.clone(),
+                        finding.template_id.clone(),
+                        finding.matcher_name.clone(),
+                        finding.matched_at.clone(),
+                    );
+                    if seen.insert(key) {
+                        findings.push(finding);
+                    }
+                }
+            }
+        }
     }
+    Ok(EngineOutcome::Completed(findings))
+}
 
+// -severity would exclude the informational templates required to initialize -as.
+// Permit fingerprint templates during execution, but retain only configured severities.
+fn web_template_condition(severities: &[String]) -> String {
+    let mut clauses = vec![
+        "contains(tags, 'tech')".to_owned(),
+        "contains(tags, 'detect')".to_owned(),
+        "contains(tags, 'favicon')".to_owned(),
+    ];
+    // Use fixed tokens even if this helper is called with unvalidated configuration.
+    for severity in ["info", "low", "medium", "high", "critical"] {
+        if severities.iter().any(|value| value == severity) {
+            clauses.push(format!("severity == '{severity}'"));
+        }
+    }
+    clauses.join(" || ")
+}
+
+async fn run_batch(
+    config: &NucleiConfig,
+    selection: &Selection,
+    targets: &[String],
+    cancel_requested: &AtomicBool,
+    started_at: Instant,
+    previous_findings: usize,
+) -> Result<EngineOutcome, ScannerError> {
+    if started_at.elapsed() >= Duration::from_secs(config.max_runtime_seconds) {
+        return Err(ScannerError::Scan(
+            "nuclei stage runtime limit exceeded".into(),
+        ));
+    }
     let target_path = std::env::temp_dir().join(format!(
         "network-mapping-nuclei-targets-{}-{}.txt",
         std::process::id(),
@@ -121,15 +184,27 @@ pub(crate) async fn run(
         .await
         .map_err(|error| ScannerError::Scan(format!("failed to write nuclei targets: {error}")))?;
 
-    let started_at = Instant::now();
     let mut command = Command::new(&config.path);
+    command.args(selection.args());
+    if matches!(selection, Selection::Web) {
+        command
+            .arg("-template-condition")
+            .arg(web_template_condition(&config.severities));
+    } else {
+        command.arg("-severity").arg(config.severities.join(","));
+    }
+    // Automatic scan also searches the active template root, not just -templates.
+    // Set both so a curated template directory remains the only source.
+    command.env("NUCLEI_TEMPLATES_DIR", &config.templates_path);
+    command
+        .arg("-update-template-dir")
+        .arg(&config.templates_path);
+    command.kill_on_drop(true);
     command
         .arg("-list")
         .arg(&target_path)
         .arg("-templates")
         .arg(&config.templates_path)
-        .arg("-severity")
-        .arg(config.severities.join(","))
         .arg("-jsonl")
         .arg("-silent")
         .arg("-no-interactsh")
@@ -151,6 +226,7 @@ pub(crate) async fn run(
 
     tracing::info!(
         event = "VulnerabilityScanStarted",
+        selection = ?selection,
         target_count = targets.len(),
         rate_limit = config.rate_limit,
         concurrency = config.concurrency,
@@ -165,130 +241,118 @@ pub(crate) async fn run(
             )));
         }
     };
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ScannerError::Scan("nuclei stdout unavailable".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| ScannerError::Scan("nuclei stderr unavailable".into()))?;
-    let stderr_handle = tokio::spawn(collect_stderr(stderr));
-    let mut lines = BufReader::new(stdout).lines();
-    let mut findings = Vec::new();
-    let mut invalid_lines = 0usize;
+    let result = async {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ScannerError::Scan("nuclei stdout unavailable".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ScannerError::Scan("nuclei stderr unavailable".into()))?;
+        let stderr_handle = tokio::spawn(collect_stderr(stderr));
+        let mut lines = BufReader::new(stdout).lines();
+        let mut findings = Vec::new();
+        let mut invalid_lines = 0usize;
 
-    loop {
-        let timed_out = started_at.elapsed() >= Duration::from_secs(config.max_runtime_seconds);
-        if cancel_requested.load(Ordering::Relaxed) || timed_out {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = finish_stderr(stderr_handle).await;
-            let _ = tokio::fs::remove_file(&target_path).await;
-            if timed_out {
+        loop {
+            let timed_out = started_at.elapsed() >= Duration::from_secs(config.max_runtime_seconds);
+            if cancel_requested.load(Ordering::Relaxed) || timed_out {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = finish_stderr(stderr_handle).await;
+                let _ = tokio::fs::remove_file(&target_path).await;
+                if timed_out {
+                    return Err(ScannerError::Scan(format!(
+                        "nuclei exceeded the {} second runtime limit",
+                        config.max_runtime_seconds
+                    )));
+                }
+                return Ok(EngineOutcome::Cancelled);
+            }
+            let line = tokio::select! {
+                line = lines.next_line() => line
+                    .map_err(|error| ScannerError::Scan(format!("failed to read nuclei output: {error}")))?,
+                _ = sleep(Duration::from_millis(200)) => continue,
+            };
+            let Some(line) = line else { break };
+            if line.len() > config.max_result_bytes {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = finish_stderr(stderr_handle).await;
+                let _ = tokio::fs::remove_file(&target_path).await;
+                return Err(ScannerError::Scan(
+                    "nuclei result exceeded max_result_bytes".into(),
+                ));
+            }
+            match parse_result(&line) {
+                Ok(finding) if config.severities.contains(&finding.severity) => {
+                    findings.push(finding)
+                }
+                Ok(_) => {} // Automatic scan emits fingerprint findings as well.
+                Err(error) => {
+                    invalid_lines += 1;
+                    tracing::warn!(%error, "ignored invalid nuclei JSONL output line");
+                }
+            }
+            if previous_findings + findings.len() > config.max_findings {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = finish_stderr(stderr_handle).await;
+                let _ = tokio::fs::remove_file(&target_path).await;
                 return Err(ScannerError::Scan(format!(
-                    "nuclei exceeded the {} second runtime limit",
-                    config.max_runtime_seconds
+                    "nuclei exceeded the {} finding limit",
+                    config.max_findings
                 )));
             }
-            return Ok(EngineOutcome::Cancelled);
         }
-        let line = tokio::select! {
-            line = lines.next_line() => line
-                .map_err(|error| ScannerError::Scan(format!("failed to read nuclei output: {error}")))?,
-            _ = sleep(Duration::from_millis(200)) => continue,
-        };
-        let Some(line) = line else { break };
-        if line.len() > config.max_result_bytes {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = finish_stderr(stderr_handle).await;
-            let _ = tokio::fs::remove_file(&target_path).await;
-            return Err(ScannerError::Scan(
-                "nuclei result exceeded max_result_bytes".into(),
-            ));
-        }
-        match parse_result(&line) {
-            Ok(finding) => findings.push(finding),
-            Err(error) => {
-                invalid_lines += 1;
-                tracing::warn!(%error, "ignored invalid nuclei JSONL output line");
-            }
-        }
-        if findings.len() > config.max_findings {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = finish_stderr(stderr_handle).await;
-            let _ = tokio::fs::remove_file(&target_path).await;
+
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| ScannerError::Scan(format!("failed to wait for nuclei: {error}")))?;
+        let stderr_output = finish_stderr(stderr_handle).await;
+        let _ = tokio::fs::remove_file(&target_path).await;
+        if !status.success() {
+            let detail = if stderr_output.trim().is_empty() {
+                "nuclei produced no stderr output"
+            } else {
+                stderr_output.trim()
+            };
             return Err(ScannerError::Scan(format!(
-                "nuclei exceeded the {} finding limit",
-                config.max_findings
+                "nuclei exited with {status}: {detail}"
             )));
         }
-    }
-
-    let status = child
-        .wait()
-        .await
-        .map_err(|error| ScannerError::Scan(format!("failed to wait for nuclei: {error}")))?;
-    let stderr_output = finish_stderr(stderr_handle).await;
+        if invalid_lines > 0 {
+            return Err(ScannerError::Scan(format!(
+                "nuclei produced {invalid_lines} invalid JSONL result line(s)"
+            )));
+        }
+        tracing::info!(
+            event = "VulnerabilityScanCompleted",
+            elapsed_ms = started_at.elapsed().as_millis(),
+            finding_count = findings.len(),
+            "nuclei vulnerability scan completed"
+        );
+        Ok(EngineOutcome::Completed(findings))
+    };
+    tokio::pin!(result);
+    let outcome = loop {
+        tokio::select! {
+            result = &mut result => break result,
+            _ = sleep(Duration::from_millis(100)) => {
+                if cancel_requested.load(Ordering::Relaxed) {
+                    break Ok(EngineOutcome::Cancelled);
+                }
+                if started_at.elapsed() >= Duration::from_secs(config.max_runtime_seconds) {
+                    break Err(ScannerError::Scan("nuclei stage runtime limit exceeded".into()));
+                }
+            }
+        }
+    };
+    // kill_on_drop terminates the child on every early return; remove the input on errors too.
     let _ = tokio::fs::remove_file(&target_path).await;
-    if !status.success() {
-        let detail = if stderr_output.trim().is_empty() {
-            "nuclei produced no stderr output"
-        } else {
-            stderr_output.trim()
-        };
-        return Err(ScannerError::Scan(format!(
-            "nuclei exited with {status}: {detail}"
-        )));
-    }
-    if invalid_lines > 0 {
-        return Err(ScannerError::Scan(format!(
-            "nuclei produced {invalid_lines} invalid JSONL result line(s)"
-        )));
-    }
-    tracing::info!(
-        event = "VulnerabilityScanCompleted",
-        elapsed_ms = started_at.elapsed().as_millis(),
-        finding_count = findings.len(),
-        "nuclei vulnerability scan completed"
-    );
-    Ok(EngineOutcome::Completed(findings))
-}
-
-fn build_targets(ports: &[PortObservation], services: &[ServiceObservation]) -> Vec<String> {
-    let service_by_endpoint = services
-        .iter()
-        .filter_map(|item| {
-            item.service
-                .as_deref()
-                .map(|service| ((item.ip.as_str(), item.port), service))
-        })
-        .collect::<HashMap<_, _>>();
-    let mut targets = BTreeSet::new();
-    for endpoint in ports.iter().filter(|item| item.state == "open") {
-        let host = if endpoint.ip.contains(':') {
-            format!("[{}]", endpoint.ip)
-        } else {
-            endpoint.ip.clone()
-        };
-        let service = service_by_endpoint
-            .get(&(endpoint.ip.as_str(), endpoint.port))
-            .map(|value| value.to_ascii_lowercase());
-        let scheme = match service.as_deref() {
-            Some("http") | Some("http-alt") => Some("http"),
-            Some("https") | Some("https-alt") | Some("tls") | Some("ssl") => Some("https"),
-            _ if matches!(endpoint.port, 80 | 8000 | 8080 | 8081 | 8888) => Some("http"),
-            _ if matches!(endpoint.port, 443 | 8443 | 9443) => Some("https"),
-            _ => None,
-        };
-        targets.insert(match scheme {
-            Some(scheme) => format!("{scheme}://{host}:{}", endpoint.port),
-            None => format!("{host}:{}", endpoint.port),
-        });
-    }
-    targets.into_iter().collect()
+    outcome
 }
 
 fn parse_result(line: &str) -> Result<VulnerabilityObservation, ScannerError> {
@@ -448,29 +512,139 @@ mod tests {
     use super::*;
 
     #[test]
-    fn targets_use_detected_web_scheme_and_ipv6_brackets() {
-        let ports = vec![
-            PortObservation {
-                ip: "192.0.2.1".into(),
-                port: 8080,
-                protocol: "tcp".into(),
-                state: "open".into(),
-                source: "masscan".into(),
-                observed_at: 1,
-            },
-            PortObservation {
-                ip: "2001:db8::1".into(),
-                port: 443,
-                protocol: "tcp".into(),
-                state: "open".into(),
-                source: "masscan".into(),
-                observed_at: 1,
-            },
-        ];
+    fn web_filter_preserves_detection_and_restricts_vulnerability_severity() {
         assert_eq!(
-            build_targets(&ports, &[]),
-            vec!["http://192.0.2.1:8080", "https://[2001:db8::1]:443"]
+            web_template_condition(&["high".into()]),
+            "contains(tags, 'tech') || contains(tags, 'detect') || contains(tags, 'favicon') || severity == 'high'"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn web_batch_uses_automatic_scan_and_discards_fingerprint_findings() {
+        let (dir, config) = fake_engine(
+            r#"
+[ "$1" = "-as" ] || exit 10
+for arg in "$@"; do [ "$arg" != "-severity" ] || exit 11; done
+printf '%s\n' '{"template-id":"tech","info":{"name":"tech","severity":"info"},"matched-at":"http://192.0.2.1:80","type":"http"}'
+printf '%s\n' '{"template-id":"vuln","info":{"name":"vuln","severity":"high"},"matched-at":"http://192.0.2.1:80","type":"http"}'
+"#,
+        );
+        let outcome = run_batch(
+            &config,
+            &Selection::Web,
+            &["http://192.0.2.1:80".into()],
+            &AtomicBool::new(false),
+            Instant::now(),
+            0,
+        )
+        .await
+        .unwrap();
+        let EngineOutcome::Completed(findings) = outcome else {
+            panic!("unexpected cancellation")
+        };
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].template_id, "vuln");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn fake_engine(script: &str) -> (PathBuf, NucleiConfig) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nuclei-test-{}", Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("engine");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = NucleiConfig {
+            path: path.to_string_lossy().into_owned(),
+            templates_path: dir.to_string_lossy().into_owned(),
+            ..NucleiConfig::default()
+        };
+        (dir, config)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn batches_pass_isolated_tags_and_enforce_total_findings() {
+        let (dir, mut config) = fake_engine(
+            r#"
+[ "$1" = "-tags" ] || exit 10
+printf '%s\n' "$2" >> "$NUCLEI_TEMPLATES_DIR/calls"
+while [ "$1" != "-list" ]; do shift; done
+shift
+printf '%s\n' "$1" >> "$NUCLEI_TEMPLATES_DIR/inputs"
+target=$(cat "$1")
+printf '{"template-id":"test","info":{"name":"test","severity":"high"},"matched-at":"%s","type":"tcp"}\n' "$target"
+"#,
+        );
+        config.max_findings = 1;
+        let ports = [3306, 6379].map(|port| PortObservation {
+            ip: "192.0.2.1".into(),
+            port,
+            protocol: "tcp".into(),
+            state: "open".into(),
+            source: "test".into(),
+            observed_at: 0,
+        });
+        let error = run(&config, &ports, &[], &AtomicBool::new(false))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("finding limit"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("calls")).unwrap(),
+            "mysql\nredis\n"
+        );
+        for path in std::fs::read_to_string(dir.join("inputs")).unwrap().lines() {
+            assert!(!Path::new(path).exists());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_covers_child_that_closes_stdout_without_exiting() {
+        let (dir, mut config) = fake_engine("exec 1>&-\nexec sleep 30");
+        config.max_runtime_seconds = 1;
+        let started = Instant::now();
+        let result = run_batch(
+            &config,
+            &Selection::Web,
+            &["http://192.0.2.1:80".into()],
+            &AtomicBool::new(false),
+            started,
+            0,
+        )
+        .await;
+        assert!(result.err().unwrap().to_string().contains("runtime limit"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_interrupts_running_child() {
+        let (dir, config) = fake_engine("exec sleep 30");
+        let cancel = AtomicBool::new(false);
+        let cancel_later = async {
+            sleep(Duration::from_millis(50)).await;
+            cancel.store(true, Ordering::Relaxed);
+        };
+        let targets = ["http://192.0.2.1:80".into()];
+        let (result, _) = tokio::join!(
+            run_batch(
+                &config,
+                &Selection::Web,
+                &targets,
+                &cancel,
+                Instant::now(),
+                0
+            ),
+            cancel_later
+        );
+        assert!(matches!(result.unwrap(), EngineOutcome::Cancelled));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -315,6 +315,7 @@ pub(crate) struct AppConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct NucleiConfig {
+    pub(crate) port_fallback: bool,
     pub(crate) enabled: bool,
     pub(crate) path: String,
     pub(crate) templates_path: String,
@@ -334,6 +335,7 @@ impl Default for NucleiConfig {
         Self {
             enabled: false,
             path: "nuclei".into(),
+            port_fallback: true,
             templates_path: String::new(),
             severities: vec!["medium".into(), "high".into(), "critical".into()],
             rate_limit: 20,
