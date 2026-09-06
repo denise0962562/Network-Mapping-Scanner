@@ -1,6 +1,7 @@
 use crate::error::{MaintenanceInfo, ScannerError, ServerError};
 use crate::http_client::{ServerHttpClient, response_decode_error, response_error};
 use crate::network::{NetworkCapabilities, SharedNetworkCapabilities};
+use crate::runtime_config::{RuntimeConfiguration, fetch_configuration};
 use crate::scan::ScanCapabilities;
 use crate::sysinfo::SystemInfo;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -161,6 +162,7 @@ struct HeartbeatPayload {
     scan_capabilities: ScanCapabilities,
     #[serde(skip_serializing_if = "Option::is_none")]
     latency_report: Option<LatencyReport>,
+    config_state: crate::runtime_config::RuntimeConfigurationState,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -193,6 +195,14 @@ pub(crate) struct HeartbeatResponse {
     lease: Option<HeartbeatLease>,
     #[serde(default)]
     maintenance: Option<MaintenanceInfo>,
+    #[serde(default)]
+    configuration: Option<ConfigurationNotice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigurationNotice {
+    revision: i64,
+    schema_version: i32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +232,8 @@ pub(crate) struct HeartbeatClient {
     network_capabilities: SharedNetworkCapabilities,
     scan_capabilities: ScanCapabilities,
     pending_latency: Arc<RwLock<Option<LatencyReport>>>,
+    runtime_configuration_url: String,
+    runtime_configuration: RuntimeConfiguration,
 }
 
 pub(crate) struct HeartbeatEndpoints {
@@ -251,6 +263,8 @@ impl HeartbeatClient {
         scanner_id: Uuid,
         network_capabilities: SharedNetworkCapabilities,
         scan_capabilities: ScanCapabilities,
+        runtime_configuration_url: String,
+        runtime_configuration: RuntimeConfiguration,
     ) -> Self {
         Self {
             client,
@@ -262,6 +276,8 @@ impl HeartbeatClient {
             network_capabilities,
             scan_capabilities,
             pending_latency: Arc::new(RwLock::new(None)),
+            runtime_configuration_url,
+            runtime_configuration,
         }
     }
 
@@ -310,6 +326,7 @@ impl HeartbeatClient {
             network_capabilities: self.network_capabilities.get().await,
             scan_capabilities: self.scan_capabilities.clone(),
             latency_report: self.pending_latency.read().await.clone(),
+            config_state: self.runtime_configuration.report().await,
         };
         tracing::debug!(
             scanner_id = %self.scanner_id,
@@ -453,6 +470,31 @@ impl HeartbeatClient {
             active.request_cancel(command.task_id).await;
         } else {
             tracing::debug!("heartbeat contained no actionable command");
+        }
+        if let Some(configuration) = response.configuration
+            && configuration.schema_version == crate::runtime_config::SCHEMA_VERSION
+            && self
+                .runtime_configuration
+                .needs_revision(configuration.revision)
+                .await
+        {
+            match fetch_configuration(&self.client, &self.runtime_configuration_url).await {
+                Ok(envelope) if envelope.revision == configuration.revision => {
+                    self.runtime_configuration.stage(envelope).await;
+                    tracing::info!(
+                        revision = configuration.revision,
+                        "runtime configuration staged"
+                    );
+                }
+                Ok(envelope) => tracing::warn!(
+                    announced_revision = configuration.revision,
+                    fetched_revision = envelope.revision,
+                    "runtime configuration changed while it was fetched"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, revision = configuration.revision, "failed to fetch runtime configuration")
+                }
+            }
         }
         response.maintenance
     }

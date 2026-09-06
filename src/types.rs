@@ -27,6 +27,16 @@ struct LegacyCacheState {
 }
 
 impl CacheManager {
+    pub(crate) fn save_runtime_configuration(
+        &self,
+        configuration: &crate::runtime_config::RuntimeConfigurationEnvelope,
+    ) -> Result<(), crate::error::ScannerError> {
+        self.store
+            .as_ref()
+            .ok_or_else(|| crate::error::ScannerError::Config("state store is unavailable".into()))?
+            .save_runtime_configuration(&self.server_origin, configuration)
+    }
+
     pub(crate) fn legacy_state_has_pending(
         path: &std::path::Path,
     ) -> Result<bool, crate::error::ScannerError> {
@@ -366,7 +376,7 @@ pub(crate) struct ServiceDetectionConfig {
     pub(crate) max_result_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ServiceDetectionStrategy {
     #[default]
@@ -507,6 +517,13 @@ impl ScannerConfig {
         format!(
             "https://{}:{}/api/scanner/heartbeat",
             self.c_server, self.c_port
+        )
+    }
+
+    pub(crate) fn runtime_configuration_url(&self) -> String {
+        format!(
+            "https://{}:{}/api/scanner/runtime-config?scannerid={}",
+            self.c_server, self.c_port, self.scanner_id
         )
     }
 

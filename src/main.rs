@@ -8,6 +8,7 @@ mod logging;
 mod network;
 mod reconnect;
 mod register;
+mod runtime_config;
 mod scan;
 mod storage;
 mod sysinfo;
@@ -22,6 +23,7 @@ use crate::http_client::{FetchTaskOutcome, ServerHttpClient, fetch_task};
 use crate::logging::{LogLevel, init_logging};
 use crate::network::{NetworkDetector, SharedNetworkCapabilities};
 use crate::reconnect::{Backoff, ConnectionState, RetryPolicy};
+use crate::runtime_config::{RuntimeConfiguration, RuntimeConfigurationEnvelope};
 use crate::scan::{
     ScanCapabilities, ScanObservation, ScanOutcome, ScanPlan, ScanRuntimeConfig, run_scan,
     validate_nuclei_binary, validate_nuclei_templates, validate_scanner_binary,
@@ -379,6 +381,17 @@ async fn run() -> Result<(), ScannerError> {
     let network_capabilities = SharedNetworkCapabilities::new(network_detector.detect().await);
     let scan_capabilities =
         ScanCapabilities::from_config(&cfg.service_detection, &cfg.dns, &cfg.nuclei);
+    let runtime_configuration = RuntimeConfiguration::new(cfg);
+    if let Some(stored) = state_store.load_runtime_configuration(&server_origin)? {
+        let envelope = RuntimeConfigurationEnvelope {
+            revision: stored.revision,
+            schema_version: stored.schema_version,
+            document: serde_json::from_slice(&stored.document)?,
+        };
+        if let Err(error) = runtime_configuration.restore(envelope).await {
+            tracing::warn!(%error, "ignored invalid cached runtime configuration");
+        }
+    }
     let network_probe_handle =
         network_detector.spawn(network_capabilities.clone(), connection_rx.clone());
     let heartbeat_client = HeartbeatClient::new(
@@ -392,6 +405,8 @@ async fn run() -> Result<(), ScannerError> {
         scanner_id,
         network_capabilities,
         scan_capabilities,
+        cfg.scanner.runtime_configuration_url(),
+        runtime_configuration.clone(),
     );
     let active_task = ActiveTask::default();
     let stop_bridge_handle = spawn_active_task_stop_bridge(active_task.clone());
@@ -439,10 +454,7 @@ async fn run() -> Result<(), ScannerError> {
                 task_url: &task_url,
                 server_client: &server_client,
                 scanner_id,
-                rate: cfg.scanner.rate as i32,
-                service_detection: &cfg.service_detection,
-                dns: &cfg.dns,
-                nuclei: &cfg.nuclei,
+                runtime_configuration,
                 retry_policy: RetryPolicy::new(
                     Duration::from_secs(cfg.scanner.reconnect_initial_delay_seconds),
                     Duration::from_secs(cfg.scanner.reconnect_max_delay_seconds),
@@ -950,10 +962,7 @@ struct ScanLoopConfig<'a> {
     task_url: &'a str,
     server_client: &'a ServerHttpClient,
     scanner_id: Uuid,
-    rate: i32,
-    service_detection: &'a crate::types::ServiceDetectionConfig,
-    dns: &'a crate::types::DnsConfig,
-    nuclei: &'a crate::types::NucleiConfig,
+    runtime_configuration: RuntimeConfiguration,
     retry_policy: RetryPolicy,
     lease_safety_margin: Duration,
 }
@@ -972,11 +981,11 @@ async fn scan_loop(
     tracing::debug!(
         scanner_id = %config.scanner_id,
         task_url = %config.task_url,
-        scan_rate = config.rate,
         "scan loop started"
     );
 
     while !stop_requested() {
+        apply_runtime_configuration(&config.runtime_configuration, cache).await;
         if cache.has_pending_task() {
             if !wait_until_online(&mut connection).await {
                 break;
@@ -1136,6 +1145,10 @@ async fn scan_loop(
                 break;
             }
         };
+        // A heartbeat may have staged a revision while this loop was waiting for
+        // connectivity or task assignment. Apply it before the new task becomes
+        // active so one task always runs against one immutable snapshot.
+        apply_runtime_configuration(&config.runtime_configuration, cache).await;
         active_task
             .set(assigned_task.task_id, assigned_task.lease_ttl_ms)
             .await;
@@ -1196,16 +1209,18 @@ async fn scan_loop(
         }
         tracing::debug!(task_id = %assigned_task.task_id, "task marked active");
 
+        let runtime = config.runtime_configuration.snapshot().await;
+
         let target = TargetParams {
             ip: assigned_task.task_target.join(","),
             port: assigned_task.task_port.clone(),
-            rate: config.rate,
+            rate: runtime.rate,
             address_family: assigned_task.address_family.clone(),
         };
         let scan_plan = assigned_task
             .scan_plan
             .clone()
-            .unwrap_or_else(|| ScanPlan::legacy(config.service_detection));
+            .unwrap_or_else(|| ScanPlan::legacy(&runtime.service_detection));
 
         let scan_started_at = Instant::now();
         tracing::info!(
@@ -1217,7 +1232,8 @@ async fn scan_loop(
             targets = %target.ip,
             ports = %target.port,
             rate = target.rate,
-            service_detection_enabled = config.service_detection.enabled,
+            configuration_revision = runtime.revision,
+            service_detection_enabled = runtime.service_detection.enabled,
             "scan task started"
         );
 
@@ -1231,9 +1247,9 @@ async fn scan_loop(
         let results = match run_scan(
             ScanRuntimeConfig {
                 scanner_path: config.scanner_path,
-                service_detection: config.service_detection,
-                dns: config.dns,
-                nuclei: config.nuclei,
+                service_detection: &runtime.service_detection,
+                dns: &runtime.dns,
+                nuclei: &runtime.nuclei,
                 dns_resolvers: &assigned_task.dns_resolvers,
             },
             &scan_plan,
@@ -1404,6 +1420,25 @@ async fn scan_loop(
             Ok(()) => {}
             Err(error) => tracing::error!("final scan-loop upload failed: {}", error),
         }
+    }
+}
+
+async fn apply_runtime_configuration(
+    runtime_configuration: &RuntimeConfiguration,
+    cache: &CacheManager,
+) {
+    match runtime_configuration.apply_pending().await {
+        Ok(Some(configuration)) => {
+            if let Err(error) = cache.save_runtime_configuration(&configuration) {
+                tracing::warn!(%error, revision = configuration.revision, "runtime configuration applied but could not be cached");
+            }
+            tracing::info!(
+                revision = configuration.revision,
+                "runtime configuration applied at task boundary"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "rejected staged runtime configuration"),
     }
 }
 
