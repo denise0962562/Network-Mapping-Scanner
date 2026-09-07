@@ -255,12 +255,12 @@ impl RemoteRuntimeConfiguration {
             return Err("runtime scan configuration contains an out-of-range value".into());
         }
         if self.dns.record_types.is_empty()
-            || self.dns.record_types.len() > 8
+            || self.dns.record_types.len() > 12
             || self
                 .dns
                 .record_types
                 .iter()
-                .any(|value| !matches!(value.as_str(), "A" | "AAAA"))
+                .any(|value| !crate::types::is_supported_dns_record_type(value))
         {
             return Err("runtime DNS record types are invalid".into());
         }

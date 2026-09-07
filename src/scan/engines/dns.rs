@@ -5,7 +5,10 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
-use hickory_resolver::proto::{rr::RecordType, xfer::Protocol};
+use hickory_resolver::proto::{
+    rr::{RData, RecordType},
+    xfer::Protocol,
+};
 use hickory_resolver::{
     TokioResolver,
     config::{NameServerConfig, ResolverConfig},
@@ -14,6 +17,8 @@ use hickory_resolver::{
 use crate::error::ScannerError;
 use crate::scan::{DnsAnswer, DnsObservation, DnsQuestion};
 use crate::types::{DnsConfig, DnsResolver, TargetParams};
+
+const MAX_CONCURRENT_QUERIES: usize = 16;
 
 pub(crate) struct DnsLookupResult {
     pub(crate) observations: Vec<DnsObservation>,
@@ -27,8 +32,8 @@ pub(crate) async fn run(
     cancel_requested: &AtomicBool,
 ) -> Result<Option<DnsLookupResult>, ScannerError> {
     let resolver_configs = resolver_configs(resolvers)?;
+    let mut queries = tokio::task::JoinSet::new();
     let mut observations = Vec::new();
-    let mut resolved_ips = BTreeSet::new();
     for domain in target
         .ip
         .split(',')
@@ -40,27 +45,72 @@ pub(crate) async fn run(
                 if cancel_requested.load(Ordering::Relaxed) {
                     return Ok(None);
                 }
-                let observation = query(
-                    &resolver.resolver,
-                    domain,
-                    parse_record_type(record_type)?,
-                    config.query_timeout_seconds,
-                    resolver.metadata.as_ref(),
-                )
-                .await;
-                resolved_ips.extend(observation.answers.iter().filter_map(|answer| {
-                    matches!(answer.record_type.as_str(), "A" | "AAAA")
-                        .then(|| answer.value.parse::<IpAddr>().ok())
-                        .flatten()
-                }));
-                observations.push(observation);
+                let dns_resolver = resolver.resolver.clone();
+                let resolver_metadata = resolver.metadata.clone();
+                let domain = domain.to_owned();
+                let record_type = parse_record_type(record_type)?;
+                let timeout_seconds = config.query_timeout_seconds;
+                queries.spawn(async move {
+                    query(
+                        &dns_resolver,
+                        &domain,
+                        record_type,
+                        timeout_seconds,
+                        resolver_metadata.as_ref(),
+                    )
+                    .await
+                });
+                if queries.len() >= MAX_CONCURRENT_QUERIES {
+                    collect_query(&mut queries, &mut observations).await?;
+                }
             }
         }
     }
+    while !queries.is_empty() {
+        if cancel_requested.load(Ordering::Relaxed) {
+            queries.abort_all();
+            return Ok(None);
+        }
+        collect_query(&mut queries, &mut observations).await?;
+    }
+    observations.sort_by(|left, right| {
+        (
+            left.question.name.as_str(),
+            left.resolver_id.as_deref().unwrap_or("system"),
+            left.question.record_type.as_str(),
+        )
+            .cmp(&(
+                right.question.name.as_str(),
+                right.resolver_id.as_deref().unwrap_or("system"),
+                right.question.record_type.as_str(),
+            ))
+    });
+    let resolved_ips = observations
+        .iter()
+        .flat_map(|observation| observation.answers.iter())
+        .filter_map(|answer| {
+            matches!(answer.record_type.as_str(), "A" | "AAAA")
+                .then(|| answer.value.parse::<IpAddr>().ok())
+                .flatten()
+        })
+        .collect::<BTreeSet<_>>();
     Ok(Some(DnsLookupResult {
         observations,
         resolved_ips: resolved_ips.into_iter().collect(),
     }))
+}
+
+async fn collect_query(
+    queries: &mut tokio::task::JoinSet<DnsObservation>,
+    observations: &mut Vec<DnsObservation>,
+) -> Result<(), ScannerError> {
+    let observation = queries
+        .join_next()
+        .await
+        .ok_or_else(|| ScannerError::Scan("DNS query task set ended unexpectedly".into()))?
+        .map_err(|error| ScannerError::Scan(format!("DNS query task failed: {error}")))?;
+    observations.push(observation);
+    Ok(())
 }
 
 struct ConfiguredResolver {
@@ -110,13 +160,17 @@ fn resolver_configs(resolvers: &[DnsResolver]) -> Result<Vec<ConfiguredResolver>
 }
 
 fn parse_record_type(value: &str) -> Result<RecordType, ScannerError> {
-    match value.trim().to_ascii_uppercase().as_str() {
-        "A" => Ok(RecordType::A),
-        "AAAA" => Ok(RecordType::AAAA),
-        other => Err(ScannerError::Scan(format!(
-            "unsupported configured DNS record type '{other}'"
-        ))),
+    let normalized = value.trim().to_ascii_uppercase();
+    if !crate::types::is_supported_dns_record_type(&normalized) {
+        return Err(ScannerError::Scan(format!(
+            "unsupported configured DNS record type '{normalized}'"
+        )));
     }
+    normalized.parse::<RecordType>().map_err(|error| {
+        ScannerError::Scan(format!(
+            "failed to parse configured DNS record type '{normalized}': {error}"
+        ))
+    })
 }
 
 async fn query(
@@ -139,14 +193,7 @@ async fn query(
             "NOERROR".into(),
             lookup
                 .record_iter()
-                .map(|record| DnsAnswer {
-                    record_type: record.record_type().to_string(),
-                    value: record.data().to_string(),
-                    ttl: record.ttl(),
-                    priority: None,
-                    weight: None,
-                    port: None,
-                })
+                .map(|record| answer_from_rdata(record.record_type(), record.data(), record.ttl()))
                 .collect(),
         ),
         Ok(Err(error)) => (response_code(&error.to_string()), Vec::new()),
@@ -181,6 +228,36 @@ async fn query(
     }
 }
 
+fn answer_from_rdata(record_type: RecordType, data: &RData, ttl: u32) -> DnsAnswer {
+    let mut answer = DnsAnswer {
+        record_type: record_type.to_string(),
+        value: data.to_string(),
+        ttl,
+        priority: None,
+        weight: None,
+        port: None,
+    };
+    match data {
+        RData::A(value) => answer.value = value.0.to_string(),
+        RData::AAAA(value) => answer.value = value.0.to_string(),
+        RData::CNAME(value) => answer.value = value.0.to_string(),
+        RData::NS(value) => answer.value = value.0.to_string(),
+        RData::PTR(value) => answer.value = value.0.to_string(),
+        RData::MX(value) => {
+            answer.value = value.exchange().to_string();
+            answer.priority = Some(value.preference());
+        }
+        RData::SRV(value) => {
+            answer.value = value.target().to_string();
+            answer.priority = Some(value.priority());
+            answer.weight = Some(value.weight());
+            answer.port = Some(value.port());
+        }
+        _ => {}
+    }
+    answer
+}
+
 fn response_code(error: &str) -> String {
     let error = error.to_ascii_uppercase();
     if error.contains("NXDOMAIN") || error.contains("NONEXISTENT") {
@@ -195,17 +272,48 @@ fn response_code(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_resolver::proto::rr::{
+        Name,
+        rdata::{MX, SRV},
+    };
 
     #[test]
-    fn accepts_only_the_initial_record_type_allowlist() {
-        assert_eq!(parse_record_type("a").unwrap(), RecordType::A);
-        assert_eq!(parse_record_type("AAAA").unwrap(), RecordType::AAAA);
-        assert!(parse_record_type("MX").is_err());
+    fn accepts_all_supported_record_types() {
+        for value in crate::types::DNS_RECORD_TYPES {
+            assert_eq!(parse_record_type(value).unwrap().to_string(), value);
+        }
+        assert!(parse_record_type("ANY").is_err());
     }
 
     #[test]
     fn error_responses_are_never_reported_as_successful_answers() {
         assert_eq!(response_code("NXDOMAIN"), "NXDOMAIN");
         assert_eq!(response_code("connection failed"), "SERVFAIL");
+    }
+
+    #[test]
+    fn extracts_structured_mx_and_srv_fields() {
+        let mx = answer_from_rdata(
+            RecordType::MX,
+            &RData::MX(MX::new(10, Name::from_ascii("mail.example.com.").unwrap())),
+            300,
+        );
+        assert_eq!(mx.value, "mail.example.com.");
+        assert_eq!(mx.priority, Some(10));
+
+        let srv = answer_from_rdata(
+            RecordType::SRV,
+            &RData::SRV(SRV::new(
+                20,
+                5,
+                443,
+                Name::from_ascii("service.example.com.").unwrap(),
+            )),
+            60,
+        );
+        assert_eq!(srv.value, "service.example.com.");
+        assert_eq!(srv.priority, Some(20));
+        assert_eq!(srv.weight, Some(5));
+        assert_eq!(srv.port, Some(443));
     }
 }

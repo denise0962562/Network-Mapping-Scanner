@@ -223,8 +223,8 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
         ),
         (
             "dns.record_types",
-            cfg.dns.record_types.is_empty() || cfg.dns.record_types.len() > 8,
-            "must contain 1 to 8 entries",
+            cfg.dns.record_types.is_empty() || cfg.dns.record_types.len() > 12,
+            "must contain 1 to 12 entries",
         ),
         (
             "nuclei.path",
@@ -288,14 +288,14 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
             return Err(ScannerError::Config(format!("{}: {}", field, msg)));
         }
     }
-    if cfg.dns.record_types.iter().any(|record_type| {
-        !matches!(
-            record_type.trim().to_ascii_uppercase().as_str(),
-            "A" | "AAAA"
-        )
-    }) {
+    if cfg
+        .dns
+        .record_types
+        .iter()
+        .any(|record_type| !crate::types::is_supported_dns_record_type(record_type))
+    {
         return Err(ScannerError::Config(
-            "dns.record_types currently supports only A and AAAA".into(),
+            "dns.record_types contains an unsupported record type".into(),
         ));
     }
     if cfg.nuclei.severities.iter().any(|severity| {

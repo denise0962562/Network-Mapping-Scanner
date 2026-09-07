@@ -293,6 +293,14 @@ pub(crate) struct TargetParams {
     pub(crate) address_family: String,
 }
 
+pub(crate) const DNS_RECORD_TYPES: [&str; 12] = [
+    "A", "AAAA", "CNAME", "NS", "MX", "PTR", "SRV", "TXT", "CAA", "SOA", "SVCB", "HTTPS",
+];
+
+pub(crate) fn is_supported_dns_record_type(value: &str) -> bool {
+    DNS_RECORD_TYPES.contains(&value.trim().to_ascii_uppercase().as_str())
+}
+
 // ---- Upload payload -----------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -425,7 +433,7 @@ impl Default for DnsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            record_types: vec!["A".into(), "AAAA".into()],
+            record_types: DNS_RECORD_TYPES.iter().map(ToString::to_string).collect(),
             query_timeout_seconds: 5,
         }
     }

@@ -1238,6 +1238,8 @@ async fn scan_loop(
         );
 
         let cancel_flag = active_task.cancellation_flag();
+        let ipv4_ready = heartbeat_client.can_scan("ipv4").await;
+        let ipv6_ready = heartbeat_client.can_scan("ipv6").await;
         let scan_span = tracing::info_span!(
             "scan_task",
             task_id = %assigned_task.task_id,
@@ -1251,6 +1253,8 @@ async fn scan_loop(
                 dns: &runtime.dns,
                 nuclei: &runtime.nuclei,
                 dns_resolvers: &assigned_task.dns_resolvers,
+                ipv4_ready,
+                ipv6_ready,
             },
             &scan_plan,
             &target,

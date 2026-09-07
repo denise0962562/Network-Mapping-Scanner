@@ -16,6 +16,8 @@ pub(crate) struct ScanRuntimeConfig<'a> {
     pub(crate) dns: &'a DnsConfig,
     pub(crate) nuclei: &'a NucleiConfig,
     pub(crate) dns_resolvers: &'a [crate::types::DnsResolver],
+    pub(crate) ipv4_ready: bool,
+    pub(crate) ipv6_ready: bool,
 }
 
 /// Execute the configured scan pipeline.
@@ -37,30 +39,22 @@ pub(crate) async fn run_scan(
     for stage in &plan.stages {
         match stage.kind {
             ScanStageKind::PortDiscovery => {
-                let port_target = if matches!(plan.profile.as_str(), "dns_ports" | "dns_full") {
+                let port_targets = if matches!(plan.profile.as_str(), "dns_ports" | "dns_full") {
                     if resolved_ips.is_empty() {
                         tracing::info!("DNS task has no A/AAAA answers; skipping port discovery");
                         continue;
                     }
-                    TargetParams {
-                        ip: resolved_ips
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        port: target.port.clone(),
-                        rate: target.rate,
-                        address_family: target.address_family.clone(),
-                    }
+                    dns_port_targets(&resolved_ips, target, config.ipv4_ready, config.ipv6_ready)
                 } else {
-                    target.clone()
+                    vec![target.clone()]
                 };
-                ports = match masscan::run(config.scanner_path, &port_target, cancel_requested)
-                    .await?
-                {
-                    masscan::EngineOutcome::Completed(results) => results,
-                    masscan::EngineOutcome::Cancelled => return Ok(ScanOutcome::Cancelled),
-                };
+                ports.clear();
+                for port_target in port_targets {
+                    match masscan::run(config.scanner_path, &port_target, cancel_requested).await? {
+                        masscan::EngineOutcome::Completed(results) => ports.extend(results),
+                        masscan::EngineOutcome::Cancelled => return Ok(ScanOutcome::Cancelled),
+                    }
+                }
             }
             ScanStageKind::ServiceDetection if ports.is_empty() => {}
             ScanStageKind::ServiceDetection if !config.service_detection.enabled => {
@@ -140,12 +134,78 @@ pub(crate) async fn run_scan(
     Ok(ScanOutcome::Completed(observations))
 }
 
+fn dns_port_targets(
+    resolved_ips: &[std::net::IpAddr],
+    target: &TargetParams,
+    ipv4_ready: bool,
+    ipv6_ready: bool,
+) -> Vec<TargetParams> {
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    let mut skipped_ipv4 = 0usize;
+    let mut skipped_ipv6 = 0usize;
+    for address in resolved_ips {
+        match address {
+            std::net::IpAddr::V4(_) if ipv4_ready => ipv4.push(address.to_string()),
+            std::net::IpAddr::V6(_) if ipv6_ready => ipv6.push(address.to_string()),
+            std::net::IpAddr::V4(_) => skipped_ipv4 += 1,
+            std::net::IpAddr::V6(_) => skipped_ipv6 += 1,
+        }
+    }
+    if skipped_ipv4 > 0 {
+        tracing::warn!(
+            skipped_target_count = skipped_ipv4,
+            "skipping DNS-resolved IPv4 targets because IPv4 is unavailable"
+        );
+    }
+    if skipped_ipv6 > 0 {
+        tracing::warn!(
+            skipped_target_count = skipped_ipv6,
+            "skipping DNS-resolved IPv6 targets because IPv6 is unavailable"
+        );
+    }
+    [("ipv4", ipv4), ("ipv6", ipv6)]
+        .into_iter()
+        .filter(|(_, addresses)| !addresses.is_empty())
+        .map(|(address_family, addresses)| TargetParams {
+            ip: addresses.join(","),
+            port: target.port.clone(),
+            rate: target.rate,
+            address_family: address_family.into(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scan::plan::{SCAN_PLAN_VERSION, ScanStageSpec};
     use std::sync::atomic::AtomicBool;
     use uuid::Uuid;
+
+    #[test]
+    fn dns_targets_skip_unavailable_ipv6_and_never_mix_families() {
+        let target = TargetParams {
+            ip: "example.com".into(),
+            port: "443".into(),
+            rate: 100,
+            address_family: "ipv4".into(),
+        };
+        let resolved = vec![
+            "192.0.2.10".parse().unwrap(),
+            "2001:db8::10".parse().unwrap(),
+        ];
+
+        let ipv4_only = dns_port_targets(&resolved, &target, true, false);
+        assert_eq!(ipv4_only.len(), 1);
+        assert_eq!(ipv4_only[0].address_family, "ipv4");
+        assert_eq!(ipv4_only[0].ip, "192.0.2.10");
+
+        let dual_stack = dns_port_targets(&resolved, &target, true, true);
+        assert_eq!(dual_stack.len(), 2);
+        assert_eq!(dual_stack[0].ip, "192.0.2.10");
+        assert_eq!(dual_stack[1].ip, "2001:db8::10");
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -186,6 +246,8 @@ mod tests {
                 dns: &DnsConfig::default(),
                 nuclei: &NucleiConfig::default(),
                 dns_resolvers: &[],
+                ipv4_ready: true,
+                ipv6_ready: false,
             },
             &plan,
             &target,
@@ -245,6 +307,8 @@ mod tests {
                 dns: &DnsConfig::default(),
                 nuclei: &NucleiConfig::default(),
                 dns_resolvers: &[],
+                ipv4_ready: true,
+                ipv6_ready: false,
             },
             &plan,
             &target,
