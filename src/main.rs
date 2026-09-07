@@ -19,7 +19,7 @@ use crate::config::load;
 use crate::error::{MaintenanceInfo, ScannerError, ServerError};
 use crate::health::health_check;
 use crate::heartbeat::{ActiveTask, HeartbeatClient, HeartbeatEndpoints, TaskCancellationReason};
-use crate::http_client::{FetchTaskOutcome, ServerHttpClient, fetch_task};
+use crate::http_client::{FetchTaskOutcome, ServerHttpClient, fetch_task, recover_task};
 use crate::logging::{LogLevel, init_logging};
 use crate::network::{NetworkDetector, SharedNetworkCapabilities};
 use crate::reconnect::{Backoff, ConnectionState, RetryPolicy};
@@ -242,6 +242,7 @@ async fn run() -> Result<(), ScannerError> {
 
     let cfg = &loaded.app;
     let task_url = cfg.scanner.task_url(false);
+    let current_task_url = cfg.scanner.current_task_url(None);
 
     tracing::debug!(
         server = %cfg.scanner.c_server,
@@ -452,6 +453,7 @@ async fn run() -> Result<(), ScannerError> {
             ScanLoopConfig {
                 scanner_path: &cfg.scanner.scanner_path,
                 task_url: &task_url,
+                current_task_url: &current_task_url,
                 server_client: &server_client,
                 scanner_id,
                 runtime_configuration,
@@ -960,6 +962,7 @@ async fn flush_with_guards(
 struct ScanLoopConfig<'a> {
     scanner_path: &'a str,
     task_url: &'a str,
+    current_task_url: &'a str,
     server_client: &'a ServerHttpClient,
     scanner_id: Uuid,
     runtime_configuration: RuntimeConfiguration,
@@ -989,6 +992,83 @@ async fn scan_loop(
         if cache.has_pending_task() {
             if !wait_until_online(&mut connection).await {
                 break;
+            }
+            // A freshly restarted scanner has durable upload state but no
+            // in-memory lease. Recover the exact server task before uploading
+            // so another scanner cannot reclaim it during the retry window.
+            if active_task.get().await.is_none() {
+                let Some(cached_task_id) = cache.task_id else {
+                    tracing::error!("pending upload is missing its task identity");
+                    break;
+                };
+                let recovery_url = format!("{}&taskid={cached_task_id}", config.current_task_url);
+                match recover_task(config.server_client, &recovery_url).await {
+                    Ok(FetchTaskOutcome::Task(task)) if task.task_id == cached_task_id => {
+                        fetch_backoff.reset();
+                        active_task.set(task.task_id, task.lease_ttl_ms).await;
+                        tracing::info!(
+                            event = "PendingUploadRecovered",
+                            task_id = %task.task_id,
+                            upload_id = ?cache.upload_id,
+                            "recovered task lease for durable result upload"
+                        );
+                    }
+                    Ok(FetchTaskOutcome::Task(task)) => {
+                        tracing::error!(
+                            expected_task_id = %cached_task_id,
+                            returned_task_id = %task.task_id,
+                            "server returned the wrong task during upload recovery"
+                        );
+                        request_stop();
+                        break;
+                    }
+                    Ok(FetchTaskOutcome::NoTask) => {
+                        fetch_backoff.reset();
+                        tracing::info!(
+                            event = "PendingUploadReconcile",
+                            task_id = %cached_task_id,
+                            "server has no running lease for cached results; attempting idempotent upload"
+                        );
+                    }
+                    Ok(FetchTaskOutcome::RecoveryRequired) => {
+                        tracing::warn!(
+                            task_id = %cached_task_id,
+                            "upload recovery was redirected; retrying recovery"
+                        );
+                        continue;
+                    }
+                    Err(ServerError::Maintenance { info, .. }) => {
+                        tracing::warn!(
+                            task_id = %cached_task_id,
+                            retry_delay_seconds = info.retry_delay().as_secs(),
+                            "pending upload recovery paused for maintenance"
+                        );
+                        if sleep_or_stop(info.retry_delay()).await {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(error) if error.is_retryable() => {
+                        let delay = fetch_backoff.next_delay(None, error.retry_after());
+                        tracing::warn!(
+                            task_id = %cached_task_id,
+                            attempt = fetch_backoff.failures(),
+                            retry_delay_seconds = delay.as_secs_f64(),
+                            error = %error,
+                            "pending upload recovery failed"
+                        );
+                        if sleep_or_stop(delay).await {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(error) if stop_for_server_error(&error) => break,
+                    Err(error) => {
+                        tracing::error!(%error, "non-retryable pending upload recovery failure");
+                        request_stop();
+                        break;
+                    }
+                }
             }
             if active_task.cancellation_reason() == Some(TaskCancellationReason::LeaseLost) {
                 tracing::error!("discarding cached results after task lease loss");
@@ -1092,25 +1172,25 @@ async fn scan_loop(
         if !wait_until_online(&mut connection).await {
             break;
         }
-        let assigned_task = match fetch_task(config.server_client, config.task_url).await {
+        let recovered_task = match recover_task(config.server_client, config.current_task_url).await
+        {
             Ok(FetchTaskOutcome::Task(task)) => {
                 fetch_backoff.reset();
-                tracing::debug!(
+                tracing::info!(
+                    event = "TaskRecovered",
                     task_id = %task.task_id,
-                    target_count = task.task_target.len(),
-                    ports = %task.task_port,
                     lease_expires_at_ms = ?task.lease_expires_at_ms,
-                    lease_ttl_ms = task.lease_ttl_ms,
-                    "scan task received"
+                    "recovered unfinished task before requesting new work"
                 );
-                task
+                Some(task)
             }
             Ok(FetchTaskOutcome::NoTask) => {
                 fetch_backoff.reset();
-                tracing::debug!(retry_delay_seconds = 5, "no scan task available");
-                if sleep_or_stop(Duration::from_secs(5)).await {
-                    break;
-                }
+                tracing::debug!(event = "RecoveryQueueDrained", "no unfinished task remains");
+                None
+            }
+            Ok(FetchTaskOutcome::RecoveryRequired) => {
+                tracing::warn!("task recovery requested another recovery pass");
                 continue;
             }
             Err(ServerError::Maintenance { info, .. }) => {
@@ -1118,7 +1198,7 @@ async fn scan_loop(
                     phase = %info.phase,
                     message = %info.message,
                     retry_delay_seconds = info.retry_delay().as_secs(),
-                    "task assignment paused for maintenance"
+                    "task recovery paused for maintenance"
                 );
                 if sleep_or_stop(info.retry_delay()).await {
                     break;
@@ -1131,7 +1211,7 @@ async fn scan_loop(
                     attempt = fetch_backoff.failures(),
                     retry_delay_seconds = delay.as_secs_f64(),
                     error = %error,
-                    "fetch task failed"
+                    "recover task failed"
                 );
                 if sleep_or_stop(delay).await {
                     break;
@@ -1140,9 +1220,75 @@ async fn scan_loop(
             }
             Err(error) if stop_for_server_error(&error) => break,
             Err(error) => {
-                tracing::error!(%error, "non-retryable task request failure; stopping");
+                tracing::error!(%error, "non-retryable task recovery failure; stopping");
                 request_stop();
                 break;
+            }
+        };
+
+        let assigned_task = if let Some(task) = recovered_task {
+            task
+        } else {
+            tracing::debug!(event = "NewTaskRequested", "requesting a new scan task");
+            match fetch_task(config.server_client, config.task_url).await {
+                Ok(FetchTaskOutcome::Task(task)) => {
+                    fetch_backoff.reset();
+                    tracing::debug!(
+                        task_id = %task.task_id,
+                        target_count = task.task_target.len(),
+                        ports = %task.task_port,
+                        lease_expires_at_ms = ?task.lease_expires_at_ms,
+                        lease_ttl_ms = task.lease_ttl_ms,
+                        "new scan task received"
+                    );
+                    task
+                }
+                Ok(FetchTaskOutcome::RecoveryRequired) => {
+                    fetch_backoff.reset();
+                    tracing::info!(
+                        "server reported unfinished work during claim; returning to recovery"
+                    );
+                    continue;
+                }
+                Ok(FetchTaskOutcome::NoTask) => {
+                    fetch_backoff.reset();
+                    tracing::debug!(retry_delay_seconds = 5, "no scan task available");
+                    if sleep_or_stop(Duration::from_secs(5)).await {
+                        break;
+                    }
+                    continue;
+                }
+                Err(ServerError::Maintenance { info, .. }) => {
+                    tracing::warn!(
+                        phase = %info.phase,
+                        message = %info.message,
+                        retry_delay_seconds = info.retry_delay().as_secs(),
+                        "task assignment paused for maintenance"
+                    );
+                    if sleep_or_stop(info.retry_delay()).await {
+                        break;
+                    }
+                    continue;
+                }
+                Err(error) if error.is_retryable() => {
+                    let delay = fetch_backoff.next_delay(None, error.retry_after());
+                    tracing::warn!(
+                        attempt = fetch_backoff.failures(),
+                        retry_delay_seconds = delay.as_secs_f64(),
+                        error = %error,
+                        "fetch task failed"
+                    );
+                    if sleep_or_stop(delay).await {
+                        break;
+                    }
+                    continue;
+                }
+                Err(error) if stop_for_server_error(&error) => break,
+                Err(error) => {
+                    tracing::error!(%error, "non-retryable task request failure; stopping");
+                    request_stop();
+                    break;
+                }
             }
         };
         // A heartbeat may have staged a revision while this loop was waiting for

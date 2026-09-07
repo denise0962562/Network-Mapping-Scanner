@@ -521,6 +521,18 @@ impl ScannerConfig {
         url
     }
 
+    pub(crate) fn current_task_url(&self, task_id: Option<Uuid>) -> String {
+        let mut url = format!(
+            "https://{}:{}/api/task/current?scannerid={}",
+            self.c_server, self.c_port, self.scanner_id
+        );
+        if let Some(task_id) = task_id {
+            url.push_str("&taskid=");
+            url.push_str(&task_id.to_string());
+        }
+        url
+    }
+
     pub(crate) fn heartbeat_url(&self) -> String {
         format!(
             "https://{}:{}/api/scanner/heartbeat",
@@ -595,6 +607,7 @@ fn default_lease_safety_margin() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{AssignedTask, CacheManager, DnsResolver, ScannerConfig, is_valid_dns_domain};
+    use uuid::Uuid;
 
     #[test]
     fn dns_task_domains_require_dot_separation_and_obey_wire_limits() {
@@ -698,6 +711,15 @@ mod tests {
         assert_eq!(
             config.task_url(true),
             "https://scanner.example:443/api/task/apply?scannerid=019c0000-0000-7000-8000-000000000001&dryrun=true"
+        );
+        assert_eq!(
+            config.current_task_url(None),
+            "https://scanner.example:443/api/task/current?scannerid=019c0000-0000-7000-8000-000000000001"
+        );
+        let task_id = Uuid::parse_str("019c0000-0000-7000-8000-000000000002").unwrap();
+        assert_eq!(
+            config.current_task_url(Some(task_id)),
+            "https://scanner.example:443/api/task/current?scannerid=019c0000-0000-7000-8000-000000000001&taskid=019c0000-0000-7000-8000-000000000002"
         );
         assert_eq!(
             config.heartbeat_url(),
