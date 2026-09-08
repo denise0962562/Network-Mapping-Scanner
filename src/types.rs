@@ -27,6 +27,16 @@ struct LegacyCacheState {
 }
 
 impl CacheManager {
+    pub(crate) fn save_runtime_configuration(
+        &self,
+        configuration: &crate::runtime_config::RuntimeConfigurationEnvelope,
+    ) -> Result<(), crate::error::ScannerError> {
+        self.store
+            .as_ref()
+            .ok_or_else(|| crate::error::ScannerError::Config("state store is unavailable".into()))?
+            .save_runtime_configuration(&self.server_origin, configuration)
+    }
+
     pub(crate) fn legacy_state_has_pending(
         path: &std::path::Path,
     ) -> Result<bool, crate::error::ScannerError> {
@@ -283,6 +293,14 @@ pub(crate) struct TargetParams {
     pub(crate) address_family: String,
 }
 
+pub(crate) const DNS_RECORD_TYPES: [&str; 12] = [
+    "A", "AAAA", "CNAME", "NS", "MX", "PTR", "SRV", "TXT", "CAA", "SOA", "SVCB", "HTTPS",
+];
+
+pub(crate) fn is_supported_dns_record_type(value: &str) -> bool {
+    DNS_RECORD_TYPES.contains(&value.trim().to_ascii_uppercase().as_str())
+}
+
 // ---- Upload payload -----------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -366,7 +384,7 @@ pub(crate) struct ServiceDetectionConfig {
     pub(crate) max_result_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ServiceDetectionStrategy {
     #[default]
@@ -415,7 +433,7 @@ impl Default for DnsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            record_types: vec!["A".into(), "AAAA".into()],
+            record_types: DNS_RECORD_TYPES.iter().map(ToString::to_string).collect(),
             query_timeout_seconds: 5,
         }
     }
@@ -503,10 +521,29 @@ impl ScannerConfig {
         url
     }
 
+    pub(crate) fn current_task_url(&self, task_id: Option<Uuid>) -> String {
+        let mut url = format!(
+            "https://{}:{}/api/task/current?scannerid={}",
+            self.c_server, self.c_port, self.scanner_id
+        );
+        if let Some(task_id) = task_id {
+            url.push_str("&taskid=");
+            url.push_str(&task_id.to_string());
+        }
+        url
+    }
+
     pub(crate) fn heartbeat_url(&self) -> String {
         format!(
             "https://{}:{}/api/scanner/heartbeat",
             self.c_server, self.c_port
+        )
+    }
+
+    pub(crate) fn runtime_configuration_url(&self) -> String {
+        format!(
+            "https://{}:{}/api/scanner/runtime-config?scannerid={}",
+            self.c_server, self.c_port, self.scanner_id
         )
     }
 
@@ -570,6 +607,7 @@ fn default_lease_safety_margin() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{AssignedTask, CacheManager, DnsResolver, ScannerConfig, is_valid_dns_domain};
+    use uuid::Uuid;
 
     #[test]
     fn dns_task_domains_require_dot_separation_and_obey_wire_limits() {
@@ -673,6 +711,15 @@ mod tests {
         assert_eq!(
             config.task_url(true),
             "https://scanner.example:443/api/task/apply?scannerid=019c0000-0000-7000-8000-000000000001&dryrun=true"
+        );
+        assert_eq!(
+            config.current_task_url(None),
+            "https://scanner.example:443/api/task/current?scannerid=019c0000-0000-7000-8000-000000000001"
+        );
+        let task_id = Uuid::parse_str("019c0000-0000-7000-8000-000000000002").unwrap();
+        assert_eq!(
+            config.current_task_url(Some(task_id)),
+            "https://scanner.example:443/api/task/current?scannerid=019c0000-0000-7000-8000-000000000001&taskid=019c0000-0000-7000-8000-000000000002"
         );
         assert_eq!(
             config.heartbeat_url(),

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredIdentity {
@@ -20,6 +20,13 @@ pub(crate) struct StoredUpload {
     pub(crate) upload_id: Uuid,
     pub(crate) next_batch_index: u32,
     pub(crate) observations: Vec<ScanObservation>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredRuntimeConfiguration {
+    pub(crate) revision: i64,
+    pub(crate) schema_version: i32,
+    pub(crate) document: Vec<u8>,
 }
 
 pub(crate) struct StateStore {
@@ -79,6 +86,40 @@ impl StateStore {
                  runtime_token = excluded.runtime_token,
                  updated_at = excluded.updated_at",
             params![server_origin, identity.scanner_id, identity.runtime_token],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn load_runtime_configuration(
+        &self,
+        server_origin: &str,
+    ) -> Result<Option<StoredRuntimeConfiguration>, ScannerError> {
+        self.connection
+            .query_row(
+                "SELECT revision, schema_version, document_json FROM runtime_configuration WHERE server_origin = ?1",
+                [server_origin],
+                |row| Ok(StoredRuntimeConfiguration {
+                    revision: row.get(0)?,
+                    schema_version: row.get(1)?,
+                    document: row.get(2)?,
+                }),
+            )
+            .optional()
+            .map_err(ScannerError::from)
+    }
+
+    pub(crate) fn save_runtime_configuration(
+        &self,
+        server_origin: &str,
+        configuration: &crate::runtime_config::RuntimeConfigurationEnvelope,
+    ) -> Result<(), ScannerError> {
+        let document = serde_json::to_vec(&configuration.document)?;
+        self.connection.execute(
+            "INSERT INTO runtime_configuration (server_origin, revision, schema_version, document_json, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, unixepoch()) ON CONFLICT(server_origin) DO UPDATE SET \
+             revision = excluded.revision, schema_version = excluded.schema_version, \
+             document_json = excluded.document_json, updated_at = excluded.updated_at",
+            params![server_origin, configuration.revision, configuration.schema_version, document],
         )?;
         Ok(())
     }
@@ -274,13 +315,10 @@ fn migrate(connection: &mut Connection) -> Result<(), ScannerError> {
             "state database schema version {current_version} is newer than supported version {SCHEMA_VERSION}"
         )));
     }
-    if current_version == SCHEMA_VERSION {
-        return Ok(());
-    }
-
-    let transaction = connection.transaction()?;
-    transaction.execute_batch(
-        "CREATE TABLE scanner_identity (
+    if current_version < 1 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE scanner_identity (
              server_origin TEXT PRIMARY KEY NOT NULL,
              scanner_id TEXT NOT NULL,
              runtime_token TEXT NOT NULL,
@@ -307,9 +345,24 @@ fn migrate(connection: &mut Connection) -> Result<(), ScannerError> {
                  ON DELETE CASCADE
          );
 
-         PRAGMA user_version = 1;",
-    )?;
-    transaction.commit()?;
+             PRAGMA user_version = 1;",
+        )?;
+        transaction.commit()?;
+    }
+    if current_version < 2 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE runtime_configuration (
+                 server_origin TEXT PRIMARY KEY NOT NULL,
+                 revision INTEGER NOT NULL CHECK(revision > 0),
+                 schema_version INTEGER NOT NULL CHECK(schema_version > 0),
+                 document_json BLOB NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             PRAGMA user_version = 2;",
+        )?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 

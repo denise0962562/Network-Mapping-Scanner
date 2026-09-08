@@ -10,6 +10,7 @@ const USER_AGENT: &str = "Scanner/1.0";
 pub(crate) enum FetchTaskOutcome {
     Task(AssignedTask),
     NoTask,
+    RecoveryRequired,
 }
 
 #[derive(Clone)]
@@ -100,17 +101,36 @@ pub(crate) async fn fetch_task(
     client: &ServerHttpClient,
     url: &str,
 ) -> Result<FetchTaskOutcome, ServerError> {
-    tracing::debug!(url, "requesting scan task");
-    let response = client.get(url, "fetch task").await?;
-    let status = response.status();
-    tracing::debug!(%status, "task endpoint responded");
+    fetch_task_from_endpoint(client, url, "fetch task", true).await
+}
 
+pub(crate) async fn recover_task(
+    client: &ServerHttpClient,
+    url: &str,
+) -> Result<FetchTaskOutcome, ServerError> {
+    fetch_task_from_endpoint(client, url, "recover task", false).await
+}
+
+async fn fetch_task_from_endpoint(
+    client: &ServerHttpClient,
+    url: &str,
+    operation: &'static str,
+    conflict_requires_recovery: bool,
+) -> Result<FetchTaskOutcome, ServerError> {
+    tracing::debug!(url, operation, "requesting scan task");
+    let response = client.get(url, operation).await?;
+    let status = response.status();
+    tracing::debug!(%status, operation, "task endpoint responded");
+
+    if let Some(outcome) = task_outcome_without_body(status, conflict_requires_recovery) {
+        return Ok(outcome);
+    }
     match status {
         StatusCode::OK => {
             let task = response
                 .json::<AssignedTask>()
                 .await
-                .map_err(|error| response_decode_error(error, "fetch task"))?;
+                .map_err(|error| response_decode_error(error, operation))?;
             tracing::debug!(
                 task_id = %task.task_id,
                 target_count = task.task_target.len(),
@@ -119,8 +139,20 @@ pub(crate) async fn fetch_task(
             );
             Ok(FetchTaskOutcome::Task(task))
         }
-        StatusCode::NOT_FOUND | StatusCode::NO_CONTENT => Ok(FetchTaskOutcome::NoTask),
-        _ => Err(response_error(response, "fetch task").await),
+        _ => Err(response_error(response, operation).await),
+    }
+}
+
+fn task_outcome_without_body(
+    status: StatusCode,
+    conflict_requires_recovery: bool,
+) -> Option<FetchTaskOutcome> {
+    match status {
+        StatusCode::NOT_FOUND | StatusCode::NO_CONTENT => Some(FetchTaskOutcome::NoTask),
+        StatusCode::CONFLICT if conflict_requires_recovery => {
+            Some(FetchTaskOutcome::RecoveryRequired)
+        }
+        _ => None,
     }
 }
 
@@ -274,12 +306,14 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerHttpClient, classify_status, parse_maintenance_response, parse_retry_after};
+    use super::{
+        FetchTaskOutcome, ServerHttpClient, classify_status, parse_maintenance_response,
+        parse_retry_after, task_outcome_without_body,
+    };
     use crate::error::ServerError;
     use reqwest::StatusCode;
     use reqwest::header::RETRY_AFTER;
     use std::time::Duration;
-
     #[test]
     fn retry_after_delta_seconds_are_parsed() {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -345,5 +379,23 @@ mod tests {
         .unwrap();
         let error = client.get(":not-a-url", "test").await.unwrap_err();
         assert!(matches!(error, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn task_statuses_preserve_recovery_before_claiming() {
+        assert!(matches!(
+            task_outcome_without_body(StatusCode::NO_CONTENT, false),
+            Some(FetchTaskOutcome::NoTask)
+        ));
+        assert!(matches!(
+            task_outcome_without_body(StatusCode::CONFLICT, true),
+            Some(FetchTaskOutcome::RecoveryRequired)
+        ));
+        assert!(task_outcome_without_body(StatusCode::CONFLICT, false).is_none());
+        assert!(task_outcome_without_body(StatusCode::OK, true).is_none());
+        assert!(matches!(
+            task_outcome_without_body(StatusCode::NOT_FOUND, false),
+            Some(FetchTaskOutcome::NoTask)
+        ));
     }
 }
