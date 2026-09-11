@@ -653,6 +653,33 @@ mod tests {
     }
 
     #[test]
+    fn smtp_starttls_keeps_the_negotiated_tls_handshake() {
+        let config = ServiceDetectionConfig::default();
+        let mut smtp = evidence("smtp", 587, "success", Some("220 mail.example ESMTP"));
+        smtp.detail["result"]["starttls"] = json!("220 Ready to start TLS");
+        smtp.detail["result"]["tls"] = json!({
+            "handshake_log": {
+                "server_certificates": {
+                    "certificate": {"parsed": {"subject_dn": "CN=mail.example"}}
+                }
+            }
+        });
+
+        let results = aggregate(&[smtp], &config);
+        assert_eq!(results[0].service.as_deref(), Some("smtp"));
+        let retained = results[0].data.as_ref().unwrap()["evidence"]
+            .as_array()
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0]["module"], "smtp");
+        assert_eq!(
+            retained[0]["result"]["tls"]["handshake_log"]["server_certificates"]["certificate"]["parsed"]
+                ["subject_dn"],
+            "CN=mail.example"
+        );
+    }
+
+    #[test]
     fn failed_probes_are_aggregated_without_claiming_a_service() {
         let config = ServiceDetectionConfig {
             strategy: ServiceDetectionStrategy::Adaptive,

@@ -373,12 +373,46 @@ fn sanitize_json_value(value: Value) -> Value {
 }
 
 fn bounded_detail(module_data: &Value, max_result_bytes: usize) -> Value {
-    let module_data = sanitize_json_value(module_data.clone());
+    let mut module_data = sanitize_json_value(module_data.clone());
     let serialized_bytes = serde_json::to_vec(&module_data)
         .map(|value| value.len())
         .unwrap_or(0);
     if serialized_bytes <= max_result_bytes {
         return module_data;
+    }
+
+    // Keep the HTTP envelope (including TLS evidence) and as much of the body
+    // as fits in the serialized JSON budget. Wire bytes and JSON bytes differ
+    // because quotes, control characters and backslashes require escaping.
+    if let Some(body) = module_data
+        .pointer("/result/response/body")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    {
+        module_data["result"]["response"]["body"] = json!("");
+        module_data["result"]["response"]["body_truncated"] = json!(true);
+        let envelope_bytes = serde_json::to_vec(&module_data)
+            .map(|value| value.len())
+            .unwrap_or(usize::MAX);
+        if envelope_bytes <= max_result_bytes {
+            let budget = max_result_bytes - envelope_bytes;
+            let mut used = 0;
+            let mut end = 0;
+            for (offset, character) in body.char_indices() {
+                let encoded = match character {
+                    '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+                    '\u{00}'..='\u{1f}' => 6,
+                    _ => character.len_utf8(),
+                };
+                if used + encoded > budget {
+                    break;
+                }
+                used += encoded;
+                end = offset + character.len_utf8();
+            }
+            module_data["result"]["response"]["body"] = json!(&body[..end]);
+            return module_data;
+        }
     }
 
     json!({
@@ -527,6 +561,62 @@ mod tests {
         );
         let results = parse_zgrab_line(&line, 1024).unwrap();
         assert_eq!(results[0].detail["truncated"], true);
+    }
+
+    #[test]
+    fn oversized_http_keeps_body_prefix_and_tls_within_json_budget() {
+        for suffix in ["x", "中", "\\\"\n\u{01}"] {
+            let detail = json!({
+                "status": "success", "port": 443,
+                "result": {
+                    "response": {
+                        "status_line": "HTTP/1.1 200 OK",
+                        "body": format!("<title>Camera</title>{}", suffix.repeat(70_000))
+                    },
+                    "tls": {"handshake_log": {"server_certificates": {"subject_dn": "CN=camera"}}}
+                }
+            });
+            let line = json!({"ip": "192.0.2.1", "data": {"https": detail}}).to_string();
+            let probes = parse_zgrab_line(&line, 65_536).unwrap();
+            let retained = &probes[0].detail;
+            assert!(serde_json::to_vec(retained).unwrap().len() <= 65_536);
+            assert_eq!(
+                retained.pointer("/result/response/body_truncated"),
+                Some(&json!(true))
+            );
+            assert!(
+                retained
+                    .pointer("/result/response/body")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .starts_with("<title>Camera</title>")
+            );
+            assert_eq!(
+                retained.pointer("/result/tls"),
+                detail.pointer("/result/tls")
+            );
+            let observations = aggregate(&probes, &ServiceDetectionConfig::default());
+            assert_eq!(observations[0].service.as_deref(), Some("https"));
+            assert_eq!(
+                observations[0]
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .pointer("/evidence/0/result/response/body_truncated"),
+                Some(&json!(true))
+            );
+        }
+    }
+
+    #[test]
+    fn http_envelope_exceeding_budget_still_reports_truncation() {
+        let detail = json!({"status": "success", "result": {"response": {
+            "body": "<title>Camera</title>", "headers": {"large": "x".repeat(2048)}
+        }}});
+        let bounded = bounded_detail(&detail, 1024);
+        assert_eq!(bounded["truncated"], true);
+        assert!(serde_json::to_vec(&bounded).unwrap().len() <= 1024);
     }
 
     #[test]
