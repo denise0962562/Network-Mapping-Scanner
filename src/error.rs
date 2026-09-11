@@ -2,6 +2,7 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use std::time::Duration;
 use thiserror::Error;
+use uuid::Uuid;
 
 fn maintenance_enabled_by_default() -> bool {
     true
@@ -63,6 +64,7 @@ pub(crate) enum ServerError {
         operation: &'static str,
         detail: String,
         info: Box<MaintenanceInfo>,
+        request_id: Option<Uuid>,
     },
 
     #[error("{operation} timed out: {detail}")]
@@ -89,18 +91,21 @@ pub(crate) enum ServerError {
         status: StatusCode,
         detail: String,
         retry_after: Option<Duration>,
+        request_id: Option<Uuid>,
     },
 
     #[error("{operation} rejected the runtime token: {detail}")]
     AuthRejected {
         operation: &'static str,
         detail: String,
+        request_id: Option<Uuid>,
     },
 
     #[error("{operation} was blocked by server policy: {detail}")]
     PolicyBlocked {
         operation: &'static str,
         detail: String,
+        request_id: Option<Uuid>,
     },
 
     #[error("{operation} returned {status}: {detail}")]
@@ -108,6 +113,7 @@ pub(crate) enum ServerError {
         operation: &'static str,
         status: StatusCode,
         detail: String,
+        request_id: Option<Uuid>,
     },
 
     #[error("{operation} returned an invalid response: {detail}")]
@@ -154,6 +160,75 @@ impl ServerError {
             _ => None,
         }
     }
+
+    pub(crate) fn request_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Maintenance { request_id, .. }
+            | Self::RetryableStatus { request_id, .. }
+            | Self::AuthRejected { request_id, .. }
+            | Self::PolicyBlocked { request_id, .. }
+            | Self::Rejected { request_id, .. } => *request_id,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn operation(&self) -> &'static str {
+        match self {
+            Self::Maintenance { operation, .. }
+            | Self::Timeout { operation, .. }
+            | Self::Connect { operation, .. }
+            | Self::Transport { operation, .. }
+            | Self::RetryableStatus { operation, .. }
+            | Self::AuthRejected { operation, .. }
+            | Self::PolicyBlocked { operation, .. }
+            | Self::Rejected { operation, .. }
+            | Self::InvalidResponse { operation, .. }
+            | Self::InvalidRequest { operation, .. } => operation,
+            Self::ClientBuild(_) => "build_server_http_client",
+        }
+    }
+
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Maintenance { .. } => "maintenance",
+            Self::Timeout { .. } => "timeout",
+            Self::Connect { .. } => "connect",
+            Self::Transport { .. } => "transport",
+            Self::RetryableStatus { .. } | Self::Rejected { .. } => "http_status",
+            Self::AuthRejected { .. } => "authentication",
+            Self::PolicyBlocked { .. } => "policy",
+            Self::InvalidResponse { .. } => "response_decode",
+            Self::InvalidRequest { .. } => "request_build",
+            Self::ClientBuild(_) => "client_build",
+        }
+    }
+
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Maintenance { .. } => "server_maintenance",
+            Self::Timeout { .. } => "server_request_timeout",
+            Self::Connect { .. } => "server_connect_failed",
+            Self::Transport { .. } => "server_transport_failed",
+            Self::RetryableStatus { .. } => "server_retryable_status",
+            Self::AuthRejected { .. } => "runtime_token_rejected",
+            Self::PolicyBlocked { .. } => "server_policy_blocked",
+            Self::Rejected { .. } => "server_request_rejected",
+            Self::InvalidResponse { .. } => "invalid_server_response",
+            Self::InvalidRequest { .. } => "invalid_server_request",
+            Self::ClientBuild(_) => "server_http_client_build_failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UploadBatchContext {
+    pub(crate) scanner_id: Uuid,
+    pub(crate) task_id: Uuid,
+    pub(crate) upload_id: Uuid,
+    pub(crate) batch_index: u32,
+    pub(crate) is_final: bool,
+    pub(crate) protocol_version: u16,
+    pub(crate) observation_count: usize,
 }
 
 #[derive(Error, Debug)]
@@ -176,14 +251,70 @@ pub(crate) enum ScannerError {
     #[error("{0}")]
     Upload(String),
 
+    #[error(
+        "result upload failed for task {context_task_id}, upload {context_upload_id}, batch {context_batch_index}: {source}",
+        context_task_id = .context.task_id,
+        context_upload_id = .context.upload_id,
+        context_batch_index = .context.batch_index,
+    )]
+    UploadBatch {
+        context: UploadBatchContext,
+        #[source]
+        source: Box<ServerError>,
+    },
+
     #[error("{0}")]
     Config(String),
 
     #[error("{0}")]
     Scan(String),
 
+    #[error("{engine} {stage} failed: {source}")]
+    EngineStage {
+        engine: &'static str,
+        stage: &'static str,
+        code: &'static str,
+        #[source]
+        source: Box<ScannerError>,
+    },
+
     #[error(transparent)]
     Server(#[from] ServerError),
+}
+
+impl ScannerError {
+    pub(crate) fn engine_stage(
+        engine: &'static str,
+        stage: &'static str,
+        code: &'static str,
+        source: ScannerError,
+    ) -> Self {
+        Self::EngineStage {
+            engine,
+            stage,
+            code,
+            source: Box::new(source),
+        }
+    }
+
+    pub(crate) fn scan_diagnostics(
+        &self,
+    ) -> (
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+    ) {
+        match self {
+            Self::EngineStage {
+                engine,
+                stage,
+                code,
+                ..
+            } => ("scan_engine", code, Some(engine), Some(stage)),
+            _ => ("scan", "scan_plan_failed", None, None),
+        }
+    }
 }
 
 impl From<toml_edit::de::Error> for ScannerError {
@@ -195,5 +326,65 @@ impl From<toml_edit::de::Error> for ScannerError {
 impl From<reqwest::Error> for ScannerError {
     fn from(e: reqwest::Error) -> Self {
         Self::Http(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ScannerError, ServerError, UploadBatchContext};
+    use uuid::Uuid;
+
+    #[test]
+    fn upload_batch_error_preserves_identity_and_server_classification() {
+        let context = UploadBatchContext {
+            scanner_id: Uuid::now_v7(),
+            task_id: Uuid::now_v7(),
+            upload_id: Uuid::now_v7(),
+            batch_index: 7,
+            is_final: true,
+            protocol_version: 3,
+            observation_count: 42,
+        };
+        let request_id = Uuid::now_v7();
+        let error = ScannerError::UploadBatch {
+            context,
+            source: Box::new(ServerError::Rejected {
+                operation: "upload results",
+                status: reqwest::StatusCode::CONFLICT,
+                detail: "batch checksum conflict".into(),
+                request_id: Some(request_id),
+            }),
+        };
+
+        let ScannerError::UploadBatch {
+            context: actual,
+            source,
+        } = error
+        else {
+            panic!("expected upload batch error");
+        };
+        assert_eq!(actual, context);
+        assert_eq!(source.code(), "server_request_rejected");
+        assert_eq!(source.request_id(), Some(request_id));
+    }
+
+    #[test]
+    fn engine_stage_error_exposes_stable_scan_diagnostics() {
+        let error = ScannerError::engine_stage(
+            "nuclei",
+            "vulnerability_detection",
+            "vulnerability_detection_failed",
+            ScannerError::Scan("process exited unsuccessfully".into()),
+        );
+
+        assert_eq!(
+            error.scan_diagnostics(),
+            (
+                "scan_engine",
+                "vulnerability_detection_failed",
+                Some("nuclei"),
+                Some("vulnerability_detection"),
+            )
+        );
     }
 }

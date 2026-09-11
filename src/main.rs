@@ -16,7 +16,7 @@ mod types;
 mod upload;
 
 use crate::config::load;
-use crate::error::{MaintenanceInfo, ScannerError, ServerError};
+use crate::error::{MaintenanceInfo, ScannerError, ServerError, UploadBatchContext};
 use crate::health::health_check;
 use crate::heartbeat::{ActiveTask, HeartbeatClient, HeartbeatEndpoints, TaskCancellationReason};
 use crate::http_client::{FetchTaskOutcome, ServerHttpClient, fetch_task, recover_task};
@@ -476,7 +476,12 @@ async fn run() -> Result<(), ScannerError> {
 
     match flush(&uploader, scanner_id, &mut cache).await {
         Ok(()) => active_task.clear().await,
-        Err(error) => tracing::error!("final result upload failed: {}", error),
+        Err(error) => log_flush_failure(
+            "FinalResultUploadFailed",
+            "batch_retained_on_disk",
+            &error,
+            &cache,
+        ),
     }
     if let Err(error) = heartbeat_client.send(active_task.get().await, true).await {
         tracing::warn!("final heartbeat failed: {}", error);
@@ -660,7 +665,13 @@ fn spawn_heartbeat(
                             }
                             Ok(false) => break,
                             Err(error) => {
-                                tracing::error!(%error, "maintenance probe stopped unexpectedly");
+                                log_terminal_scanner_error(
+                                    "MaintenanceProbeFailed",
+                                    "poll_maintenance_status",
+                                    &error,
+                                    "process_stopping",
+                                    active_task_id,
+                                );
                                 request_stop();
                                 break;
                             }
@@ -721,7 +732,13 @@ fn spawn_heartbeat(
                             break;
                         }
                         Err(error) => {
-                            tracing::error!(%error, "maintenance probe stopped unexpectedly");
+                            log_terminal_scanner_error(
+                                "MaintenanceProbeFailed",
+                                "poll_maintenance_status",
+                                &error,
+                                "process_stopping",
+                                active_task_id,
+                            );
                             request_stop();
                             break;
                         }
@@ -758,29 +775,57 @@ fn spawn_heartbeat(
                         break;
                     }
                 }
-                Err(ScannerError::Server(ServerError::AuthRejected { .. })) => {
+                Err(ScannerError::Server(error @ ServerError::AuthRejected { .. })) => {
                     publish_connection_state(&connection_tx, ConnectionState::AuthRejected);
                     active_task.request_shutdown().await;
-                    tracing::error!("runtime token rejected; register the scanner again");
+                    log_terminal_scanner_error(
+                        "HeartbeatAuthenticationRejected",
+                        "send_heartbeat",
+                        &ScannerError::Server(error),
+                        "process_stopping",
+                        active_task_id,
+                    );
                     request_stop();
                     break;
                 }
-                Err(ScannerError::Server(ServerError::PolicyBlocked { .. })) => {
+                Err(ScannerError::Server(error @ ServerError::PolicyBlocked { .. })) => {
                     publish_connection_state(&connection_tx, ConnectionState::PolicyBlocked);
                     active_task.request_shutdown().await;
-                    tracing::error!("heartbeat blocked by server policy; stopping");
+                    log_terminal_scanner_error(
+                        "HeartbeatPolicyBlocked",
+                        "send_heartbeat",
+                        &ScannerError::Server(error),
+                        "process_stopping",
+                        active_task_id,
+                    );
                     request_stop();
                     break;
                 }
                 Err(ScannerError::Server(error)) => {
-                    tracing::error!(%error, "non-retryable heartbeat failure; stopping");
+                    log_terminal_scanner_error(
+                        "HeartbeatFailed",
+                        "send_heartbeat",
+                        &ScannerError::Server(error),
+                        "process_stopping",
+                        active_task_id,
+                    );
                     request_stop();
                     break;
                 }
                 Err(error) => {
                     publish_connection_state(&connection_tx, ConnectionState::Reconnecting);
                     let delay = backoff.next_delay(None, None);
-                    tracing::error!(%error, retry_delay_seconds = delay.as_secs_f64(), "heartbeat failed");
+                    tracing::warn!(
+                        event = "HeartbeatRetry",
+                        operation = "send_heartbeat",
+                        reason = %error,
+                        retryable = true,
+                        outcome = "reconnecting",
+                        task_id = ?active_task_id,
+                        attempt = backoff.failures(),
+                        retry_after_ms = delay.as_millis() as u64,
+                        "heartbeat failed; reconnecting"
+                    );
                     if sleep_or_stop(delay).await {
                         break;
                     }
@@ -880,6 +925,84 @@ async fn wait_until_online(receiver: &mut watch::Receiver<ConnectionState>) -> b
 
 // ---- pipeline helpers ---------------------------------------------------
 
+fn log_flush_failure(
+    event: &'static str,
+    outcome: &'static str,
+    error: &ScannerError,
+    cache: &CacheManager,
+) {
+    match error {
+        ScannerError::UploadBatch { context, source } => tracing::error!(
+            event,
+            operation = source.operation(),
+            error_kind = source.kind(),
+            error_code = source.code(),
+            error_message = %source,
+            retryable = source.is_retryable(),
+            outcome,
+            scanner_id = %context.scanner_id,
+            task_id = %context.task_id,
+            upload_id = %context.upload_id,
+            batch_index = context.batch_index,
+            is_final = context.is_final,
+            protocol_version = context.protocol_version,
+            observation_count = context.observation_count,
+            http_status = ?source.status(),
+            server_request_id = ?source.request_id(),
+            "scan result flush failed"
+        ),
+        _ => tracing::error!(
+            event,
+            operation = "prepare_or_commit_result_cache",
+            error_kind = "local_storage",
+            error_code = "result_cache_operation_failed",
+            error_message = %error,
+            retryable = false,
+            outcome,
+            task_id = ?cache.task_id,
+            upload_id = ?cache.upload_id,
+            next_batch_index = cache.next_batch_index,
+            observation_count = cache.observations.len(),
+            "scan result flush failed"
+        ),
+    }
+}
+
+fn log_terminal_scanner_error(
+    event: &'static str,
+    operation: &'static str,
+    error: &ScannerError,
+    outcome: &'static str,
+    task_id: Option<Uuid>,
+) {
+    match error {
+        ScannerError::Server(source) => tracing::error!(
+            event,
+            operation = source.operation(),
+            error_kind = source.kind(),
+            error_code = source.code(),
+            error_message = %source,
+            retryable = false,
+            outcome,
+            task_id = ?task_id,
+            http_status = ?source.status(),
+            server_request_id = ?source.request_id(),
+            "server operation failed"
+        ),
+        _ => tracing::error!(
+            event,
+            operation,
+            error_kind = "scanner",
+            error_code = "scanner_operation_failed",
+            error_message = %error,
+            retryable = false,
+            outcome,
+            task_id = ?task_id,
+            "scanner operation failed"
+        ),
+    }
+}
+
 async fn flush(
     uploader: &Uploader,
     scanner_id: Uuid,
@@ -911,7 +1034,21 @@ async fn flush(
     let observation_count = cache.observations.len();
     let batch_count = batches.len();
     for batch in &batches {
-        uploader.upload(batch).await?;
+        uploader
+            .upload(batch)
+            .await
+            .map_err(|source| ScannerError::UploadBatch {
+                context: UploadBatchContext {
+                    scanner_id: batch.scanner_id,
+                    task_id: batch.task_id,
+                    upload_id: batch.upload_id,
+                    batch_index: batch.batch_index,
+                    is_final: batch.is_final,
+                    protocol_version: batch.protocol_version,
+                    observation_count: batch.observations.len(),
+                },
+                source: Box::new(source),
+            })?;
         cache.mark_batch_uploaded(batch.batch_index)?;
     }
     tracing::info!(
@@ -998,7 +1135,19 @@ async fn scan_loop(
             // so another scanner cannot reclaim it during the retry window.
             if active_task.get().await.is_none() {
                 let Some(cached_task_id) = cache.task_id else {
-                    tracing::error!("pending upload is missing its task identity");
+                    tracing::error!(
+                        event = "PendingUploadIdentityMissing",
+                        operation = "recover_pending_upload",
+                        error_kind = "local_storage",
+                        error_code = "pending_upload_task_id_missing",
+                        error_message = "durable upload state has no task identity",
+                        retryable = false,
+                        outcome = "process_stopping",
+                        upload_id = ?cache.upload_id,
+                        next_batch_index = cache.next_batch_index,
+                        observation_count = cache.observations.len(),
+                        "pending upload is missing its task identity"
+                    );
                     break;
                 };
                 let recovery_url = format!("{}&taskid={cached_task_id}", config.current_task_url);
@@ -1015,8 +1164,17 @@ async fn scan_loop(
                     }
                     Ok(FetchTaskOutcome::Task(task)) => {
                         tracing::error!(
+                            event = "PendingUploadRecoveryMismatch",
+                            operation = "recover_pending_upload",
+                            error_kind = "protocol",
+                            error_code = "recovered_task_identity_mismatch",
+                            error_message = "server returned a different task during upload recovery",
+                            retryable = false,
+                            outcome = "process_stopping",
                             expected_task_id = %cached_task_id,
                             returned_task_id = %task.task_id,
+                            upload_id = ?cache.upload_id,
+                            next_batch_index = cache.next_batch_index,
                             "server returned the wrong task during upload recovery"
                         );
                         request_stop();
@@ -1062,18 +1220,49 @@ async fn scan_loop(
                         }
                         continue;
                     }
-                    Err(error) if stop_for_server_error(&error) => break,
+                    Err(error) if stop_for_server_error(&error, Some(cached_task_id)) => break,
                     Err(error) => {
-                        tracing::error!(%error, "non-retryable pending upload recovery failure");
+                        log_terminal_scanner_error(
+                            "PendingUploadRecoveryFailed",
+                            "recover_pending_upload",
+                            &ScannerError::Server(error),
+                            "process_stopping",
+                            Some(cached_task_id),
+                        );
                         request_stop();
                         break;
                     }
                 }
             }
             if active_task.cancellation_reason() == Some(TaskCancellationReason::LeaseLost) {
-                tracing::error!("discarding cached results after task lease loss");
+                tracing::error!(
+                    event = "ResultCacheDiscardedAfterLeaseLoss",
+                    operation = "validate_task_lease",
+                    error_kind = "lease",
+                    error_code = "task_lease_lost",
+                    retryable = false,
+                    outcome = "discarding_cached_results",
+                    task_id = ?cache.task_id,
+                    upload_id = ?cache.upload_id,
+                    next_batch_index = cache.next_batch_index,
+                    observation_count = cache.observations.len(),
+                    "discarding cached results after task lease loss"
+                );
                 if let Err(error) = cache.clear() {
-                    tracing::error!(%error, "failed to discard cached results after lease loss");
+                    tracing::error!(
+                        event = "LeaseLostResultCacheDiscardError",
+                        operation = "clear_result_cache",
+                        error_kind = "local_storage",
+                        error_code = "result_cache_clear_failed",
+                        error_message = %error,
+                        retryable = false,
+                        outcome = "cached_results_retained",
+                        task_id = ?cache.task_id,
+                        upload_id = ?cache.upload_id,
+                        next_batch_index = cache.next_batch_index,
+                        observation_count = cache.observations.len(),
+                        "failed to discard cached results after lease loss"
+                    );
                     break;
                 }
                 active_task.clear().await;
@@ -1090,9 +1279,35 @@ async fn scan_loop(
             {
                 FlushAttempt::LeaseExpired(task_id) => {
                     active_task.request_lease_lost(task_id).await;
-                    tracing::error!(%task_id, "result upload stopped at the lease safety deadline");
+                    tracing::error!(
+                        event = "ResultUploadLeaseDeadlineExceeded",
+                        operation = "guard_result_upload_lease",
+                        error_kind = "lease",
+                        error_code = "upload_lease_safety_deadline_exceeded",
+                        retryable = false,
+                        outcome = "discarding_cached_results",
+                        %task_id,
+                        upload_id = ?cache.upload_id,
+                        next_batch_index = cache.next_batch_index,
+                        observation_count = cache.observations.len(),
+                        lease_safety_margin_ms = config.lease_safety_margin.as_millis() as u64,
+                        "result upload stopped at the lease safety deadline"
+                    );
                     if let Err(error) = cache.clear() {
-                        tracing::error!(%error, "failed to discard results after lease expiry");
+                        tracing::error!(
+                            event = "ExpiredLeaseResultCacheDiscardError",
+                            operation = "clear_result_cache",
+                            error_kind = "local_storage",
+                            error_code = "result_cache_clear_failed",
+                            error_message = %error,
+                            retryable = false,
+                            outcome = "cached_results_retained",
+                            %task_id,
+                            upload_id = ?cache.upload_id,
+                            next_batch_index = cache.next_batch_index,
+                            observation_count = cache.observations.len(),
+                            "failed to discard results after lease expiry"
+                        );
                         break;
                     }
                     active_task.clear().await;
@@ -1103,14 +1318,34 @@ async fn scan_loop(
                     upload_backoff.reset();
                     active_task.clear().await;
                 }
-                FlushAttempt::Completed(Err(ScannerError::Server(ServerError::Maintenance {
-                    info,
-                    ..
-                }))) => {
+                FlushAttempt::Completed(Err(ScannerError::UploadBatch { context, source }))
+                    if matches!(source.as_ref(), ServerError::Maintenance { .. }) =>
+                {
+                    let ServerError::Maintenance {
+                        info, request_id, ..
+                    } = source.as_ref()
+                    else {
+                        unreachable!("maintenance guard guarantees the error variant");
+                    };
                     tracing::warn!(
+                        event = "ResultBatchUploadPaused",
+                        operation = "upload_results",
+                        error_kind = "maintenance",
+                        error_code = "server_maintenance",
+                        retryable = true,
+                        outcome = "batch_retained",
+                        scanner_id = %context.scanner_id,
+                        task_id = %context.task_id,
+                        upload_id = %context.upload_id,
+                        batch_index = context.batch_index,
+                        is_final = context.is_final,
+                        protocol_version = context.protocol_version,
+                        observation_count = context.observation_count,
+                        server_request_id = ?request_id,
+                        maintenance_id = ?info.id,
                         phase = %info.phase,
-                        message = %info.message,
-                        retry_delay_seconds = info.retry_delay().as_secs(),
+                        reason = %info.message,
+                        retry_after_ms = info.retry_delay().as_millis() as u64,
                         "result upload paused for maintenance; cached task retained"
                     );
                     if sleep_or_stop(info.retry_delay()).await {
@@ -1118,16 +1353,10 @@ async fn scan_loop(
                     }
                     continue;
                 }
-                FlushAttempt::Completed(Err(ScannerError::Server(error)))
-                    if error.is_retryable() =>
+                FlushAttempt::Completed(Err(ScannerError::UploadBatch { context, source }))
+                    if source.is_retryable() =>
                 {
-                    log_event!(
-                        LogLevel::Warn,
-                        "UPLOAD-RETRY",
-                        "upload temporarily failed",
-                        "scan_loop"
-                    );
-                    let mut delay = upload_backoff.next_delay(None, error.retry_after());
+                    let mut delay = upload_backoff.next_delay(None, source.retry_after());
                     if let Some(remaining) = active_task
                         .lease_safety_remaining(config.lease_safety_margin)
                         .await
@@ -1135,9 +1364,24 @@ async fn scan_loop(
                         delay = delay.min(remaining);
                     }
                     tracing::warn!(
+                        event = "ResultBatchUploadRetry",
+                        operation = source.operation(),
+                        error_kind = source.kind(),
+                        error_code = source.code(),
+                        error_message = %source,
+                        retryable = true,
+                        outcome = "batch_retained",
+                        scanner_id = %context.scanner_id,
+                        task_id = %context.task_id,
+                        upload_id = %context.upload_id,
+                        batch_index = context.batch_index,
+                        is_final = context.is_final,
+                        protocol_version = context.protocol_version,
+                        observation_count = context.observation_count,
+                        http_status = ?source.status(),
+                        server_request_id = ?source.request_id(),
                         attempt = upload_backoff.failures(),
-                        retry_delay_seconds = delay.as_secs_f64(),
-                        error = %error,
+                        retry_after_ms = delay.as_millis() as u64,
                         "upload failed; cached task retained"
                     );
                     if sleep_or_stop(delay).await {
@@ -1145,24 +1389,86 @@ async fn scan_loop(
                     }
                     continue;
                 }
-                FlushAttempt::Completed(Err(ScannerError::Server(error)))
-                    if is_stale_task_error(&error) =>
+                FlushAttempt::Completed(Err(ScannerError::UploadBatch { context, source }))
+                    if is_stale_task_error(&source) =>
                 {
-                    tracing::error!(%error, "server no longer accepts this task; discarding cached results");
+                    tracing::error!(
+                        event = "ResultBatchUploadRejected",
+                        operation = source.operation(),
+                        error_kind = source.kind(),
+                        error_code = source.code(),
+                        error_message = %source,
+                        retryable = false,
+                        outcome = "batch_discarded",
+                        scanner_id = %context.scanner_id,
+                        task_id = %context.task_id,
+                        upload_id = %context.upload_id,
+                        batch_index = context.batch_index,
+                        is_final = context.is_final,
+                        protocol_version = context.protocol_version,
+                        observation_count = context.observation_count,
+                        http_status = ?source.status(),
+                        server_request_id = ?source.request_id(),
+                        "server no longer accepts this task; discarding cached results"
+                    );
                     if let Err(clear_error) = cache.clear() {
-                        tracing::error!(%clear_error, "failed to discard rejected cached results");
+                        tracing::error!(
+                            event = "RejectedResultCacheDiscardError",
+                            operation = "clear_result_cache",
+                            error_kind = "local_storage",
+                            error_code = "result_cache_clear_failed",
+                            error_message = %clear_error,
+                            retryable = false,
+                            outcome = "cached_results_retained",
+                            scanner_id = %context.scanner_id,
+                            task_id = %context.task_id,
+                            upload_id = %context.upload_id,
+                            batch_index = context.batch_index,
+                            "failed to discard rejected cached results"
+                        );
                         break;
                     }
                     active_task.clear().await;
                     continue;
                 }
-                FlushAttempt::Completed(Err(ScannerError::Server(error)))
-                    if stop_for_server_error(&error) =>
-                {
+                FlushAttempt::Completed(Err(ScannerError::UploadBatch { context, source })) => {
+                    tracing::error!(
+                        event = "ResultBatchUploadFailed",
+                        operation = source.operation(),
+                        error_kind = source.kind(),
+                        error_code = source.code(),
+                        error_message = %source,
+                        retryable = false,
+                        outcome = "process_stopping",
+                        scanner_id = %context.scanner_id,
+                        task_id = %context.task_id,
+                        upload_id = %context.upload_id,
+                        batch_index = context.batch_index,
+                        is_final = context.is_final,
+                        protocol_version = context.protocol_version,
+                        observation_count = context.observation_count,
+                        http_status = ?source.status(),
+                        server_request_id = ?source.request_id(),
+                        "non-retryable upload failure; stopping"
+                    );
+                    request_stop();
                     break;
                 }
                 FlushAttempt::Completed(Err(error)) => {
-                    tracing::error!(%error, "non-retryable upload failure; stopping");
+                    tracing::error!(
+                        event = "ResultCacheOperationFailed",
+                        operation = "prepare_or_commit_result_cache",
+                        error_kind = "local_storage",
+                        error_code = "result_cache_operation_failed",
+                        error_message = %error,
+                        retryable = false,
+                        outcome = "process_stopping",
+                        task_id = ?cache.task_id,
+                        upload_id = ?cache.upload_id,
+                        next_batch_index = cache.next_batch_index,
+                        observation_count = cache.observations.len(),
+                        "non-retryable result cache failure; stopping"
+                    );
                     request_stop();
                     break;
                 }
@@ -1218,9 +1524,15 @@ async fn scan_loop(
                 }
                 continue;
             }
-            Err(error) if stop_for_server_error(&error) => break,
+            Err(error) if stop_for_server_error(&error, None) => break,
             Err(error) => {
-                tracing::error!(%error, "non-retryable task recovery failure; stopping");
+                log_terminal_scanner_error(
+                    "TaskRecoveryFailed",
+                    "recover_task",
+                    &ScannerError::Server(error),
+                    "process_stopping",
+                    None,
+                );
                 request_stop();
                 break;
             }
@@ -1283,9 +1595,15 @@ async fn scan_loop(
                     }
                     continue;
                 }
-                Err(error) if stop_for_server_error(&error) => break,
+                Err(error) if stop_for_server_error(&error, None) => break,
                 Err(error) => {
-                    tracing::error!(%error, "non-retryable task request failure; stopping");
+                    log_terminal_scanner_error(
+                        "TaskRequestFailed",
+                        "fetch_task",
+                        &ScannerError::Server(error),
+                        "process_stopping",
+                        None,
+                    );
                     request_stop();
                     break;
                 }
@@ -1300,8 +1618,14 @@ async fn scan_loop(
             .await;
         if let Err(message) = assigned_task.validate_targets() {
             tracing::error!(
+                event = "UnsafeScanTargetRejected",
+                operation = "validate_scan_targets",
+                error_kind = "validation",
+                error_code = "unsafe_scan_target",
+                error_message = %message,
+                retryable = false,
+                outcome = "task_failed",
                 task_id = %assigned_task.task_id,
-                error = %message,
                 "rejecting unsafe scan target"
             );
             if report_task_status_with_retry(
@@ -1439,6 +1763,12 @@ async fn scan_loop(
                 Some(TaskCancellationReason::LeaseLost) => {
                     tracing::error!(
                         event = "ScanTaskLeaseLost",
+                        operation = "monitor_task_lease",
+                        error_kind = "lease",
+                        error_code = "task_lease_lost",
+                        error_message = "scan stopped because its lease was lost",
+                        retryable = false,
+                        outcome = "task_aborted",
                         task_id = %assigned_task.task_id,
                         elapsed_ms = scan_started_at.elapsed().as_millis(),
                         "scan stopped because its lease was lost"
@@ -1449,13 +1779,21 @@ async fn scan_loop(
                 Some(TaskCancellationReason::Shutdown) | None => return,
             },
             Err(e) => {
+                let (error_kind, error_code, engine, stage) = e.scan_diagnostics();
                 tracing::error!(
                     event = "ScanTaskFailed",
+                    operation = "execute_scan_plan",
+                    error_kind,
+                    error_code,
+                    error_message = %e,
+                    retryable = false,
+                    outcome = "task_failed",
+                    engine = ?engine,
+                    stage = ?stage,
                     task_id = %assigned_task.task_id,
                     scan_profile = %scan_plan.profile,
                     address_family = %target.address_family,
                     elapsed_ms = scan_started_at.elapsed().as_millis(),
-                    error = %e,
                     "scan task failed"
                 );
                 let error_message = e.to_string();
@@ -1505,7 +1843,18 @@ async fn scan_loop(
 
         match active_task.cancellation_reason() {
             Some(TaskCancellationReason::LeaseLost) => {
-                tracing::error!(task_id = %assigned_task.task_id, "discarding completed results after lease loss");
+                tracing::error!(
+                    event = "CompletedResultsDiscardedAfterLeaseLoss",
+                    operation = "validate_task_lease",
+                    error_kind = "lease",
+                    error_code = "task_lease_lost",
+                    error_message = "completed results cannot be uploaded after lease loss",
+                    retryable = false,
+                    outcome = "results_discarded",
+                    task_id = %assigned_task.task_id,
+                    observation_count = results.len(),
+                    "discarding completed results after lease loss"
+                );
                 active_task.clear().await;
                 continue;
             }
@@ -1533,7 +1882,19 @@ async fn scan_loop(
         );
 
         if let Err(error) = cache.begin_task_with_observations(assigned_task.task_id, &results) {
-            tracing::error!("failed to bind results to task: {}", error);
+            tracing::error!(
+                event = "ResultCacheBindFailed",
+                operation = "cache_task_results",
+                error_kind = "local_storage",
+                error_code = "result_cache_bind_failed",
+                error_message = %error,
+                retryable = false,
+                outcome = "process_stopping",
+                task_id = %assigned_task.task_id,
+                upload_id = ?cache.upload_id,
+                observation_count = results.len(),
+                "failed to bind results to task"
+            );
             break;
         }
 
@@ -1545,7 +1906,12 @@ async fn scan_loop(
                 "scan_loop"
             );
             if let Err(error) = flush(uploader, config.scanner_id, cache).await {
-                tracing::error!("upload during shutdown failed: {}", error);
+                log_flush_failure(
+                    "ShutdownResultUploadFailed",
+                    "batch_retained_on_disk",
+                    &error,
+                    cache,
+                );
             }
             return;
         }
@@ -1561,14 +1927,32 @@ async fn scan_loop(
 
     if active_task.cancellation_reason() == Some(TaskCancellationReason::LeaseLost) {
         if let Err(error) = cache.clear() {
-            tracing::error!(%error, "failed to discard cached results after lease loss");
+            tracing::error!(
+                event = "FinalLeaseLostCacheDiscardError",
+                operation = "clear_result_cache",
+                error_kind = "local_storage",
+                error_code = "result_cache_clear_failed",
+                error_message = %error,
+                retryable = false,
+                outcome = "cached_results_retained",
+                task_id = ?cache.task_id,
+                upload_id = ?cache.upload_id,
+                next_batch_index = cache.next_batch_index,
+                observation_count = cache.observations.len(),
+                "failed to discard cached results after lease loss"
+            );
         }
         active_task.clear().await;
     } else {
         match flush(uploader, config.scanner_id, cache).await {
             Ok(()) if !cache.has_pending_task() => active_task.clear().await,
             Ok(()) => {}
-            Err(error) => tracing::error!("final scan-loop upload failed: {}", error),
+            Err(error) => log_flush_failure(
+                "FinalScanLoopUploadFailed",
+                "batch_retained_on_disk",
+                &error,
+                cache,
+            ),
         }
     }
 }
@@ -1666,9 +2050,18 @@ async fn report_task_status_with_retry(
                     delay = delay.min(remaining);
                 }
                 tracing::warn!(
+                    event = "TaskStatusReportRetry",
+                    operation = error.operation(),
+                    reason = %error,
+                    error_kind = error.kind(),
+                    error_code = error.code(),
+                    retryable = true,
+                    outcome = "task_status_pending",
+                    http_status = ?error.status(),
+                    server_request_id = ?error.request_id(),
+                    task_id = %task_id,
                     attempt = backoff.failures(),
-                    retry_delay_seconds = delay.as_secs_f64(),
-                    error = %error,
+                    retry_after_ms = delay.as_millis() as u64,
                     "task status report failed; retrying"
                 );
                 if sleep_or_stop(delay).await {
@@ -1679,9 +2072,17 @@ async fn report_task_status_with_retry(
                 active_task.request_lease_lost(task_id).await;
                 return false;
             }
-            Err(ScannerError::Server(error)) if stop_for_server_error(&error) => return false,
+            Err(ScannerError::Server(error)) if stop_for_server_error(&error, Some(task_id)) => {
+                return false;
+            }
             Err(error) => {
-                tracing::error!(%error, "non-retryable task status report failure");
+                log_terminal_scanner_error(
+                    "TaskStatusReportFailed",
+                    "report_task_status",
+                    &error,
+                    "process_stopping",
+                    Some(task_id),
+                );
                 request_stop();
                 return false;
             }
@@ -1696,22 +2097,39 @@ fn is_stale_task_error(error: &ServerError) -> bool {
     )
 }
 
-fn stop_for_server_error(error: &ServerError) -> bool {
+fn stop_for_server_error(error: &ServerError, task_id: Option<Uuid>) -> bool {
     match error {
         ServerError::AuthRejected { .. } => {
-            log_event!(LogLevel::Error, "AUTH", "runtime token rejected", "main");
-            tracing::error!(%error, "register the scanner again");
+            tracing::error!(
+                event = "ServerAuthenticationRejected",
+                operation = error.operation(),
+                error_kind = error.kind(),
+                error_code = error.code(),
+                error_message = %error,
+                retryable = false,
+                outcome = "process_stopping",
+                task_id = ?task_id,
+                http_status = ?error.status(),
+                server_request_id = ?error.request_id(),
+                "runtime token rejected; register the scanner again"
+            );
             request_stop();
             true
         }
         ServerError::PolicyBlocked { .. } => {
-            log_event!(
-                LogLevel::Error,
-                "SERVER-POLICY",
-                "request forbidden",
-                "main"
+            tracing::error!(
+                event = "ServerPolicyBlocked",
+                operation = error.operation(),
+                error_kind = error.kind(),
+                error_code = error.code(),
+                error_message = %error,
+                retryable = false,
+                outcome = "process_stopping",
+                task_id = ?task_id,
+                http_status = ?error.status(),
+                server_request_id = ?error.request_id(),
+                "request blocked by server policy"
             );
-            tracing::error!(%error, "request blocked by server policy");
             request_stop();
             true
         }

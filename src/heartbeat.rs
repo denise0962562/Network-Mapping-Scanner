@@ -134,7 +134,17 @@ impl ActiveTask {
     pub(crate) async fn request_lease_lost(&self, task_id: Uuid) {
         if self.get().await == Some(task_id) {
             self.request_cancellation(TaskCancellationReason::LeaseLost);
-            tracing::error!(%task_id, "active task lease was lost");
+            tracing::error!(
+                event = "ActiveTaskLeaseLost",
+                operation = "renew_task_lease",
+                error_kind = "lease",
+                error_code = "task_lease_lost",
+                error_message = "active task lease expired before renewal",
+                retryable = false,
+                outcome = "task_cancellation_requested",
+                %task_id,
+                "active task lease was lost"
+            );
         }
     }
 

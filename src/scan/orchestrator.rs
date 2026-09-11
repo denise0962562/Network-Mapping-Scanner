@@ -50,7 +50,16 @@ pub(crate) async fn run_scan(
                 };
                 ports.clear();
                 for port_target in port_targets {
-                    match masscan::run(config.scanner_path, &port_target, cancel_requested).await? {
+                    match masscan::run(config.scanner_path, &port_target, cancel_requested)
+                        .await
+                        .map_err(|source| {
+                            ScannerError::engine_stage(
+                                "masscan",
+                                "port_discovery",
+                                "port_discovery_failed",
+                                source,
+                            )
+                        })? {
                         masscan::EngineOutcome::Completed(results) => ports.extend(results),
                         masscan::EngineOutcome::Cancelled => return Ok(ScanOutcome::Cancelled),
                     }
@@ -84,9 +93,26 @@ pub(crate) async fn run_scan(
                 {
                     Ok(zgrab2::EngineOutcome::Completed(enrichment)) => services = enrichment,
                     Ok(zgrab2::EngineOutcome::Cancelled) => return Ok(ScanOutcome::Cancelled),
-                    Err(error) if required => return Err(error),
+                    Err(error) if required => {
+                        return Err(ScannerError::engine_stage(
+                            "zgrab2",
+                            "service_detection",
+                            "service_detection_failed",
+                            error,
+                        ));
+                    }
                     Err(error) => {
-                        tracing::warn!(%error, "optional service detection stage failed; preserving port results");
+                        tracing::warn!(
+                            event = "OptionalServiceDetectionFailed",
+                            operation = "run_service_detection",
+                            reason = %error,
+                            error_code = "optional_service_detection_failed",
+                            outcome = "port_results_preserved",
+                            engine = "zgrab2",
+                            stage = "service_detection",
+                            port_count = ports.len(),
+                            "optional service detection stage failed; preserving port results"
+                        );
                     }
                 }
             }
@@ -96,7 +122,11 @@ pub(crate) async fn run_scan(
                 ));
             }
             ScanStageKind::DnsLookup => {
-                match dns::run(config.dns, target, config.dns_resolvers, cancel_requested).await? {
+                match dns::run(config.dns, target, config.dns_resolvers, cancel_requested)
+                    .await
+                    .map_err(|source| {
+                        ScannerError::engine_stage("dns", "dns_lookup", "dns_lookup_failed", source)
+                    })? {
                     Some(results) => {
                         dns_observations = results.observations;
                         resolved_ips = results.resolved_ips;
@@ -111,7 +141,16 @@ pub(crate) async fn run_scan(
                 ));
             }
             ScanStageKind::VulnerabilityDetection => {
-                match nuclei::run(config.nuclei, &ports, &services, cancel_requested).await? {
+                match nuclei::run(config.nuclei, &ports, &services, cancel_requested)
+                    .await
+                    .map_err(|source| {
+                        ScannerError::engine_stage(
+                            "nuclei",
+                            "vulnerability_detection",
+                            "vulnerability_detection_failed",
+                            source,
+                        )
+                    })? {
                     nuclei::EngineOutcome::Completed(results) => vulnerabilities = results,
                     nuclei::EngineOutcome::Cancelled => return Ok(ScanOutcome::Cancelled),
                 }
