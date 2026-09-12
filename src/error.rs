@@ -231,6 +231,21 @@ pub(crate) struct UploadBatchContext {
     pub(crate) observation_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScanFailureDiagnostics {
+    pub(crate) error_kind: &'static str,
+    pub(crate) error_code: &'static str,
+    pub(crate) engine: Option<&'static str>,
+    pub(crate) stage: Option<&'static str>,
+    pub(crate) process_id: Option<u32>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) elapsed_ms: Option<u64>,
+    pub(crate) result_count: Option<usize>,
+    pub(crate) invalid_line_count: Option<usize>,
+    pub(crate) stderr_bytes: Option<usize>,
+    pub(crate) stderr_truncated: Option<bool>,
+}
+
 #[derive(Error, Debug)]
 pub(crate) enum ScannerError {
     #[error("{0}")]
@@ -269,6 +284,21 @@ pub(crate) enum ScannerError {
     #[error("{0}")]
     Scan(String),
 
+    #[error("{engine} {stage} failed: {detail}")]
+    ExternalProcess {
+        engine: &'static str,
+        stage: &'static str,
+        code: &'static str,
+        detail: String,
+        process_id: Option<u32>,
+        exit_code: Option<i32>,
+        elapsed_ms: u64,
+        result_count: usize,
+        invalid_line_count: usize,
+        stderr_bytes: usize,
+        stderr_truncated: bool,
+    },
+
     #[error("{engine} {stage} failed: {source}")]
     EngineStage {
         engine: &'static str,
@@ -283,6 +313,35 @@ pub(crate) enum ScannerError {
 }
 
 impl ScannerError {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn external_process(
+        engine: &'static str,
+        stage: &'static str,
+        code: &'static str,
+        detail: String,
+        process_id: Option<u32>,
+        exit_code: Option<i32>,
+        elapsed_ms: u64,
+        result_count: usize,
+        invalid_line_count: usize,
+        stderr_bytes: usize,
+        stderr_truncated: bool,
+    ) -> Self {
+        Self::ExternalProcess {
+            engine,
+            stage,
+            code,
+            detail,
+            process_id,
+            exit_code,
+            elapsed_ms,
+            result_count,
+            invalid_line_count,
+            stderr_bytes,
+            stderr_truncated,
+        }
+    }
+
     pub(crate) fn engine_stage(
         engine: &'static str,
         stage: &'static str,
@@ -297,22 +356,65 @@ impl ScannerError {
         }
     }
 
-    pub(crate) fn scan_diagnostics(
-        &self,
-    ) -> (
-        &'static str,
-        &'static str,
-        Option<&'static str>,
-        Option<&'static str>,
-    ) {
+    pub(crate) fn scan_diagnostics(&self) -> ScanFailureDiagnostics {
         match self {
+            Self::ExternalProcess {
+                engine,
+                stage,
+                code,
+                process_id,
+                exit_code,
+                elapsed_ms,
+                result_count,
+                invalid_line_count,
+                stderr_bytes,
+                stderr_truncated,
+                ..
+            } => ScanFailureDiagnostics {
+                error_kind: "external_process",
+                error_code: code,
+                engine: Some(engine),
+                stage: Some(stage),
+                process_id: *process_id,
+                exit_code: *exit_code,
+                elapsed_ms: Some(*elapsed_ms),
+                result_count: Some(*result_count),
+                invalid_line_count: Some(*invalid_line_count),
+                stderr_bytes: Some(*stderr_bytes),
+                stderr_truncated: Some(*stderr_truncated),
+            },
             Self::EngineStage {
                 engine,
                 stage,
                 code,
-                ..
-            } => ("scan_engine", code, Some(engine), Some(stage)),
-            _ => ("scan", "scan_plan_failed", None, None),
+                source,
+            } => {
+                let source_diagnostics = source.scan_diagnostics();
+                if source_diagnostics.engine.is_some() {
+                    source_diagnostics
+                } else {
+                    ScanFailureDiagnostics {
+                        error_kind: "scan_engine",
+                        error_code: code,
+                        engine: Some(engine),
+                        stage: Some(stage),
+                        ..source_diagnostics
+                    }
+                }
+            }
+            _ => ScanFailureDiagnostics {
+                error_kind: "scan",
+                error_code: "scan_plan_failed",
+                engine: None,
+                stage: None,
+                process_id: None,
+                exit_code: None,
+                elapsed_ms: None,
+                result_count: None,
+                invalid_line_count: None,
+                stderr_bytes: None,
+                stderr_truncated: None,
+            },
         }
     }
 }
@@ -377,14 +479,40 @@ mod tests {
             ScannerError::Scan("process exited unsuccessfully".into()),
         );
 
-        assert_eq!(
-            error.scan_diagnostics(),
-            (
-                "scan_engine",
-                "vulnerability_detection_failed",
-                Some("nuclei"),
-                Some("vulnerability_detection"),
-            )
+        let diagnostics = error.scan_diagnostics();
+        assert_eq!(diagnostics.error_kind, "scan_engine");
+        assert_eq!(diagnostics.error_code, "vulnerability_detection_failed");
+        assert_eq!(diagnostics.engine, Some("nuclei"));
+        assert_eq!(diagnostics.stage, Some("vulnerability_detection"));
+    }
+
+    #[test]
+    fn external_process_error_preserves_bounded_failure_metadata() {
+        let error = ScannerError::external_process(
+            "masscan",
+            "process_exit",
+            "masscan_nonzero_exit",
+            "permission denied".into(),
+            Some(42),
+            Some(1),
+            250,
+            17,
+            2,
+            4_096,
+            true,
         );
+
+        let diagnostics = error.scan_diagnostics();
+        assert_eq!(diagnostics.error_kind, "external_process");
+        assert_eq!(diagnostics.error_code, "masscan_nonzero_exit");
+        assert_eq!(diagnostics.engine, Some("masscan"));
+        assert_eq!(diagnostics.stage, Some("process_exit"));
+        assert_eq!(diagnostics.process_id, Some(42));
+        assert_eq!(diagnostics.exit_code, Some(1));
+        assert_eq!(diagnostics.elapsed_ms, Some(250));
+        assert_eq!(diagnostics.result_count, Some(17));
+        assert_eq!(diagnostics.invalid_line_count, Some(2));
+        assert_eq!(diagnostics.stderr_bytes, Some(4_096));
+        assert_eq!(diagnostics.stderr_truncated, Some(true));
     }
 }

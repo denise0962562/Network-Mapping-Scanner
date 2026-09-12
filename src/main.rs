@@ -484,7 +484,14 @@ async fn run() -> Result<(), ScannerError> {
         ),
     }
     if let Err(error) = heartbeat_client.send(active_task.get().await, true).await {
-        tracing::warn!("final heartbeat failed: {}", error);
+        tracing::warn!(
+            event = "FinalHeartbeatFailed",
+            operation = "send_final_heartbeat",
+            reason = %error,
+            retryable = false,
+            outcome = "shutdown_continued",
+            "final heartbeat failed"
+        );
     }
     heartbeat_handle.abort();
     stop_bridge_handle.abort();
@@ -766,9 +773,18 @@ fn spawn_heartbeat(
                         delay = delay.min(remaining);
                     }
                     tracing::warn!(
+                        event = "HeartbeatRetry",
+                        operation = error.operation(),
+                        reason = %error,
+                        error_kind = error.kind(),
+                        error_code = error.code(),
+                        retryable = true,
+                        outcome = "reconnecting",
+                        http_status = ?error.status(),
+                        server_request_id = ?error.request_id(),
+                        task_id = ?active_task_id,
                         attempt = backoff.failures(),
-                        retry_delay_seconds = delay.as_secs_f64(),
-                        error = %error,
+                        retry_after_ms = delay.as_millis() as u64,
                         "heartbeat failed; reconnecting"
                     );
                     if sleep_or_stop(delay).await {
@@ -875,8 +891,12 @@ async fn wait_for_maintenance_exit(
             }
             Err(error) => {
                 tracing::warn!(
-                    %error,
-                    retry_delay_seconds = delay.as_secs(),
+                    event = "MaintenanceProbeRetry",
+                    operation = "poll_maintenance_status",
+                    reason = %error,
+                    retryable = true,
+                    outcome = "maintenance_sleep_continued",
+                    retry_after_ms = delay.as_millis() as u64,
                     "maintenance probe failed; remaining asleep"
                 );
             }
@@ -1190,15 +1210,26 @@ async fn scan_loop(
                     }
                     Ok(FetchTaskOutcome::RecoveryRequired) => {
                         tracing::warn!(
+                            event = "PendingUploadRecoveryRedirected",
+                            operation = "recover_pending_upload",
+                            reason = "server_requires_recovery",
+                            outcome = "recovery_retried",
                             task_id = %cached_task_id,
+                            upload_id = ?cache.upload_id,
                             "upload recovery was redirected; retrying recovery"
                         );
                         continue;
                     }
                     Err(ServerError::Maintenance { info, .. }) => {
                         tracing::warn!(
+                            event = "PendingUploadRecoveryPaused",
+                            operation = "recover_pending_upload",
+                            reason = "system_maintenance",
+                            outcome = "recovery_delayed",
                             task_id = %cached_task_id,
-                            retry_delay_seconds = info.retry_delay().as_secs(),
+                            upload_id = ?cache.upload_id,
+                            maintenance_id = ?info.id,
+                            retry_after_ms = info.retry_delay().as_millis() as u64,
                             "pending upload recovery paused for maintenance"
                         );
                         if sleep_or_stop(info.retry_delay()).await {
@@ -1209,10 +1240,19 @@ async fn scan_loop(
                     Err(error) if error.is_retryable() => {
                         let delay = fetch_backoff.next_delay(None, error.retry_after());
                         tracing::warn!(
+                            event = "PendingUploadRecoveryRetry",
+                            operation = error.operation(),
+                            reason = %error,
+                            error_kind = error.kind(),
+                            error_code = error.code(),
+                            retryable = true,
+                            outcome = "recovery_pending",
+                            http_status = ?error.status(),
+                            server_request_id = ?error.request_id(),
                             task_id = %cached_task_id,
+                            upload_id = ?cache.upload_id,
                             attempt = fetch_backoff.failures(),
-                            retry_delay_seconds = delay.as_secs_f64(),
-                            error = %error,
+                            retry_after_ms = delay.as_millis() as u64,
                             "pending upload recovery failed"
                         );
                         if sleep_or_stop(delay).await {
@@ -1496,14 +1536,24 @@ async fn scan_loop(
                 None
             }
             Ok(FetchTaskOutcome::RecoveryRequired) => {
-                tracing::warn!("task recovery requested another recovery pass");
+                tracing::warn!(
+                    event = "TaskRecoveryRedirected",
+                    operation = "recover_task",
+                    reason = "server_requires_recovery",
+                    outcome = "recovery_retried",
+                    "task recovery requested another recovery pass"
+                );
                 continue;
             }
             Err(ServerError::Maintenance { info, .. }) => {
                 tracing::warn!(
+                    event = "TaskRecoveryPaused",
+                    operation = "recover_task",
+                    reason = "system_maintenance",
+                    outcome = "recovery_delayed",
+                    maintenance_id = ?info.id,
                     phase = %info.phase,
-                    message = %info.message,
-                    retry_delay_seconds = info.retry_delay().as_secs(),
+                    retry_after_ms = info.retry_delay().as_millis() as u64,
                     "task recovery paused for maintenance"
                 );
                 if sleep_or_stop(info.retry_delay()).await {
@@ -1514,9 +1564,17 @@ async fn scan_loop(
             Err(error) if error.is_retryable() => {
                 let delay = fetch_backoff.next_delay(None, error.retry_after());
                 tracing::warn!(
+                    event = "TaskRecoveryRetry",
+                    operation = error.operation(),
+                    reason = %error,
+                    error_kind = error.kind(),
+                    error_code = error.code(),
+                    retryable = true,
+                    outcome = "recovery_pending",
+                    http_status = ?error.status(),
+                    server_request_id = ?error.request_id(),
                     attempt = fetch_backoff.failures(),
-                    retry_delay_seconds = delay.as_secs_f64(),
-                    error = %error,
+                    retry_after_ms = delay.as_millis() as u64,
                     "recover task failed"
                 );
                 if sleep_or_stop(delay).await {
@@ -1572,9 +1630,13 @@ async fn scan_loop(
                 }
                 Err(ServerError::Maintenance { info, .. }) => {
                     tracing::warn!(
+                        event = "TaskAssignmentPaused",
+                        operation = "fetch_task",
+                        reason = "system_maintenance",
+                        outcome = "task_claim_delayed",
+                        maintenance_id = ?info.id,
                         phase = %info.phase,
-                        message = %info.message,
-                        retry_delay_seconds = info.retry_delay().as_secs(),
+                        retry_after_ms = info.retry_delay().as_millis() as u64,
                         "task assignment paused for maintenance"
                     );
                     if sleep_or_stop(info.retry_delay()).await {
@@ -1585,9 +1647,17 @@ async fn scan_loop(
                 Err(error) if error.is_retryable() => {
                     let delay = fetch_backoff.next_delay(None, error.retry_after());
                     tracing::warn!(
+                        event = "TaskFetchRetry",
+                        operation = error.operation(),
+                        reason = %error,
+                        error_kind = error.kind(),
+                        error_code = error.code(),
+                        retryable = true,
+                        outcome = "task_claim_pending",
+                        http_status = ?error.status(),
+                        server_request_id = ?error.request_id(),
                         attempt = fetch_backoff.failures(),
-                        retry_delay_seconds = delay.as_secs_f64(),
-                        error = %error,
+                        retry_after_ms = delay.as_millis() as u64,
                         "fetch task failed"
                     );
                     if sleep_or_stop(delay).await {
@@ -1655,6 +1725,10 @@ async fn scan_loop(
                 assigned_task.address_family
             );
             tracing::warn!(
+                event = "ScanTaskRejected",
+                operation = "validate_task_network_capability",
+                reason = "address_family_unavailable",
+                outcome = "task_failure_reported",
                 task_id = %assigned_task.task_id,
                 address_family = %assigned_task.address_family,
                 "rejecting incompatible scan task"
@@ -1779,17 +1853,24 @@ async fn scan_loop(
                 Some(TaskCancellationReason::Shutdown) | None => return,
             },
             Err(e) => {
-                let (error_kind, error_code, engine, stage) = e.scan_diagnostics();
+                let diagnostics = e.scan_diagnostics();
                 tracing::error!(
                     event = "ScanTaskFailed",
                     operation = "execute_scan_plan",
-                    error_kind,
-                    error_code,
+                    error_kind = diagnostics.error_kind,
+                    error_code = diagnostics.error_code,
                     error_message = %e,
                     retryable = false,
                     outcome = "task_failed",
-                    engine = ?engine,
-                    stage = ?stage,
+                    engine = ?diagnostics.engine,
+                    stage = ?diagnostics.stage,
+                    process_id = ?diagnostics.process_id,
+                    exit_code = ?diagnostics.exit_code,
+                    process_elapsed_ms = ?diagnostics.elapsed_ms,
+                    result_count = ?diagnostics.result_count,
+                    invalid_line_count = ?diagnostics.invalid_line_count,
+                    stderr_bytes = ?diagnostics.stderr_bytes,
+                    stderr_truncated = ?diagnostics.stderr_truncated,
                     task_id = %assigned_task.task_id,
                     scan_profile = %scan_plan.profile,
                     address_family = %target.address_family,
@@ -1964,7 +2045,14 @@ async fn apply_runtime_configuration(
     match runtime_configuration.apply_pending().await {
         Ok(Some(configuration)) => {
             if let Err(error) = cache.save_runtime_configuration(&configuration) {
-                tracing::warn!(%error, revision = configuration.revision, "runtime configuration applied but could not be cached");
+                tracing::warn!(
+                    event = "RuntimeConfigurationCacheFailed",
+                    operation = "cache_runtime_configuration",
+                    reason = %error,
+                    outcome = "runtime_configuration_active_memory_only",
+                    revision = configuration.revision,
+                    "runtime configuration applied but could not be cached"
+                );
             }
             tracing::info!(
                 revision = configuration.revision,
@@ -1972,7 +2060,13 @@ async fn apply_runtime_configuration(
             );
         }
         Ok(None) => {}
-        Err(error) => tracing::warn!(%error, "rejected staged runtime configuration"),
+        Err(error) => tracing::warn!(
+            event = "RuntimeConfigurationRejected",
+            operation = "apply_runtime_configuration",
+            reason = %error,
+            outcome = "previous_configuration_retained",
+            "rejected staged runtime configuration"
+        ),
     }
 }
 
@@ -2029,8 +2123,13 @@ async fn report_task_status_with_retry(
             Err(ScannerError::Server(ServerError::Maintenance { info, .. })) => {
                 renew_maintenance_hold(active_task, &info).await;
                 tracing::warn!(
+                    event = "TaskStatusReportPaused",
+                    operation = "report_task_status",
+                    reason = "system_maintenance",
+                    outcome = "task_status_pending",
                     task_id = %task_id,
-                    retry_delay_seconds = info.retry_delay().as_secs(),
+                    maintenance_id = ?info.id,
+                    retry_after_ms = info.retry_delay().as_millis() as u64,
                     "task status report paused for maintenance"
                 );
                 if sleep_or_stop(info.retry_delay()).await {
