@@ -1,6 +1,7 @@
 use crate::error::ScannerError;
 use crate::scan::ScanObservation;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -31,6 +32,14 @@ pub(crate) struct StoredRuntimeConfiguration {
 
 pub(crate) struct StateStore {
     connection: Connection,
+    _lock: File,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CacheSummary {
+    pub(crate) pending_tasks: u64,
+    pub(crate) observations: u64,
+    pub(crate) runtime_configurations: u64,
 }
 
 impl StateStore {
@@ -38,6 +47,22 @@ impl StateStore {
         if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(ScannerError::Io)?;
         }
+
+        let lock_path = path.with_extension("sqlite3.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(ScannerError::Io)?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|error| {
+            ScannerError::Config(format!(
+                "scanner state is already in use ({}): {error}",
+                lock_path.display()
+            ))
+        })?;
+        set_private_permissions(&lock_path)?;
 
         let mut connection = Connection::open(&path)?;
         set_private_permissions(&path)?;
@@ -48,7 +73,68 @@ impl StateStore {
         migrate(&mut connection)?;
 
         tracing::debug!(database_path = %path.display(), "SQLite state database opened");
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            _lock: lock,
+        })
+    }
+
+    pub(crate) fn cache_summary(
+        &self,
+        server_origin: Option<&str>,
+    ) -> Result<CacheSummary, ScannerError> {
+        let (pending_tasks, observations, runtime_configurations): (i64, i64, i64) =
+            match server_origin {
+                Some(origin) => self.connection.query_row(
+                    "SELECT (SELECT COUNT(*) FROM pending_upload WHERE server_origin=?1), \
+                            (SELECT COUNT(*) FROM observation WHERE server_origin=?1), \
+                            (SELECT COUNT(*) FROM runtime_configuration WHERE server_origin=?1)",
+                    [origin],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?,
+                None => self.connection.query_row(
+                    "SELECT (SELECT COUNT(*) FROM pending_upload), \
+                            (SELECT COUNT(*) FROM observation), \
+                            (SELECT COUNT(*) FROM runtime_configuration)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?,
+            };
+        Ok(CacheSummary {
+            pending_tasks: pending_tasks.try_into().unwrap_or_default(),
+            observations: observations.try_into().unwrap_or_default(),
+            runtime_configurations: runtime_configurations.try_into().unwrap_or_default(),
+        })
+    }
+
+    pub(crate) fn clear_cache(
+        &mut self,
+        server_origin: Option<&str>,
+        include_runtime_configuration: bool,
+    ) -> Result<(), ScannerError> {
+        let transaction = self.connection.transaction()?;
+        match server_origin {
+            Some(origin) => {
+                transaction.execute(
+                    "DELETE FROM pending_upload WHERE server_origin=?1",
+                    [origin],
+                )?;
+                if include_runtime_configuration {
+                    transaction.execute(
+                        "DELETE FROM runtime_configuration WHERE server_origin=?1",
+                        [origin],
+                    )?;
+                }
+            }
+            None => {
+                transaction.execute("DELETE FROM pending_upload", [])?;
+                if include_runtime_configuration {
+                    transaction.execute("DELETE FROM runtime_configuration", [])?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub(crate) fn load_identity(
@@ -513,6 +599,64 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("belongs to scanner"));
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cache_clear_preserves_identity_and_optionally_runtime_configuration() {
+        let path = database_path();
+        let mut store = StateStore::open(path.clone()).unwrap();
+        let origin = "https://scanner.example:443";
+        let identity = StoredIdentity {
+            scanner_id: Uuid::now_v7().to_string(),
+            runtime_token: "secret".into(),
+        };
+        store.save_identity(origin, &identity).unwrap();
+        store
+            .begin_upload(
+                origin,
+                &identity.scanner_id,
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                &[observation(443)],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO runtime_configuration(server_origin,revision,schema_version,document_json,updated_at) VALUES(?1,1,1,'{}',unixepoch())",
+                [origin],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.cache_summary(Some(origin)).unwrap(),
+            CacheSummary {
+                pending_tasks: 1,
+                observations: 1,
+                runtime_configurations: 1,
+            }
+        );
+        store.clear_cache(Some(origin), false).unwrap();
+        assert_eq!(store.load_identity(origin).unwrap(), Some(identity.clone()));
+        assert_eq!(
+            store.cache_summary(Some(origin)).unwrap(),
+            CacheSummary {
+                pending_tasks: 0,
+                observations: 0,
+                runtime_configurations: 1,
+            }
+        );
+        store.clear_cache(Some(origin), true).unwrap();
+        assert_eq!(store.load_identity(origin).unwrap(), Some(identity));
+        assert_eq!(
+            store
+                .cache_summary(Some(origin))
+                .unwrap()
+                .runtime_configurations,
+            0
+        );
         drop(store);
         std::fs::remove_file(path).unwrap();
     }

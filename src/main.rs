@@ -33,7 +33,8 @@ use crate::storage::{StateStore, StoredIdentity};
 use crate::sysinfo::SystemInfo;
 use crate::types::{CacheManager, TargetParams};
 use crate::upload::Uploader;
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +52,10 @@ use uuid::Uuid;
     about = "Network port scanner orchestrator"
 )]
 struct Cli {
+    /// Run a maintenance command instead of starting the scan loop
+    #[command(subcommand)]
+    command: Option<ScannerCommand>,
+
     /// Run health-check only (no scanning)
     #[arg(short = 'c', long)]
     health_check: bool,
@@ -87,6 +92,34 @@ struct Cli {
     /// SQLite database for scanner identity and durable upload state
     #[arg(long, default_value = "./scanner-state.sqlite3")]
     database: PathBuf,
+}
+
+#[derive(Subcommand, Debug)]
+enum ScannerCommand {
+    /// Inspect or clear durable scanner caches
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheCommand {
+    /// Clear pending scan results and task/upload progress
+    Clear {
+        /// Clear cached results for every server origin in the state database
+        #[arg(long)]
+        all_origins: bool,
+        /// Also clear cached runtime configuration (scanner identity is always preserved)
+        #[arg(long)]
+        include_runtime_config: bool,
+        /// Show what would be removed without changing files
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 // ---- globals ------------------------------------------------------------
@@ -129,6 +162,14 @@ async fn main() {
 
 async fn run() -> Result<(), ScannerError> {
     let cli = Cli::parse();
+    if cli.command.is_some()
+        && (cli.health_check || cli.get_system_info || cli.id.is_some() || cli.token.is_some())
+    {
+        return Err(ScannerError::Config(
+            "cache commands cannot be combined with health, system-info, or registration options"
+                .into(),
+        ));
+    }
     init_shutdown();
 
     let logging_guard = init_logging(cli.debug, &cli.log_directory)?;
@@ -172,7 +213,11 @@ async fn run() -> Result<(), ScannerError> {
     tracing::debug!(config_path = %cli.config, "configuration loaded and validated");
 
     let server_origin = loaded.app.scanner.server_origin();
-    let state_store = StateStore::open(cli.database.clone())?;
+    let mut state_store = StateStore::open(cli.database.clone())?;
+    if let Some(command) = cli.command.as_ref() {
+        execute_maintenance_command(command, &mut state_store, &server_origin, &cli.state_file)?;
+        return Ok(());
+    }
     let legacy_identity_present = loaded.has_legacy_runtime_token();
     let legacy_secret_present = loaded.has_legacy_secret();
     if let Some(identity) = state_store.load_identity(&server_origin)? {
@@ -500,6 +545,98 @@ async fn run() -> Result<(), ScannerError> {
     log_event!(LogLevel::Info, "CLEANUP", "shutdown complete", "main");
     println!("shutdown complete");
     Ok(())
+}
+
+fn execute_maintenance_command(
+    command: &ScannerCommand,
+    store: &mut StateStore,
+    server_origin: &str,
+    legacy_state_file: &std::path::Path,
+) -> Result<(), ScannerError> {
+    match command {
+        ScannerCommand::Cache {
+            command:
+                CacheCommand::Clear {
+                    all_origins,
+                    include_runtime_config,
+                    dry_run,
+                    yes,
+                },
+        } => {
+            let origin = (!all_origins).then_some(server_origin);
+            let summary = store.cache_summary(origin)?;
+            let legacy_present = legacy_state_file.exists();
+            println!("Scanner cache clear summary");
+            println!(
+                "  scope                 : {}",
+                origin.unwrap_or("all origins")
+            );
+            println!("  pending tasks         : {}", summary.pending_tasks);
+            println!("  cached observations   : {}", summary.observations);
+            println!(
+                "  runtime configurations: {} ({})",
+                summary.runtime_configurations,
+                if *include_runtime_config {
+                    "clear"
+                } else {
+                    "preserve"
+                }
+            );
+            println!(
+                "  legacy JSON state     : {}",
+                if legacy_present {
+                    legacy_state_file.display().to_string()
+                } else {
+                    "not present".into()
+                }
+            );
+            println!("  scanner identity      : preserved");
+            if *dry_run {
+                println!("dry-run: no cache was changed");
+                return Ok(());
+            }
+            if !*yes {
+                if !io::stdin().is_terminal() {
+                    return Err(ScannerError::Config(
+                        "non-interactive cache clear requires --yes".into(),
+                    ));
+                }
+                eprint!("Permanently discard these unuploaded results? [y/N] ");
+                io::stderr().flush().map_err(ScannerError::Io)?;
+                let mut answer = String::new();
+                io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(ScannerError::Io)?;
+                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    return Err(ScannerError::Config("cache clear cancelled".into()));
+                }
+            }
+            let staged_legacy = if legacy_present {
+                let staged = legacy_state_file.with_extension("json.clearing");
+                if staged.exists() {
+                    return Err(ScannerError::Config(format!(
+                        "cannot stage legacy state because {} already exists",
+                        staged.display()
+                    )));
+                }
+                std::fs::rename(legacy_state_file, &staged).map_err(ScannerError::Io)?;
+                Some(staged)
+            } else {
+                None
+            };
+            if let Err(error) = store.clear_cache(origin, *include_runtime_config) {
+                if let Some(staged) = staged_legacy.as_ref() {
+                    let _ = std::fs::rename(staged, legacy_state_file);
+                }
+                return Err(error);
+            }
+            if let Some(staged) = staged_legacy {
+                std::fs::remove_file(staged).map_err(ScannerError::Io)?;
+            }
+            println!("cache cleared; scanner identity was preserved");
+            Ok(())
+        }
+    }
 }
 
 // ---- identity management ------------------------------------------------
@@ -1170,7 +1307,11 @@ async fn scan_loop(
                     );
                     break;
                 };
-                let recovery_url = format!("{}&taskid={cached_task_id}", config.current_task_url);
+                let recovery_url = pending_upload_recovery_url(
+                    config.current_task_url,
+                    cached_task_id,
+                    cache.upload_id,
+                );
                 match recover_task(config.server_client, &recovery_url).await {
                     Ok(FetchTaskOutcome::Task(task)) if task.task_id == cached_task_id => {
                         fetch_backoff.reset();
@@ -2038,6 +2179,40 @@ async fn scan_loop(
     }
 }
 
+fn pending_upload_recovery_url(
+    current_task_url: &str,
+    task_id: Uuid,
+    upload_id: Option<Uuid>,
+) -> String {
+    match upload_id {
+        Some(upload_id) => {
+            format!("{current_task_url}&taskid={task_id}&uploadid={upload_id}")
+        }
+        None => format!("{current_task_url}&taskid={task_id}"),
+    }
+}
+
+#[cfg(test)]
+mod recovery_url_tests {
+    use super::pending_upload_recovery_url;
+    use uuid::Uuid;
+
+    #[test]
+    fn durable_upload_recovery_includes_both_identities() {
+        let task_id = Uuid::parse_str("019c0000-0000-7000-8000-000000000001").unwrap();
+        let upload_id = Uuid::parse_str("019c0000-0000-7000-8000-000000000002").unwrap();
+
+        assert_eq!(
+            pending_upload_recovery_url(
+                "https://scanner.example/api/task/current?scannerid=scanner",
+                task_id,
+                Some(upload_id),
+            ),
+            "https://scanner.example/api/task/current?scannerid=scanner&taskid=019c0000-0000-7000-8000-000000000001&uploadid=019c0000-0000-7000-8000-000000000002"
+        );
+    }
+}
+
 async fn apply_runtime_configuration(
     runtime_configuration: &RuntimeConfiguration,
     cache: &CacheManager,
@@ -2233,5 +2408,46 @@ fn stop_for_server_error(error: &ServerError, task_id: Option<Uuid>) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod cli_command_tests {
+    use clap::Parser;
+
+    use super::{CacheCommand, Cli, ScannerCommand};
+
+    #[test]
+    fn no_subcommand_keeps_scan_loop_mode() {
+        assert!(
+            Cli::try_parse_from(["scanner-rs"])
+                .unwrap()
+                .command
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parses_cache_clear_safety_options() {
+        let cli = Cli::try_parse_from([
+            "scanner-rs",
+            "cache",
+            "clear",
+            "--all-origins",
+            "--include-runtime-config",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(ScannerCommand::Cache {
+                command: CacheCommand::Clear {
+                    all_origins: true,
+                    include_runtime_config: true,
+                    yes: true,
+                    ..
+                }
+            })
+        ));
     }
 }

@@ -112,6 +112,9 @@ cargo run -- --config config.toml --log-directory /var/log/network-mapping-scann
 
 相对日志目录以启动扫描器时的当前工作目录为基准。程序退出时会刷新尚未写入磁盘的日志。
 
+如需在扫描器停止后丢弃尚未上传的任务 ID、批次进度和本地扫描结果，使用 `cache clear`
+维护命令；身份凭据默认保留。完整说明参见[扫描缓存管理](docs/CACHE_MANAGEMENT.md)。
+
 ## 服务端自动重连
 
 扫描器启动后会先通过心跳确认服务端可用，再开始领取任务。DNS、建连、请求超时、HTTP
