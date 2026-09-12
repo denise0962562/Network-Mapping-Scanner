@@ -17,6 +17,13 @@ use uuid::Uuid;
 const MAX_ZGRAB_STDERR_CHARS: usize = 4096;
 const MAX_BANNER_CHARS: usize = 1024;
 
+#[derive(Default)]
+struct StderrCapture {
+    text: String,
+    bytes: usize,
+    truncated: bool,
+}
+
 pub(crate) enum EngineOutcome {
     Completed(Vec<ServiceObservation>),
     Cancelled,
@@ -173,6 +180,7 @@ async fn run_attempts(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|error| ScannerError::Scan(format!("failed to spawn zgrab2: {error}")))?;
+    let process_id = child.id();
 
     let mut stdin = child
         .stdin
@@ -216,7 +224,18 @@ async fn run_attempts(
             Ok(mut parsed) => results.append(&mut parsed),
             Err(error) => {
                 invalid_lines += 1;
-                tracing::warn!(%error, "ignored invalid zgrab2 JSON output line");
+                if invalid_lines == 1 {
+                    tracing::warn!(
+                        event = "Zgrab2OutputLineIgnored",
+                        operation = "parse_zgrab2_output",
+                        reason = %error,
+                        error_code = "zgrab2_output_invalid",
+                        outcome = "invalid_lines_skipped",
+                        engine = "zgrab2",
+                        invalid_line_count = invalid_lines,
+                        "ignored invalid zgrab2 JSON output line"
+                    );
+                }
             }
         }
     }
@@ -258,14 +277,24 @@ async fn run_attempts(
         "service detection completed"
     );
     if !status.success() {
-        let detail = if stderr_output.trim().is_empty() {
+        let detail = if stderr_output.text.trim().is_empty() {
             "zgrab2 produced no stderr output"
         } else {
-            stderr_output.trim()
+            stderr_output.text.trim()
         };
-        return Err(ScannerError::Scan(format!(
-            "zgrab2 exited with {status}: {detail}"
-        )));
+        return Err(ScannerError::external_process(
+            "zgrab2",
+            "process_exit",
+            "zgrab2_nonzero_exit",
+            format!("zgrab2 exited with {status}: {detail}"),
+            process_id,
+            status.code(),
+            started_at.elapsed().as_millis() as u64,
+            results.len(),
+            invalid_lines,
+            stderr_output.bytes,
+            stderr_output.truncated,
+        ));
     }
 
     Ok(ProcessOutcome::Completed(results))
@@ -450,7 +479,15 @@ impl Drop for TempZgrabConfig {
         if let Err(error) = std::fs::remove_file(&self.path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            tracing::warn!(path = %self.path.display(), %error, "failed to remove temporary zgrab2 config");
+            tracing::warn!(
+                event = "Zgrab2TempConfigCleanupFailed",
+                operation = "remove_zgrab2_temp_config",
+                reason = %error,
+                outcome = "temporary_file_retained",
+                engine = "zgrab2",
+                path = %self.path.display(),
+                "failed to remove temporary zgrab2 config"
+            );
         }
     }
 }
@@ -474,28 +511,49 @@ fn zgrab_config(config: &ServiceDetectionConfig) -> String {
     output
 }
 
-async fn collect_zgrab_stderr(stderr: ChildStderr) -> String {
+async fn collect_zgrab_stderr(stderr: ChildStderr) -> StderrCapture {
     let mut lines = BufReader::new(stderr).lines();
     let mut captured = String::new();
+    let mut captured_chars = 0usize;
+    let mut bytes = 0usize;
+    let mut truncated = false;
     while let Ok(Some(line)) = lines.next_line().await {
-        tracing::debug!(line = %line, "zgrab2 stderr");
-        if captured.len() < MAX_ZGRAB_STDERR_CHARS {
-            if !captured.is_empty() {
+        tracing::debug!(line_bytes = line.len(), "zgrab2 stderr received");
+        bytes = bytes.saturating_add(line.len()).saturating_add(1);
+        if captured_chars < MAX_ZGRAB_STDERR_CHARS {
+            if !captured.is_empty() && captured_chars < MAX_ZGRAB_STDERR_CHARS {
                 captured.push('\n');
+                captured_chars += 1;
             }
-            let remaining = MAX_ZGRAB_STDERR_CHARS.saturating_sub(captured.len());
+            let remaining = MAX_ZGRAB_STDERR_CHARS.saturating_sub(captured_chars);
+            let line_chars = line.chars().count();
             captured.extend(line.chars().take(remaining));
+            captured_chars += line_chars.min(remaining);
+            truncated |= line_chars > remaining;
+        } else {
+            truncated = true;
         }
     }
-    captured
+    StderrCapture {
+        text: captured,
+        bytes,
+        truncated,
+    }
 }
 
-async fn finish_zgrab_stderr(handle: JoinHandle<String>) -> String {
+async fn finish_zgrab_stderr(handle: JoinHandle<StderrCapture>) -> StderrCapture {
     match handle.await {
         Ok(output) => output,
         Err(error) => {
-            tracing::warn!(%error, "zgrab2 stderr reader task failed");
-            String::new()
+            tracing::warn!(
+                event = "Zgrab2StderrReaderFailed",
+                operation = "join_zgrab2_stderr_reader",
+                reason = %error,
+                outcome = "stderr_unavailable",
+                engine = "zgrab2",
+                "zgrab2 stderr reader task failed"
+            );
+            StderrCapture::default()
         }
     }
 }

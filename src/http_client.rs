@@ -172,6 +172,11 @@ pub(crate) async fn validate_credentials(
 pub(crate) async fn response_error(response: Response, operation: &'static str) -> ServerError {
     let status = response.status();
     let retry_after = parse_retry_after(response.headers());
+    let request_id = response
+        .headers()
+        .get("X-Request-ID")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| uuid::Uuid::parse_str(value).ok());
     let maintenance_version = response
         .headers()
         .get("NM-Maintenance-Version")
@@ -184,9 +189,10 @@ pub(crate) async fn response_error(response: Response, operation: &'static str) 
             operation,
             detail,
             info: Box::new(info),
+            request_id,
         };
     }
-    classify_status(status, detail, retry_after, operation)
+    classify_status(status, detail, retry_after, request_id, operation)
 }
 
 pub(crate) fn response_decode_error(error: reqwest::Error, operation: &'static str) -> ServerError {
@@ -217,17 +223,27 @@ fn classify_status(
     status: StatusCode,
     detail: String,
     retry_after: Option<Duration>,
+    request_id: Option<uuid::Uuid>,
     operation: &'static str,
 ) -> ServerError {
     match status {
-        StatusCode::UNAUTHORIZED => ServerError::AuthRejected { operation, detail },
-        StatusCode::FORBIDDEN => ServerError::PolicyBlocked { operation, detail },
+        StatusCode::UNAUTHORIZED => ServerError::AuthRejected {
+            operation,
+            detail,
+            request_id,
+        },
+        StatusCode::FORBIDDEN => ServerError::PolicyBlocked {
+            operation,
+            detail,
+            request_id,
+        },
         StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS => {
             ServerError::RetryableStatus {
                 operation,
                 status,
                 detail,
                 retry_after,
+                request_id,
             }
         }
         status if status.is_server_error() => ServerError::RetryableStatus {
@@ -235,11 +251,13 @@ fn classify_status(
             status,
             detail,
             retry_after,
+            request_id,
         },
         status => ServerError::Rejected {
             operation,
             status,
             detail,
+            request_id,
         },
     }
 }
@@ -325,7 +343,13 @@ mod tests {
     #[test]
     fn response_statuses_have_actionable_retry_classes() {
         assert!(matches!(
-            classify_status(StatusCode::UNAUTHORIZED, "bad token".into(), None, "test"),
+            classify_status(
+                StatusCode::UNAUTHORIZED,
+                "bad token".into(),
+                None,
+                None,
+                "test"
+            ),
             ServerError::AuthRejected { .. }
         ));
         assert!(matches!(
@@ -333,6 +357,7 @@ mod tests {
                 StatusCode::TOO_MANY_REQUESTS,
                 "slow down".into(),
                 Some(Duration::from_secs(7)),
+                None,
                 "test"
             ),
             ServerError::RetryableStatus {
@@ -341,9 +366,32 @@ mod tests {
             } if delay == Duration::from_secs(7)
         ));
         assert!(matches!(
-            classify_status(StatusCode::CONFLICT, "lease lost".into(), None, "test"),
+            classify_status(
+                StatusCode::CONFLICT,
+                "lease lost".into(),
+                None,
+                None,
+                "test"
+            ),
             ServerError::Rejected { .. }
         ));
+    }
+
+    #[test]
+    fn response_errors_preserve_server_request_id_and_stable_classification() {
+        let request_id = uuid::Uuid::now_v7();
+        let error = classify_status(
+            StatusCode::BAD_REQUEST,
+            "invalid upload".into(),
+            None,
+            Some(request_id),
+            "upload results",
+        );
+        assert_eq!(error.request_id(), Some(request_id));
+        assert_eq!(error.operation(), "upload results");
+        assert_eq!(error.kind(), "http_status");
+        assert_eq!(error.code(), "server_request_rejected");
+        assert!(!error.is_retryable());
     }
 
     #[test]

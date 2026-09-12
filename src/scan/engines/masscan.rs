@@ -16,6 +16,13 @@ pub(crate) enum EngineOutcome {
     Cancelled,
 }
 
+#[derive(Default)]
+struct StderrCapture {
+    text: String,
+    bytes: usize,
+    truncated: bool,
+}
+
 /// Validate that the configured scanner resolves to an executable file.
 ///
 /// Explicit paths are checked directly. A bare command name is resolved
@@ -118,7 +125,8 @@ pub(crate) async fn run(
         .spawn()
         .map_err(|e| ScannerError::Scan(format!("failed to spawn scanner: {}", e)))?;
 
-    tracing::debug!(process_id = ?child.id(), "masscan process spawned");
+    let process_id = child.id();
+    tracing::debug!(process_id = ?process_id, "masscan process spawned");
 
     let stdout = child
         .stdout
@@ -163,11 +171,23 @@ pub(crate) async fn run(
                 results.push(r);
             }
             MasscanLine::Error => {
-                tracing::error!("scanner reported error: {}", trimmed);
-                let _ = child.wait().await;
+                let status = child.wait().await.ok();
                 let stderr_output = finish_scanner_stderr(stderr_handle).await;
-                let detail = scanner_failure_detail(trimmed, &stderr_output);
-                return Err(ScannerError::Scan(format!("scanner error: {detail}")));
+                let detail = scanner_failure_detail(trimmed, &stderr_output.text);
+                tracing::debug!(process_id = ?process_id, "masscan error marker collected");
+                return Err(ScannerError::external_process(
+                    "masscan",
+                    "read_stdout",
+                    "masscan_error_marker",
+                    detail,
+                    process_id,
+                    status.and_then(|value| value.code()),
+                    started_at.elapsed().as_millis() as u64,
+                    results.len(),
+                    unknown_count,
+                    stderr_output.bytes,
+                    stderr_output.truncated,
+                ));
             }
             MasscanLine::Complete => {
                 tracing::debug!(marker = "COMPLETE", "masscan completion marker received");
@@ -202,30 +222,38 @@ pub(crate) async fn run(
     );
 
     if !status.success() {
-        let detail = scanner_failure_detail("scanner produced no stderr output", &stderr_output);
-        tracing::error!(
-            exit_code = ?status.code(),
-            stderr = %stderr_output,
-            "masscan exited unsuccessfully"
-        );
-        return Err(ScannerError::Scan(format!(
-            "masscan exited with {status}: {detail}"
-        )));
+        let detail =
+            scanner_failure_detail("scanner produced no stderr output", &stderr_output.text);
+        return Err(ScannerError::external_process(
+            "masscan",
+            "process_exit",
+            "masscan_nonzero_exit",
+            format!("masscan exited with {status}: {detail}"),
+            process_id,
+            status.code(),
+            started_at.elapsed().as_millis() as u64,
+            results.len(),
+            unknown_count,
+            stderr_output.bytes,
+            stderr_output.truncated,
+        ));
     }
 
     Ok(EngineOutcome::Completed(results))
 }
 
-async fn log_scanner_stderr(stderr: ChildStderr) -> String {
+async fn log_scanner_stderr(stderr: ChildStderr) -> StderrCapture {
     let mut lines = BufReader::new(stderr).lines();
     let mut captured = String::new();
     let mut captured_chars = 0usize;
+    let mut bytes = 0usize;
     let mut truncated = false;
 
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
-                tracing::debug!(line = %line, "masscan stderr");
+                tracing::debug!(line_bytes = line.len(), "masscan stderr received");
+                bytes = bytes.saturating_add(line.len()).saturating_add(1);
                 if captured_chars < MAX_SCANNER_STDERR_CHARS {
                     if !captured.is_empty() {
                         captured.push('\n');
@@ -242,7 +270,15 @@ async fn log_scanner_stderr(stderr: ChildStderr) -> String {
             }
             Ok(None) => break,
             Err(error) => {
-                tracing::warn!(error = %error, "failed to read masscan stderr");
+                tracing::warn!(
+                    event = "MasscanStderrReadFailed",
+                    operation = "read_masscan_stderr",
+                    reason = %error,
+                    outcome = "partial_stderr_retained",
+                    engine = "masscan",
+                    stderr_bytes = bytes,
+                    "failed to read masscan stderr"
+                );
                 break;
             }
         }
@@ -251,15 +287,26 @@ async fn log_scanner_stderr(stderr: ChildStderr) -> String {
     if truncated {
         captured.push_str("\n[stderr truncated]");
     }
-    captured
+    StderrCapture {
+        text: captured,
+        bytes,
+        truncated,
+    }
 }
 
-async fn finish_scanner_stderr(handle: JoinHandle<String>) -> String {
+async fn finish_scanner_stderr(handle: JoinHandle<StderrCapture>) -> StderrCapture {
     match handle.await {
         Ok(output) => output,
         Err(error) => {
-            tracing::warn!(error = %error, "masscan stderr reader task failed");
-            String::new()
+            tracing::warn!(
+                event = "MasscanStderrReaderFailed",
+                operation = "join_masscan_stderr_reader",
+                reason = %error,
+                outcome = "stderr_unavailable",
+                engine = "masscan",
+                "masscan stderr reader task failed"
+            );
+            StderrCapture::default()
         }
     }
 }

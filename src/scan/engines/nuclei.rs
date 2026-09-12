@@ -18,6 +18,13 @@ use uuid::Uuid;
 
 const MAX_STDERR_CHARS: usize = 4_096;
 
+#[derive(Default)]
+struct StderrCapture {
+    text: String,
+    bytes: usize,
+    truncated: bool,
+}
+
 pub(crate) enum EngineOutcome {
     Completed(Vec<VulnerabilityObservation>),
     Cancelled,
@@ -241,6 +248,7 @@ async fn run_batch(
             )));
         }
     };
+    let process_id = child.id();
     let result = async {
         let stdout = child
             .stdout
@@ -260,13 +268,25 @@ async fn run_batch(
             if cancel_requested.load(Ordering::Relaxed) || timed_out {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let _ = finish_stderr(stderr_handle).await;
+                let stderr_output = finish_stderr(stderr_handle).await;
                 let _ = tokio::fs::remove_file(&target_path).await;
                 if timed_out {
-                    return Err(ScannerError::Scan(format!(
-                        "nuclei exceeded the {} second runtime limit",
-                        config.max_runtime_seconds
-                    )));
+                    return Err(ScannerError::external_process(
+                        "nuclei",
+                        "runtime_limit",
+                        "nuclei_runtime_limit_exceeded",
+                        format!(
+                            "nuclei exceeded the {} second runtime limit",
+                            config.max_runtime_seconds
+                        ),
+                        process_id,
+                        None,
+                        started_at.elapsed().as_millis() as u64,
+                        findings.len(),
+                        invalid_lines,
+                        stderr_output.bytes,
+                        stderr_output.truncated,
+                    ));
                 }
                 return Ok(EngineOutcome::Cancelled);
             }
@@ -279,10 +299,20 @@ async fn run_batch(
             if line.len() > config.max_result_bytes {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let _ = finish_stderr(stderr_handle).await;
+                let stderr_output = finish_stderr(stderr_handle).await;
                 let _ = tokio::fs::remove_file(&target_path).await;
-                return Err(ScannerError::Scan(
+                return Err(ScannerError::external_process(
+                    "nuclei",
+                    "read_stdout",
+                    "nuclei_result_size_limit_exceeded",
                     "nuclei result exceeded max_result_bytes".into(),
+                    process_id,
+                    None,
+                    started_at.elapsed().as_millis() as u64,
+                    findings.len(),
+                    invalid_lines,
+                    stderr_output.bytes,
+                    stderr_output.truncated,
                 ));
             }
             match parse_result(&line) {
@@ -292,18 +322,38 @@ async fn run_batch(
                 Ok(_) => {} // Automatic scan emits fingerprint findings as well.
                 Err(error) => {
                     invalid_lines += 1;
-                    tracing::warn!(%error, "ignored invalid nuclei JSONL output line");
+                    if invalid_lines == 1 {
+                        tracing::warn!(
+                            event = "NucleiOutputLineIgnored",
+                            operation = "parse_nuclei_output",
+                            reason = %error,
+                            error_code = "nuclei_output_invalid",
+                            outcome = "invalid_lines_skipped",
+                            engine = "nuclei",
+                            invalid_line_count = invalid_lines,
+                            "ignored invalid nuclei JSONL output line"
+                        );
+                    }
                 }
             }
             if previous_findings + findings.len() > config.max_findings {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let _ = finish_stderr(stderr_handle).await;
+                let stderr_output = finish_stderr(stderr_handle).await;
                 let _ = tokio::fs::remove_file(&target_path).await;
-                return Err(ScannerError::Scan(format!(
-                    "nuclei exceeded the {} finding limit",
-                    config.max_findings
-                )));
+                return Err(ScannerError::external_process(
+                    "nuclei",
+                    "result_limit",
+                    "nuclei_finding_limit_exceeded",
+                    format!("nuclei exceeded the {} finding limit", config.max_findings),
+                    process_id,
+                    None,
+                    started_at.elapsed().as_millis() as u64,
+                    findings.len(),
+                    invalid_lines,
+                    stderr_output.bytes,
+                    stderr_output.truncated,
+                ));
             }
         }
 
@@ -314,19 +364,39 @@ async fn run_batch(
         let stderr_output = finish_stderr(stderr_handle).await;
         let _ = tokio::fs::remove_file(&target_path).await;
         if !status.success() {
-            let detail = if stderr_output.trim().is_empty() {
+            let detail = if stderr_output.text.trim().is_empty() {
                 "nuclei produced no stderr output"
             } else {
-                stderr_output.trim()
+                stderr_output.text.trim()
             };
-            return Err(ScannerError::Scan(format!(
-                "nuclei exited with {status}: {detail}"
-            )));
+            return Err(ScannerError::external_process(
+                "nuclei",
+                "process_exit",
+                "nuclei_nonzero_exit",
+                format!("nuclei exited with {status}: {detail}"),
+                process_id,
+                status.code(),
+                started_at.elapsed().as_millis() as u64,
+                findings.len(),
+                invalid_lines,
+                stderr_output.bytes,
+                stderr_output.truncated,
+            ));
         }
         if invalid_lines > 0 {
-            return Err(ScannerError::Scan(format!(
-                "nuclei produced {invalid_lines} invalid JSONL result line(s)"
-            )));
+            return Err(ScannerError::external_process(
+                "nuclei",
+                "parse_output",
+                "nuclei_invalid_output",
+                format!("nuclei produced {invalid_lines} invalid JSONL result line(s)"),
+                process_id,
+                status.code(),
+                started_at.elapsed().as_millis() as u64,
+                findings.len(),
+                invalid_lines,
+                stderr_output.bytes,
+                stderr_output.truncated,
+            ));
         }
         tracing::info!(
             event = "VulnerabilityScanCompleted",
@@ -487,23 +557,37 @@ fn extract_port(value: &str) -> Option<u16> {
     authority.rsplit_once(':')?.1.parse().ok()
 }
 
-async fn collect_stderr(stderr: ChildStderr) -> String {
+async fn collect_stderr(stderr: ChildStderr) -> StderrCapture {
     let mut lines = BufReader::new(stderr).lines();
     let mut captured = String::new();
+    let mut captured_chars = 0usize;
+    let mut bytes = 0usize;
+    let mut truncated = false;
     while let Ok(Some(line)) = lines.next_line().await {
-        tracing::debug!(line = %line, "nuclei stderr");
-        if captured.chars().count() < MAX_STDERR_CHARS {
-            if !captured.is_empty() {
+        tracing::debug!(line_bytes = line.len(), "nuclei stderr received");
+        bytes = bytes.saturating_add(line.len()).saturating_add(1);
+        if captured_chars < MAX_STDERR_CHARS {
+            if !captured.is_empty() && captured_chars < MAX_STDERR_CHARS {
                 captured.push('\n');
+                captured_chars += 1;
             }
-            let remaining = MAX_STDERR_CHARS.saturating_sub(captured.chars().count());
+            let remaining = MAX_STDERR_CHARS.saturating_sub(captured_chars);
+            let line_chars = line.chars().count();
             captured.extend(line.chars().take(remaining));
+            captured_chars += line_chars.min(remaining);
+            truncated |= line_chars > remaining;
+        } else {
+            truncated = true;
         }
     }
-    captured
+    StderrCapture {
+        text: captured,
+        bytes,
+        truncated,
+    }
 }
 
-async fn finish_stderr(handle: JoinHandle<String>) -> String {
+async fn finish_stderr(handle: JoinHandle<StderrCapture>) -> StderrCapture {
     handle.await.unwrap_or_default()
 }
 
