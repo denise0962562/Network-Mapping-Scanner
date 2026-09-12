@@ -1170,7 +1170,11 @@ async fn scan_loop(
                     );
                     break;
                 };
-                let recovery_url = format!("{}&taskid={cached_task_id}", config.current_task_url);
+                let recovery_url = pending_upload_recovery_url(
+                    config.current_task_url,
+                    cached_task_id,
+                    cache.upload_id,
+                );
                 match recover_task(config.server_client, &recovery_url).await {
                     Ok(FetchTaskOutcome::Task(task)) if task.task_id == cached_task_id => {
                         fetch_backoff.reset();
@@ -2035,6 +2039,40 @@ async fn scan_loop(
                 cache,
             ),
         }
+    }
+}
+
+fn pending_upload_recovery_url(
+    current_task_url: &str,
+    task_id: Uuid,
+    upload_id: Option<Uuid>,
+) -> String {
+    match upload_id {
+        Some(upload_id) => {
+            format!("{current_task_url}&taskid={task_id}&uploadid={upload_id}")
+        }
+        None => format!("{current_task_url}&taskid={task_id}"),
+    }
+}
+
+#[cfg(test)]
+mod recovery_url_tests {
+    use super::pending_upload_recovery_url;
+    use uuid::Uuid;
+
+    #[test]
+    fn durable_upload_recovery_includes_both_identities() {
+        let task_id = Uuid::parse_str("019c0000-0000-7000-8000-000000000001").unwrap();
+        let upload_id = Uuid::parse_str("019c0000-0000-7000-8000-000000000002").unwrap();
+
+        assert_eq!(
+            pending_upload_recovery_url(
+                "https://scanner.example/api/task/current?scannerid=scanner",
+                task_id,
+                Some(upload_id),
+            ),
+            "https://scanner.example/api/task/current?scannerid=scanner&taskid=019c0000-0000-7000-8000-000000000001&uploadid=019c0000-0000-7000-8000-000000000002"
+        );
     }
 }
 
