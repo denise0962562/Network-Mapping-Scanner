@@ -1274,6 +1274,7 @@ async fn scan_loop(
 ) {
     let mut fetch_backoff = Backoff::new(config.retry_policy);
     let mut upload_backoff = Backoff::new(config.retry_policy);
+    let mut upload_identity_recoveries = 0u8;
 
     tracing::debug!(
         scanner_id = %config.scanner_id,
@@ -1497,6 +1498,7 @@ async fn scan_loop(
                 FlushAttempt::Stopped => break,
                 FlushAttempt::Completed(Ok(())) => {
                     upload_backoff.reset();
+                    upload_identity_recoveries = 0;
                     active_task.clear().await;
                 }
                 FlushAttempt::Completed(Err(ScannerError::UploadBatch { context, source }))
@@ -1568,6 +1570,30 @@ async fn scan_loop(
                     if sleep_or_stop(delay).await {
                         break;
                     }
+                    continue;
+                }
+                FlushAttempt::Completed(Err(ScannerError::UploadBatch { context, source }))
+                    if matches!(source.as_ref(), ServerError::UploadIdentityConflict { .. })
+                        && upload_identity_recoveries < 2 =>
+                {
+                    upload_identity_recoveries += 1;
+                    tracing::warn!(
+                        event = "ResultUploadExecutionRecovery",
+                        operation = source.operation(),
+                        error_kind = source.kind(),
+                        error_code = source.code(),
+                        error_message = %source,
+                        retryable = true,
+                        outcome = "execution_recovery_requested",
+                        scanner_id = %context.scanner_id,
+                        task_id = %context.task_id,
+                        upload_id = %context.upload_id,
+                        batch_index = context.batch_index,
+                        server_request_id = ?source.request_id(),
+                        attempt = upload_identity_recoveries,
+                        "upload identity conflicted with a previous execution attempt; recovering a clean execution"
+                    );
+                    active_task.clear().await;
                     continue;
                 }
                 FlushAttempt::Completed(Err(ScannerError::UploadBatch { context, source }))
