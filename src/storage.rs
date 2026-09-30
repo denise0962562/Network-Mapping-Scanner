@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredIdentity {
@@ -119,6 +119,11 @@ impl StateStore {
                     "DELETE FROM pending_upload WHERE server_origin=?1",
                     [origin],
                 )?;
+                transaction.execute(
+                    "DELETE FROM scan_checkpoint WHERE server_origin=?1",
+                    [origin],
+                )?;
+                transaction.execute("DELETE FROM scan_retry WHERE server_origin=?1", [origin])?;
                 if include_runtime_configuration {
                     transaction.execute(
                         "DELETE FROM runtime_configuration WHERE server_origin=?1",
@@ -128,12 +133,209 @@ impl StateStore {
             }
             None => {
                 transaction.execute("DELETE FROM pending_upload", [])?;
+                transaction.execute("DELETE FROM scan_checkpoint", [])?;
+                transaction.execute("DELETE FROM scan_retry", [])?;
                 if include_runtime_configuration {
                     transaction.execute("DELETE FROM runtime_configuration", [])?;
                 }
             }
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn archive_upload(
+        &mut self,
+        origin: &str,
+        reason: &str,
+    ) -> Result<(), ScannerError> {
+        let scanner_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT scanner_id FROM pending_upload WHERE server_origin=?1",
+                [origin],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(scanner_id) = scanner_id else {
+            return Ok(());
+        };
+        let Some(upload) = self.load_upload(origin, &scanner_id)? else {
+            return Ok(());
+        };
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "scanner_id": upload.scanner_id, "task_id": upload.task_id,
+            "upload_id": upload.upload_id, "next_batch_index": upload.next_batch_index,
+            "observations": upload.observations,
+        }))?;
+        if payload.len() > 64 * 1024 * 1024 {
+            return Err(ScannerError::Upload(
+                "upload archive exceeds 64 MiB; pending results retained".into(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute("INSERT INTO upload_archive(server_origin, reason, payload, created_at) VALUES (?1, ?2, ?3, unixepoch())",
+            params![origin, reason, payload])?;
+        transaction.execute(
+            "DELETE FROM pending_upload WHERE server_origin=?1",
+            [origin],
+        )?;
+        transaction.execute("DELETE FROM upload_archive WHERE created_at < unixepoch()-604800 OR id NOT IN (SELECT id FROM upload_archive ORDER BY id DESC LIMIT 10)", [])?;
+        // Retain the newest archive even when a single large upload exceeds the quota.
+        loop {
+            let bytes: i64 = transaction.query_row(
+                "SELECT COALESCE(SUM(length(payload)),0) FROM upload_archive",
+                [],
+                |r| r.get(0),
+            )?;
+            if bytes <= 64 * 1024 * 1024 {
+                break;
+            }
+            if transaction.execute("DELETE FROM upload_archive WHERE id=(SELECT MIN(id) FROM upload_archive) AND id<>(SELECT MAX(id) FROM upload_archive)", [])? == 0 { break; }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn load_checkpoint(
+        &self,
+        origin: &str,
+        key: &str,
+    ) -> Result<Option<crate::journal::Checkpoint>, ScannerError> {
+        let header: Option<(String, usize, usize, u64, Option<i64>)> = self.connection.query_row(
+            "SELECT scan_key, stage, chunk, elapsed_ms, running_since_ms FROM scan_checkpoint WHERE server_origin=?1",
+            [origin], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?;
+        let Some((stored_key, stage, chunk, mut elapsed_ms, running_since)) = header else {
+            return Ok(None);
+        };
+        if stored_key != key {
+            return Ok(None);
+        }
+        if let Some(since) = running_since {
+            // Account for an interrupted block before clearing its marker. This is
+            // conservative across downtime and prevents restarts resetting budgets.
+            elapsed_ms = elapsed_ms.saturating_add(
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_sub(since)
+                    .max(0) as u64,
+            );
+            let transaction = self.connection.unchecked_transaction()?;
+            transaction.execute("UPDATE scan_checkpoint SET elapsed_ms=?2,running_since_ms=NULL WHERE server_origin=?1", params![origin,elapsed_ms])?;
+            transaction.execute("INSERT INTO scan_retry(server_origin,task_id,failures,retry_at_ms) VALUES (?1,?2,1,0) ON CONFLICT(server_origin,task_id) DO UPDATE SET failures=failures+1",
+                params![origin,key.split('|').next().unwrap_or_default()])?;
+            transaction.commit()?;
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT payload FROM scan_checkpoint_part WHERE server_origin=?1 ORDER BY stage, chunk",
+        )?;
+        let parts = statement.query_map([origin], |r| r.get::<_, Vec<u8>>(0))?;
+        let mut observations = Vec::new();
+        for part in parts {
+            observations.extend(serde_json::from_slice::<Vec<ScanObservation>>(&part?)?);
+        }
+        Ok(Some(crate::journal::Checkpoint {
+            stage,
+            chunk,
+            elapsed_ms,
+            observations,
+        }))
+    }
+
+    pub(crate) fn save_checkpoint(
+        &self,
+        origin: &str,
+        key: &str,
+        stage: usize,
+        chunk: usize,
+        elapsed_ms: u64,
+        part: Option<&[ScanObservation]>,
+    ) -> Result<(), ScannerError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM scan_checkpoint WHERE server_origin=?1 AND scan_key<>?2",
+            params![origin, key],
+        )?;
+        transaction.execute("INSERT INTO scan_checkpoint(server_origin, scan_key, stage, chunk, elapsed_ms) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(server_origin) DO UPDATE SET stage=excluded.stage,chunk=excluded.chunk,elapsed_ms=excluded.elapsed_ms,running_since_ms=NULL",
+            params![origin,key,stage,chunk,elapsed_ms])?;
+        if let Some(part) = part {
+            if chunk == 0 && stage > 0 {
+                // Completing a stage replaces its incremental blocks with one
+                // snapshot in the same transaction, without duplicate evidence.
+                transaction.execute("DELETE FROM scan_checkpoint_part WHERE server_origin=?1 AND stage=?2 AND chunk>0", params![origin,stage-1])?;
+            }
+            transaction.execute("INSERT OR REPLACE INTO scan_checkpoint_part(server_origin,stage,chunk,payload) VALUES (?1,?2,?3,?4)", params![origin,stage,chunk,serde_json::to_vec(part)?])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn start_checkpoint_block(&self, origin: &str) -> Result<(), ScannerError> {
+        self.connection.execute(
+            "UPDATE scan_checkpoint SET running_since_ms=?2 WHERE server_origin=?1",
+            params![origin, chrono::Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_checkpoint(&self, origin: &str) -> Result<(), ScannerError> {
+        self.connection.execute(
+            "DELETE FROM scan_checkpoint WHERE server_origin=?1",
+            [origin],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn latest_scan_failure(
+        &self,
+        origin: &str,
+    ) -> Result<Option<(Uuid, u32)>, ScannerError> {
+        let record: Option<(String,u32)> = self.connection.query_row(
+            "SELECT task_id,failures FROM scan_retry WHERE server_origin=?1 ORDER BY retry_at_ms DESC LIMIT 1",
+            [origin], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        record
+            .map(|(task, count)| Ok((parse_uuid(&task, "scan retry task_id")?, count.min(3))))
+            .transpose()
+    }
+
+    pub(crate) fn scan_failures(
+        &self,
+        origin: &str,
+        task_id: Uuid,
+    ) -> Result<(u32, i64), ScannerError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT failures,retry_at_ms FROM scan_retry WHERE server_origin=?1 AND task_id=?2",
+                params![origin, task_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn record_scan_failure(
+        &self,
+        origin: &str,
+        task_id: Uuid,
+    ) -> Result<(), ScannerError> {
+        let (failures, _) = self.scan_failures(origin, task_id)?;
+        let retry_at = chrono::Utc::now().timestamp_millis()
+            + i64::from((5u32.saturating_mul(2u32.pow(failures.min(6)))).min(300)) * 1000;
+        self.connection.execute("INSERT INTO scan_retry(server_origin,task_id,failures,retry_at_ms) VALUES (?1,?2,1,?3) ON CONFLICT(server_origin,task_id) DO UPDATE SET failures=failures+1,retry_at_ms=excluded.retry_at_ms",
+            params![origin,task_id.to_string(),retry_at])?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_scan_failures(
+        &self,
+        origin: &str,
+        task_id: Uuid,
+    ) -> Result<(), ScannerError> {
+        self.connection.execute(
+            "DELETE FROM scan_retry WHERE server_origin=?1 AND task_id=?2",
+            params![origin, task_id.to_string()],
+        )?;
         Ok(())
     }
 
@@ -449,6 +651,15 @@ fn migrate(connection: &mut Connection) -> Result<(), ScannerError> {
         )?;
         transaction.commit()?;
     }
+    if current_version < 3 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch("CREATE TABLE upload_archive(id INTEGER PRIMARY KEY,server_origin TEXT NOT NULL,reason TEXT NOT NULL,payload BLOB NOT NULL,created_at INTEGER NOT NULL);
+            CREATE TABLE scan_checkpoint(server_origin TEXT PRIMARY KEY,scan_key TEXT NOT NULL,stage INTEGER NOT NULL,chunk INTEGER NOT NULL,elapsed_ms INTEGER NOT NULL,running_since_ms INTEGER);
+            CREATE TABLE scan_checkpoint_part(server_origin TEXT NOT NULL,stage INTEGER NOT NULL,chunk INTEGER NOT NULL,payload BLOB NOT NULL,PRIMARY KEY(server_origin,stage,chunk),FOREIGN KEY(server_origin) REFERENCES scan_checkpoint(server_origin) ON DELETE CASCADE);
+            CREATE TABLE scan_retry(server_origin TEXT NOT NULL,task_id TEXT NOT NULL,failures INTEGER NOT NULL,retry_at_ms INTEGER NOT NULL,PRIMARY KEY(server_origin,task_id));
+            PRAGMA user_version=3;")?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -476,6 +687,128 @@ fn set_private_permissions(_path: &Path) -> Result<(), ScannerError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn schema_two_upgrade_preserves_pending_upload_and_identity() {
+        let path = database_path();
+        let mut store = StateStore::open(path.clone()).unwrap();
+        let task = Uuid::now_v7();
+        let upload = Uuid::now_v7();
+        store
+            .save_identity(
+                "origin",
+                &StoredIdentity {
+                    scanner_id: "scanner".into(),
+                    runtime_token: "fixture-token".into(),
+                },
+            )
+            .unwrap();
+        store
+            .begin_upload("origin", "scanner", task, upload, &[])
+            .unwrap();
+        store.connection.execute_batch("DROP TABLE scan_checkpoint_part; DROP TABLE scan_checkpoint; DROP TABLE scan_retry; DROP TABLE upload_archive; PRAGMA user_version=2;").unwrap();
+        drop(store);
+        let store = StateStore::open(path.clone()).unwrap();
+        let state = store.load_upload("origin", "scanner").unwrap().unwrap();
+        assert_eq!(state.task_id, task);
+        assert_eq!(state.upload_id, upload);
+        assert_eq!(
+            store
+                .load_identity("origin")
+                .unwrap()
+                .unwrap()
+                .runtime_token,
+            "fixture-token"
+        );
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_blocks_and_retry_counts_survive_reopen() {
+        let path = database_path();
+        let task = Uuid::now_v7();
+        let key = format!("{task}|configuration-1");
+        let store = StateStore::open(path.clone()).unwrap();
+        store
+            .save_checkpoint("origin", &key, 1, 2, 350, Some(&[]))
+            .unwrap();
+        store.record_scan_failure("origin", task).unwrap();
+        drop(store);
+        let store = StateStore::open(path.clone()).unwrap();
+        let state = store.load_checkpoint("origin", &key).unwrap().unwrap();
+        assert_eq!((state.stage, state.chunk, state.elapsed_ms), (1, 2, 350));
+        assert_eq!(store.scan_failures("origin", task).unwrap().0, 1);
+        assert!(
+            store
+                .load_checkpoint("origin", "changed-configuration")
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unclean_restart_consumes_budget_and_counts_failure_only_once() {
+        let path = database_path();
+        let task = Uuid::now_v7();
+        let key = format!("{task}|config");
+        let store = StateStore::open(path.clone()).unwrap();
+        store
+            .save_checkpoint("origin", &key, 1, 0, 100, None)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE scan_checkpoint SET running_since_ms=?1",
+                [chrono::Utc::now().timestamp_millis() - 5000],
+            )
+            .unwrap();
+        drop(store);
+        let store = StateStore::open(path.clone()).unwrap();
+        assert!(
+            store
+                .load_checkpoint("origin", &key)
+                .unwrap()
+                .unwrap()
+                .elapsed_ms
+                >= 5100
+        );
+        store.load_checkpoint("origin", &key).unwrap();
+        assert_eq!(store.scan_failures("origin", task).unwrap().0, 1);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn archiving_preserves_upload_identity_and_observations() {
+        let path = database_path();
+        let mut store = StateStore::open(path.clone()).unwrap();
+        let task = Uuid::now_v7();
+        let upload = Uuid::now_v7();
+        store
+            .begin_upload("origin", "scanner", task, upload, &[])
+            .unwrap();
+        store.archive_upload("origin", "server_cancelled").unwrap();
+        assert!(store.load_upload("origin", "scanner").unwrap().is_none());
+        let bytes: Vec<u8> = store
+            .connection
+            .query_row("SELECT payload FROM upload_archive", [], |r| r.get(0))
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["task_id"], task.to_string());
+        assert_eq!(value["upload_id"], upload.to_string());
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
     use super::*;
     use crate::scan::{PortObservation, ScanObservation};
 

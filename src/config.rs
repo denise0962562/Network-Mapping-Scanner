@@ -212,6 +212,21 @@ fn validate(cfg: &AppConfig) -> Result<(), ScannerError> {
             "must be at least connect_timeout_seconds and at most 300",
         ),
         (
+            "service_detection.batch_endpoints",
+            !(1..=4096).contains(&cfg.service_detection.batch_endpoints),
+            "must be between 1 and 4096",
+        ),
+        (
+            "service_detection.idle_timeout_seconds",
+            !(1..=3600).contains(&cfg.service_detection.idle_timeout_seconds),
+            "must be between 1 and 3600",
+        ),
+        (
+            "service_detection.max_runtime_seconds",
+            !(1..=86400).contains(&cfg.service_detection.max_runtime_seconds),
+            "must be between 1 and 86400",
+        ),
+        (
             "service_detection.max_result_bytes",
             !(1_024..=1_048_576).contains(&cfg.service_detection.max_result_bytes),
             "must be between 1024 and 1048576",

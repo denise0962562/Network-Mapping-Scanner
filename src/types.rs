@@ -368,9 +368,25 @@ impl Default for NucleiConfig {
     }
 }
 
+pub(crate) fn default_batch_endpoints() -> usize {
+    512
+}
+pub(crate) fn default_idle_timeout() -> u64 {
+    120
+}
+pub(crate) fn default_service_runtime() -> u64 {
+    1800
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct ServiceDetectionConfig {
+    #[serde(default = "default_batch_endpoints")]
+    pub(crate) batch_endpoints: usize,
+    #[serde(default = "default_idle_timeout")]
+    pub(crate) idle_timeout_seconds: u64,
+    #[serde(default = "default_service_runtime")]
+    pub(crate) max_runtime_seconds: u64,
     pub(crate) enabled: bool,
     pub(crate) required: bool,
     pub(crate) strategy: ServiceDetectionStrategy,
@@ -406,6 +422,9 @@ impl ServiceDetectionStrategy {
 impl Default for ServiceDetectionConfig {
     fn default() -> Self {
         Self {
+            batch_endpoints: default_batch_endpoints(),
+            idle_timeout_seconds: default_idle_timeout(),
+            max_runtime_seconds: default_service_runtime(),
             enabled: false,
             required: false,
             strategy: ServiceDetectionStrategy::Standard,
