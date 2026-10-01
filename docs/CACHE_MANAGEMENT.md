@@ -37,3 +37,7 @@ scanner-rs cache clear --include-runtime-config --yes
 
 清除缓存会永久丢弃尚未上传的扫描结果，且不会通知服务端取消任务。需要正常完成或取消任务
 时，应优先让扫描器恢复连接并完成协议流程。
+
+## 诊断队列
+
+`cache clear` 不清除独立的 `*.diagnostics.sqlite3` 和 `*.diagnostics-spool/`。扫描错误事件、日志快照和采集任务按[远程诊断](DIAGNOSTICS.md)的确认与留存规则处理。

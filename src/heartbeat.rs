@@ -197,6 +197,8 @@ impl ActiveTask {
 
 #[derive(Serialize)]
 struct HeartbeatPayload {
+    diagnostics: crate::diagnostics::protocol::Capabilities,
+    diagnostic_health: serde_json::Value,
     scanner_id: Uuid,
     state: &'static str,
     active_task_id: Option<Uuid>,
@@ -235,6 +237,10 @@ struct TaskCancelledPayload {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct HeartbeatResponse {
+    #[serde(default)]
+    diagnostics_enabled: bool,
+    #[serde(default)]
+    diagnostic_requests: Vec<crate::diagnostics::protocol::Job>,
     command: Option<HeartbeatCommand>,
     lease: Option<HeartbeatLease>,
     #[serde(default)]
@@ -267,6 +273,7 @@ struct HeartbeatLease {
 
 #[derive(Clone)]
 pub(crate) struct HeartbeatClient {
+    diagnostics: Option<crate::diagnostics::DiagnosticsHandle>,
     client: ServerHttpClient,
     heartbeat_url: String,
     failure_url: String,
@@ -294,6 +301,13 @@ struct MaintenanceProbeResponse {
 }
 
 impl HeartbeatClient {
+    pub(crate) fn with_diagnostics(
+        mut self,
+        handle: crate::diagnostics::DiagnosticsHandle,
+    ) -> Self {
+        self.diagnostics = Some(handle);
+        self
+    }
     pub(crate) async fn can_scan(&self, address_family: &str) -> bool {
         self.network_capabilities
             .get()
@@ -311,6 +325,7 @@ impl HeartbeatClient {
         runtime_configuration: RuntimeConfiguration,
     ) -> Self {
         Self {
+            diagnostics: None,
             client,
             heartbeat_url: endpoints.heartbeat,
             failure_url: endpoints.failure,
@@ -362,6 +377,16 @@ impl HeartbeatClient {
             "idle"
         };
         let payload = HeartbeatPayload {
+            diagnostics: self
+                .diagnostics
+                .as_ref()
+                .map(|d| d.capabilities())
+                .unwrap_or_default(),
+            diagnostic_health: self
+                .diagnostics
+                .as_ref()
+                .map(|d| d.health())
+                .unwrap_or_else(|| serde_json::json!({"accepting_tasks":true,"status":"healthy"})),
             scanner_id: self.scanner_id,
             state,
             active_task_id,
@@ -486,6 +511,9 @@ impl HeartbeatClient {
         response: HeartbeatResponse,
         active: &ActiveTask,
     ) -> Option<MaintenanceInfo> {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.dispatch(response.diagnostic_requests, response.diagnostics_enabled);
+        }
         if let Some(lease) = response.lease {
             match lease.status.as_str() {
                 "renewed" if active.get().await == Some(lease.task_id) => {
