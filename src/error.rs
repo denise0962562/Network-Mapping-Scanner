@@ -116,6 +116,13 @@ pub(crate) enum ServerError {
         request_id: Option<Uuid>,
     },
 
+    #[error("{operation} requires execution recovery: {detail}")]
+    UploadIdentityConflict {
+        operation: &'static str,
+        detail: String,
+        request_id: Option<Uuid>,
+    },
+
     #[error("{operation} returned an invalid response: {detail}")]
     InvalidResponse {
         operation: &'static str,
@@ -155,6 +162,7 @@ impl ServerError {
         match self {
             Self::Maintenance { .. } => Some(StatusCode::SERVICE_UNAVAILABLE),
             Self::RetryableStatus { status, .. } | Self::Rejected { status, .. } => Some(*status),
+            Self::UploadIdentityConflict { .. } => Some(StatusCode::BAD_REQUEST),
             Self::AuthRejected { .. } => Some(StatusCode::UNAUTHORIZED),
             Self::PolicyBlocked { .. } => Some(StatusCode::FORBIDDEN),
             _ => None,
@@ -167,7 +175,8 @@ impl ServerError {
             | Self::RetryableStatus { request_id, .. }
             | Self::AuthRejected { request_id, .. }
             | Self::PolicyBlocked { request_id, .. }
-            | Self::Rejected { request_id, .. } => *request_id,
+            | Self::Rejected { request_id, .. }
+            | Self::UploadIdentityConflict { request_id, .. } => *request_id,
             _ => None,
         }
     }
@@ -182,6 +191,7 @@ impl ServerError {
             | Self::AuthRejected { operation, .. }
             | Self::PolicyBlocked { operation, .. }
             | Self::Rejected { operation, .. }
+            | Self::UploadIdentityConflict { operation, .. }
             | Self::InvalidResponse { operation, .. }
             | Self::InvalidRequest { operation, .. } => operation,
             Self::ClientBuild(_) => "build_server_http_client",
@@ -195,6 +205,7 @@ impl ServerError {
             Self::Connect { .. } => "connect",
             Self::Transport { .. } => "transport",
             Self::RetryableStatus { .. } | Self::Rejected { .. } => "http_status",
+            Self::UploadIdentityConflict { .. } => "upload_identity",
             Self::AuthRejected { .. } => "authentication",
             Self::PolicyBlocked { .. } => "policy",
             Self::InvalidResponse { .. } => "response_decode",
@@ -213,6 +224,7 @@ impl ServerError {
             Self::AuthRejected { .. } => "runtime_token_rejected",
             Self::PolicyBlocked { .. } => "server_policy_blocked",
             Self::Rejected { .. } => "server_request_rejected",
+            Self::UploadIdentityConflict { .. } => "execution_upload_id_conflict",
             Self::InvalidResponse { .. } => "invalid_server_response",
             Self::InvalidRequest { .. } => "invalid_server_request",
             Self::ClientBuild(_) => "server_http_client_build_failed",

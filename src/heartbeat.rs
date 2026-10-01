@@ -8,7 +8,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -53,6 +53,7 @@ pub(crate) struct ActiveTask {
     cancellation_reason: Arc<AtomicU8>,
     lease_deadline: Arc<RwLock<Option<Instant>>>,
     lease_ttl_ms: Arc<AtomicU64>,
+    lease_changed: Arc<Notify>,
 }
 
 impl ActiveTask {
@@ -75,6 +76,7 @@ impl ActiveTask {
         self.lease_ttl_ms.store(0, Ordering::Relaxed);
         self.cancel_requested.store(false, Ordering::Relaxed);
         self.cancellation_reason.store(0, Ordering::Relaxed);
+        self.lease_changed.notify_waiters();
         tracing::debug!(?previous_task_id, "active task cleared");
     }
 
@@ -104,6 +106,7 @@ impl ActiveTask {
         let ttl = Duration::from_millis(bounded_ttl_ms);
         self.lease_ttl_ms.store(bounded_ttl_ms, Ordering::Relaxed);
         *self.lease_deadline.write().await = Some(Instant::now() + ttl);
+        self.lease_changed.notify_waiters();
         tracing::debug!(
             lease_ttl_ms = bounded_ttl_ms,
             "active task lease deadline updated"
@@ -131,7 +134,35 @@ impl ActiveTask {
             .map(|deadline| deadline.saturating_duration_since(Instant::now() + safety_margin))
     }
 
+    /// Wait against the current deadline, including renewals during a long upload.
+    pub(crate) async fn wait_for_lease_loss(&self, task_id: Uuid, margin: Duration) {
+        loop {
+            let changed = self.lease_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.get().await != Some(task_id) || self.cancellation_reason().is_some() {
+                return;
+            }
+            let remaining = self
+                .lease_safety_remaining(margin)
+                .await
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                return;
+            }
+            tokio::select! {
+                _ = changed => {},
+                _ = tokio::time::sleep(remaining) => {},
+            }
+        }
+    }
+
     pub(crate) async fn request_lease_lost(&self, task_id: Uuid) {
+        self.request_lease_lost_from(task_id, "local_safety_deadline")
+            .await;
+    }
+
+    pub(crate) async fn request_lease_lost_from(&self, task_id: Uuid, source: &str) {
         if self.get().await == Some(task_id) {
             self.request_cancellation(TaskCancellationReason::LeaseLost);
             tracing::error!(
@@ -139,7 +170,9 @@ impl ActiveTask {
                 operation = "renew_task_lease",
                 error_kind = "lease",
                 error_code = "task_lease_lost",
-                error_message = "active task lease expired before renewal",
+                error_message = "active task lease is no longer usable",
+                lease_loss_source = source,
+                lease_ttl_ms = self.lease_ttl_ms.load(Ordering::Relaxed),
                 retryable = false,
                 outcome = "task_cancellation_requested",
                 %task_id,
@@ -158,6 +191,7 @@ impl ActiveTask {
         self.cancellation_reason
             .store(reason.code(), Ordering::Relaxed);
         self.cancel_requested.store(true, Ordering::Relaxed);
+        self.lease_changed.notify_waiters();
     }
 }
 
@@ -465,7 +499,11 @@ impl HeartbeatClient {
                         "active task lease frozen for maintenance result upload"
                     );
                 }
-                "lost" => active.request_lease_lost(lease.task_id).await,
+                "lost" => {
+                    active
+                        .request_lease_lost_from(lease.task_id, "server_reported_lost")
+                        .await
+                }
                 status => tracing::warn!(%status, task_id = %lease.task_id, "unknown lease status"),
             }
         } else if active.get().await.is_some() {
@@ -558,6 +596,57 @@ fn parse_non_negative_header(headers: &HeaderMap, name: &HeaderName) -> Option<i
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn upload_monitor_tracks_renewals_beyond_original_deadline() {
+        let active = super::ActiveTask::default();
+        let task = uuid::Uuid::now_v7();
+        active.set(task, 90_000).await;
+        let monitor = active.clone();
+        let waiter = tokio::spawn(async move {
+            monitor
+                .wait_for_lease_loss(task, tokio::time::Duration::from_secs(10))
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(tokio::time::Duration::from_secs(40)).await;
+        active.renew_lease(90_000).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(tokio::time::Duration::from_secs(45)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "the original deadline must not terminate an upload"
+        );
+        tokio::time::advance(tokio::time::Duration::from_secs(36)).await;
+        waiter.await.unwrap();
+        assert!(
+            active
+                .lease_safety_expired(tokio::time::Duration::from_secs(10))
+                .await
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_wakes_upload_monitor_immediately() {
+        let active = super::ActiveTask::default();
+        let task = uuid::Uuid::now_v7();
+        active.set(task, 90_000).await;
+        let monitor = active.clone();
+        let waiter = tokio::spawn(async move {
+            monitor
+                .wait_for_lease_loss(task, tokio::time::Duration::from_secs(10))
+                .await
+        });
+        tokio::task::yield_now().await;
+        active.request_cancel(task).await;
+        waiter.await.unwrap();
+        assert!(
+            !active
+                .lease_safety_expired(tokio::time::Duration::from_secs(10))
+                .await
+        );
+    }
+
     use super::*;
 
     #[tokio::test]

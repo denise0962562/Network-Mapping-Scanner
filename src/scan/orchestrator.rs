@@ -11,6 +11,7 @@ pub(crate) enum ScanOutcome {
 }
 
 pub(crate) struct ScanRuntimeConfig<'a> {
+    pub(crate) journal: Option<crate::journal::ScanJournal<'a>>,
     pub(crate) scanner_path: &'a str,
     pub(crate) service_detection: &'a ServiceDetectionConfig,
     pub(crate) dns: &'a DnsConfig,
@@ -25,7 +26,7 @@ pub(crate) struct ScanRuntimeConfig<'a> {
 /// Engines own process execution and output parsing. This orchestrator owns
 /// stage ordering, cancellation propagation, and stage-level failure policy.
 pub(crate) async fn run_scan(
-    config: ScanRuntimeConfig<'_>,
+    mut config: ScanRuntimeConfig<'_>,
     plan: &ScanPlan,
     target: &TargetParams,
     cancel_requested: &AtomicBool,
@@ -36,7 +37,34 @@ pub(crate) async fn run_scan(
     let mut dns_observations = Vec::new();
     let mut vulnerabilities = Vec::new();
     let mut resolved_ips = Vec::new();
-    for stage in &plan.stages {
+    let resumed_stage = config.journal.as_ref().map_or(0, |j| j.state.stage);
+    if let Some(j) = &config.journal {
+        for observation in &j.state.observations {
+            match observation {
+                ScanObservation::Port(p) => ports.push(p.clone()),
+                ScanObservation::Service(s) => services.push(s.clone()),
+                ScanObservation::Dns(d) => dns_observations.push(d.clone()),
+                ScanObservation::Vulnerability(v) => vulnerabilities.push(v.clone()),
+            }
+        }
+        resolved_ips = dns_observations
+            .iter()
+            .flat_map(|d| d.answers.iter())
+            .filter(|a| matches!(a.record_type.as_str(), "A" | "AAAA"))
+            .filter_map(|a| a.value.parse().ok())
+            .collect();
+        tracing::info!(
+            event = "ScanCheckpointRecovered",
+            stage = resumed_stage,
+            chunk = j.state.chunk,
+            observation_count = j.state.observations.len(),
+            "scan checkpoint loaded"
+        );
+    }
+    for (stage_index, stage) in plan.stages.iter().enumerate() {
+        if stage_index < resumed_stage {
+            continue;
+        }
         match stage.kind {
             ScanStageKind::PortDiscovery => {
                 let port_targets = if matches!(plan.profile.as_str(), "dns_ports" | "dns_full") {
@@ -83,15 +111,24 @@ pub(crate) async fn run_scan(
                 } else {
                     stage.required
                 };
-                match zgrab2::run(
+                match zgrab2::run_with_journal(
                     config.service_detection,
                     &ports,
                     &target.address_family,
                     cancel_requested,
+                    config.journal.as_mut(),
                 )
                 .await
                 {
-                    Ok(zgrab2::EngineOutcome::Completed(enrichment)) => services = enrichment,
+                    Ok(zgrab2::EngineOutcome::Completed(enrichment)) => services.extend(enrichment),
+                    Ok(zgrab2::EngineOutcome::Partial(enrichment, reason)) => {
+                        if required {
+                            return Err(ScannerError::Scan(reason));
+                        }
+                        tracing::warn!(event="ServiceDetectionIncomplete", error_code=%reason,
+                            outcome="partial_services_and_ports_preserved", "optional service detection stopped before completion");
+                        services.extend(enrichment);
+                    }
                     Ok(zgrab2::EngineOutcome::Cancelled) => return Ok(ScanOutcome::Cancelled),
                     Err(error) if required => {
                         return Err(ScannerError::engine_stage(
@@ -156,6 +193,29 @@ pub(crate) async fn run_scan(
                 }
             }
         }
+        if let Some(j) = config.journal.as_mut() {
+            let part: Vec<_> = match stage.kind {
+                ScanStageKind::PortDiscovery => {
+                    ports.iter().cloned().map(ScanObservation::Port).collect()
+                }
+                ScanStageKind::ServiceDetection => services
+                    .iter()
+                    .cloned()
+                    .map(ScanObservation::Service)
+                    .collect(),
+                ScanStageKind::DnsLookup => dns_observations
+                    .iter()
+                    .cloned()
+                    .map(ScanObservation::Dns)
+                    .collect(),
+                ScanStageKind::VulnerabilityDetection => vulnerabilities
+                    .iter()
+                    .cloned()
+                    .map(ScanObservation::Vulnerability)
+                    .collect(),
+            };
+            j.save(stage_index + 1, 0, 0, Some(&part))?;
+        }
     }
     let mut observations = Vec::with_capacity(
         ports.len() + services.len() + dns_observations.len() + vulnerabilities.len(),
@@ -170,6 +230,8 @@ pub(crate) async fn run_scan(
             .into_iter()
             .map(ScanObservation::Vulnerability),
     );
+    let mut identities = std::collections::HashSet::new();
+    observations.retain(|o| identities.insert(o.identity()));
     Ok(ScanOutcome::Completed(observations))
 }
 
@@ -217,6 +279,81 @@ fn dns_port_targets(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_reuses_ports_and_completed_service_blocks() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("scanner-checkpoint-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&directory).unwrap();
+        let masscan = directory.join("masscan");
+        let zgrab = directory.join("zgrab");
+        let marker = directory.join("marker");
+        let gate = directory.join("fail");
+        std::fs::write(&gate, "").unwrap();
+        std::fs::write(&masscan,format!("#!/bin/sh\nprintf 'masscan\n' >> '{}'\nprintf 'open tcp 22 192.0.2.1 1\nopen tcp 23 192.0.2.1 1\n'\n",marker.display())).unwrap();
+        std::fs::write(&zgrab,format!(r#"#!/bin/sh
+while IFS=',' read -r ip domain tag port; do
+  printf '%s\n' "$port" >> '{}'
+  if [ "$port" = 23 ] && [ -f '{}' ]; then exit 4; fi
+  printf '{{"ip":"%s","data":{{"%s":{{"status":"success","protocol":"%s","port":%s,"result":{{"banner":"identified"}}}}}}}}\n' "$ip" "$tag" "$tag" "$port"
+done
+"#,marker.display(),gate.display())).unwrap();
+        for path in [&masscan, &zgrab] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store = crate::storage::StateStore::open(directory.join("state.sqlite3")).unwrap();
+        let key = format!("{}|same-config", uuid::Uuid::now_v7());
+        let service = crate::types::ServiceDetectionConfig {
+            enabled: true,
+            required: true,
+            batch_endpoints: 1,
+            zgrab_path: zgrab.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let plan = super::ScanPlan::legacy(&service);
+        let target = crate::types::TargetParams {
+            ip: "192.0.2.1".into(),
+            port: "22-23".into(),
+            rate: 10,
+            address_family: "ipv4".into(),
+        };
+        for attempt in 0..2 {
+            let journal = crate::journal::ScanJournal::open(&store, "origin", key.clone()).unwrap();
+            let result = super::run_scan(
+                super::ScanRuntimeConfig {
+                    journal: Some(journal),
+                    scanner_path: masscan.to_str().unwrap(),
+                    service_detection: &service,
+                    dns: &crate::types::DnsConfig::default(),
+                    nuclei: &crate::types::NucleiConfig::default(),
+                    dns_resolvers: &[],
+                    ipv4_ready: true,
+                    ipv6_ready: false,
+                },
+                &plan,
+                &target,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .await;
+            if attempt == 0 {
+                assert!(result.is_err());
+                std::fs::remove_file(&gate).unwrap();
+            } else {
+                let super::ScanOutcome::Completed(results) = result.unwrap() else {
+                    panic!("recovered scan must complete");
+                };
+                assert_eq!(results.len(), 4);
+            }
+        }
+        let markers = std::fs::read_to_string(marker).unwrap();
+        assert_eq!(markers.lines().filter(|&line| line == "masscan").count(), 1);
+        assert_eq!(markers.lines().filter(|&line| line == "22").count(), 1);
+        assert_eq!(markers.lines().filter(|&line| line == "23").count(), 2);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     use super::*;
     use crate::scan::plan::{SCAN_PLAN_VERSION, ScanStageSpec};
     use std::sync::atomic::AtomicBool;
@@ -280,6 +417,7 @@ mod tests {
 
         let outcome = run_scan(
             ScanRuntimeConfig {
+                journal: None,
                 scanner_path: path.to_str().unwrap(),
                 service_detection: &service,
                 dns: &DnsConfig::default(),
@@ -341,6 +479,7 @@ mod tests {
 
         let result = run_scan(
             ScanRuntimeConfig {
+                journal: None,
                 scanner_path: path.to_str().unwrap(),
                 service_detection: &service,
                 dns: &DnsConfig::default(),

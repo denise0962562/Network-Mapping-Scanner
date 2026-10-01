@@ -192,6 +192,15 @@ pub(crate) async fn response_error(response: Response, operation: &'static str) 
             request_id,
         };
     }
+    if status == StatusCode::BAD_REQUEST
+        && parse_error_code(&body).as_deref() == Some("execution_upload_id_conflict")
+    {
+        return ServerError::UploadIdentityConflict {
+            operation,
+            detail,
+            request_id,
+        };
+    }
     classify_status(status, detail, retry_after, request_id, operation)
 }
 
@@ -268,6 +277,17 @@ struct MaintenanceEnvelope {
     maintenance: MaintenanceInfo,
 }
 
+#[derive(Deserialize)]
+struct ErrorEnvelope {
+    code: String,
+}
+
+fn parse_error_code(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<ErrorEnvelope>(body)
+        .ok()
+        .map(|envelope| envelope.code)
+}
+
 fn parse_maintenance_response(
     status: StatusCode,
     version: Option<&str>,
@@ -325,8 +345,8 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FetchTaskOutcome, ServerHttpClient, classify_status, parse_maintenance_response,
-        parse_retry_after, task_outcome_without_body,
+        FetchTaskOutcome, ServerHttpClient, classify_status, parse_error_code,
+        parse_maintenance_response, parse_retry_after, task_outcome_without_body,
     };
     use crate::error::ServerError;
     use reqwest::StatusCode;
@@ -392,6 +412,20 @@ mod tests {
         assert_eq!(error.kind(), "http_status");
         assert_eq!(error.code(), "server_request_rejected");
         assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn structured_upload_identity_conflict_has_a_stable_code() {
+        let body = br#"{
+            "success":false,
+            "code":"execution_upload_id_conflict",
+            "action":"recover_execution"
+        }"#;
+        assert_eq!(
+            parse_error_code(body).as_deref(),
+            Some("execution_upload_id_conflict")
+        );
+        assert_eq!(parse_error_code(b"plain text"), None);
     }
 
     #[test]

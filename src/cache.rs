@@ -95,6 +95,54 @@ impl CacheManager {
         self.task_id.is_some()
     }
 
+    pub(crate) fn upload_ranges(
+        &self,
+        scanner_id: Uuid,
+    ) -> Result<Vec<std::ops::Range<usize>>, ScannerError> {
+        let task_id = self
+            .task_id
+            .ok_or_else(|| ScannerError::Upload("missing task identity".into()))?;
+        let upload_id = self
+            .upload_id
+            .ok_or_else(|| ScannerError::Upload("missing upload identity".into()))?;
+        if self.observations.is_empty() {
+            return Ok(std::iter::once(0..0).collect());
+        }
+        upload_batch_ranges(&self.observations, scanner_id, task_id, upload_id)
+    }
+
+    pub(crate) fn batch_at(
+        &self,
+        scanner_id: Uuid,
+        ranges: &[std::ops::Range<usize>],
+        index: u32,
+    ) -> Result<Option<ScannerResultBatchUpload>, ScannerError> {
+        let Some(range) = ranges.get(index as usize) else {
+            return Ok(None);
+        };
+        Ok(Some(ScannerResultBatchUpload {
+            protocol_version: RESULT_PROTOCOL_VERSION,
+            scanner_id,
+            task_id: self
+                .task_id
+                .ok_or_else(|| ScannerError::Upload("missing task identity".into()))?,
+            upload_id: self
+                .upload_id
+                .ok_or_else(|| ScannerError::Upload("missing upload identity".into()))?,
+            batch_index: index,
+            is_final: index as usize + 1 == ranges.len(),
+            observations: self.observations[range.clone()].to_vec(),
+        }))
+    }
+
+    pub(crate) fn archive(&mut self, reason: &str) -> Result<(), ScannerError> {
+        if let Some(store) = self.store.as_mut() {
+            store.archive_upload(&self.server_origin, reason)?;
+        }
+        self.clear()
+    }
+
+    #[cfg(test)]
     pub(crate) fn upload_batches(
         &self,
         scanner_id: Uuid,

@@ -7,10 +7,10 @@ use crate::types::ServiceDetectionConfig;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, Command};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
@@ -26,11 +26,13 @@ struct StderrCapture {
 
 pub(crate) enum EngineOutcome {
     Completed(Vec<ServiceObservation>),
+    Partial(Vec<ServiceObservation>, String),
     Cancelled,
 }
 
 enum ProcessOutcome {
     Completed(Vec<ProbeEvidence>),
+    TimedOut(Vec<ProbeEvidence>, &'static str),
     Cancelled,
 }
 
@@ -100,47 +102,177 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
+#[cfg(test)]
 pub(crate) async fn run(
     config: &ServiceDetectionConfig,
     open_ports: &[PortObservation],
     address_family: &str,
     cancel_requested: &AtomicBool,
 ) -> Result<EngineOutcome, ScannerError> {
-    let initial = initial_attempts(open_ports, config);
-    if initial.is_empty() {
-        tracing::info!(
-            event = "ServiceDetectionSkipped",
-            reason = "no_tcp_endpoints",
-            "service detection skipped"
-        );
-        return Ok(EngineOutcome::Completed(Vec::new()));
-    }
+    run_with_journal(config, open_ports, address_family, cancel_requested, None).await
+}
 
-    let mut evidence =
-        match run_attempts(config, &initial, address_family, cancel_requested).await? {
-            ProcessOutcome::Completed(evidence) => evidence,
-            ProcessOutcome::Cancelled => return Ok(EngineOutcome::Cancelled),
-        };
-    let fallback = fallback_attempts(open_ports, &initial, &evidence, config);
-    if !fallback.is_empty() {
-        tracing::debug!(
-            endpoint_count = fallback
-                .iter()
-                .map(|attempt| (&attempt.ip, attempt.port))
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            probe_count = fallback.len(),
-            "running adaptive service detection fallback round"
-        );
-        match run_attempts(config, &fallback, address_family, cancel_requested).await? {
-            ProcessOutcome::Completed(mut fallback_evidence) => {
-                evidence.append(&mut fallback_evidence)
+pub(crate) async fn run_with_journal(
+    config: &ServiceDetectionConfig,
+    open_ports: &[PortObservation],
+    address_family: &str,
+    cancel_requested: &AtomicBool,
+    mut journal: Option<&mut crate::journal::ScanJournal<'_>>,
+) -> Result<EngineOutcome, ScannerError> {
+    let started = Instant::now();
+    let previous_elapsed = journal.as_ref().map_or(0, |j| j.state.elapsed_ms);
+    let budget_ms = config.max_runtime_seconds.saturating_mul(1000);
+    let deadline = started + Duration::from_millis(budget_ms.saturating_sub(previous_elapsed));
+    let mut services = Vec::new();
+    let mut service_bytes = 0usize;
+    if let Some(j) = journal.as_ref() {
+        for observation in &j.state.observations {
+            if let crate::scan::ScanObservation::Service(service) = observation {
+                service_bytes = service_bytes.saturating_add(serde_json::to_vec(service)?.len());
             }
-            ProcessOutcome::Cancelled => return Ok(EngineOutcome::Cancelled),
         }
     }
+    let first_chunk = journal.as_ref().map_or(0, |j| j.state.chunk);
+    let chunk_count = open_ports.len().div_ceil(config.batch_endpoints);
+    tracing::info!(
+        event = "ServiceDetectionStarted",
+        endpoint_count = open_ports.len(),
+        chunk_count,
+        resumed_chunk = first_chunk,
+        strategy = config.strategy.as_str(),
+        senders = config.senders,
+        server_rate_limit = config.server_rate_limit,
+        max_runtime_seconds = config.max_runtime_seconds,
+        idle_timeout_seconds = config.idle_timeout_seconds,
+        "service detection started"
+    );
+    for (chunk_index, ports) in open_ports
+        .chunks(config.batch_endpoints)
+        .enumerate()
+        .skip(first_chunk)
+    {
+        if cancel_requested.load(Ordering::Relaxed) {
+            return Ok(EngineOutcome::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Ok(EngineOutcome::Partial(
+                services,
+                "service_detection_runtime_exceeded".into(),
+            ));
+        }
+        if let Some(j) = journal.as_mut() {
+            j.save(
+                j.state.stage,
+                chunk_index,
+                previous_elapsed.saturating_add(started.elapsed().as_millis() as u64),
+                None,
+            )?;
+            j.store.start_checkpoint_block(j.origin)?;
+        }
+        let initial = initial_attempts(ports, config);
+        let result =
+            run_attempts(config, &initial, address_family, cancel_requested, deadline).await;
+        let mut evidence;
+        let mut timeout_reason = None;
+        match result {
+            Ok(ProcessOutcome::Completed(e)) => evidence = e,
+            Ok(ProcessOutcome::TimedOut(e, reason)) => {
+                evidence = e;
+                timeout_reason = Some(reason);
+            }
+            Ok(ProcessOutcome::Cancelled) => {
+                save_elapsed(&mut journal, previous_elapsed, started)?;
+                return Ok(EngineOutcome::Cancelled);
+            }
+            Err(error) => {
+                save_elapsed(&mut journal, previous_elapsed, started)?;
+                return Err(error);
+            }
+        }
+        let fallback = fallback_attempts(ports, &initial, &evidence, config);
+        if timeout_reason.is_none() && !fallback.is_empty() {
+            match run_attempts(
+                config,
+                &fallback,
+                address_family,
+                cancel_requested,
+                deadline,
+            )
+            .await
+            {
+                Ok(ProcessOutcome::Completed(mut e)) => evidence.append(&mut e),
+                Ok(ProcessOutcome::TimedOut(mut e, reason)) => {
+                    evidence.append(&mut e);
+                    timeout_reason = Some(reason);
+                }
+                Ok(ProcessOutcome::Cancelled) => {
+                    save_elapsed(&mut journal, previous_elapsed, started)?;
+                    return Ok(EngineOutcome::Cancelled);
+                }
+                Err(error) => {
+                    save_elapsed(&mut journal, previous_elapsed, started)?;
+                    return Err(error);
+                }
+            }
+        }
+        let mut block = aggregate(&evidence, config);
+        let mut retained = Vec::new();
+        for service in block.drain(..) {
+            let bytes = serde_json::to_vec(&service)?.len();
+            if service_bytes.saturating_add(bytes) > 64 * 1024 * 1024 {
+                timeout_reason = Some("service_detection_result_limit");
+                break;
+            }
+            service_bytes += bytes;
+            retained.push(service);
+        }
+        let block = retained;
+        if let Some(reason) = timeout_reason {
+            save_elapsed(&mut journal, previous_elapsed, started)?;
+            services.extend(block);
+            return Ok(EngineOutcome::Partial(services, reason.into()));
+        }
+        if let Some(j) = journal.as_mut() {
+            let observations: Vec<_> = block
+                .iter()
+                .cloned()
+                .map(crate::scan::ScanObservation::Service)
+                .collect();
+            j.save(
+                j.state.stage,
+                chunk_index + 1,
+                previous_elapsed.saturating_add(started.elapsed().as_millis() as u64),
+                Some(&observations),
+            )?;
+        }
+        services.extend(block);
+        tracing::info!(
+            event = "ServiceDetectionChunkCompleted",
+            chunk_index,
+            chunk_count,
+            endpoint_count = ports.len(),
+            service_count = services.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "service detection block completed"
+        );
+    }
+    Ok(EngineOutcome::Completed(services))
+}
 
-    Ok(EngineOutcome::Completed(aggregate(&evidence, config)))
+fn save_elapsed(
+    journal: &mut Option<&mut crate::journal::ScanJournal<'_>>,
+    previous: u64,
+    started: Instant,
+) -> Result<(), ScannerError> {
+    if let Some(j) = journal.as_mut() {
+        j.save(
+            j.state.stage,
+            j.state.chunk,
+            previous.saturating_add(started.elapsed().as_millis() as u64),
+            None,
+        )?;
+    }
+    Ok(())
 }
 
 async fn run_attempts(
@@ -148,6 +280,7 @@ async fn run_attempts(
     attempts: &[ProbeAttempt],
     address_family: &str,
     cancel_requested: &AtomicBool,
+    deadline: Instant,
 ) -> Result<ProcessOutcome, ScannerError> {
     let input = build_zgrab_input(attempts);
 
@@ -178,6 +311,7 @@ async fn run_attempts(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|error| ScannerError::Scan(format!("failed to spawn zgrab2: {error}")))?;
     let process_id = child.id();
@@ -200,7 +334,12 @@ async fn run_attempts(
         stdin.shutdown().await
     });
     let stderr_handle = tokio::spawn(collect_zgrab_stderr(stderr));
-    let mut lines = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
+    let mut line_buffer = Vec::new();
+    let mut last_progress = Instant::now();
+    let mut progress = tokio::time::interval(Duration::from_secs(30));
+    progress.tick().await;
+    let mut output_bytes = 0usize;
     let mut results = Vec::new();
     let mut invalid_lines = 0usize;
 
@@ -215,11 +354,48 @@ async fn run_attempts(
         }
 
         let line = tokio::select! {
-            line = lines.next_line() => line
-                .map_err(|error| ScannerError::Scan(format!("failed to read zgrab2 output: {error}")))?,
+            line = read_bounded_line(&mut reader, &mut line_buffer, config.max_result_bytes.saturating_mul(32).clamp(65536, 8*1024*1024)) => match line {
+                Ok(line) => line,
+                Err(error) => {
+                    let _ = child.kill().await;
+                    input_handle.abort();
+                    let _ = finish_zgrab_stderr(stderr_handle).await;
+                    return Err(error.into());
+                }
+            },
+            _ = sleep(deadline.saturating_duration_since(Instant::now())) => {
+                let _ = child.kill().await;
+                input_handle.abort();
+                let _ = finish_zgrab_stderr(stderr_handle).await;
+                return Ok(ProcessOutcome::TimedOut(results, "service_detection_runtime_exceeded"));
+            },
+            _ = sleep(Duration::from_secs(config.idle_timeout_seconds).saturating_sub(last_progress.elapsed())) => {
+                let _ = child.kill().await;
+                input_handle.abort();
+                let _ = finish_zgrab_stderr(stderr_handle).await;
+                return Ok(ProcessOutcome::TimedOut(results, "service_detection_idle_timeout"));
+            },
+            _ = progress.tick() => {
+                tracing::info!(event="ServiceDetectionProgress", process_id=?process_id,
+                    probe_count=attempts.len(), output_count=results.len(), invalid_lines,
+                    output_bytes, elapsed_ms=started_at.elapsed().as_millis() as u64,
+                    idle_ms=last_progress.elapsed().as_millis() as u64, "service detection progress");
+                continue;
+            },
             _ = sleep(Duration::from_millis(200)) => continue,
         };
         let Some(line) = line else { break };
+        last_progress = Instant::now();
+        output_bytes = output_bytes.saturating_add(line.len());
+        if output_bytes > 64 * 1024 * 1024 {
+            let _ = child.kill().await;
+            input_handle.abort();
+            let _ = finish_zgrab_stderr(stderr_handle).await;
+            return Ok(ProcessOutcome::TimedOut(
+                results,
+                "service_detection_evidence_limit",
+            ));
+        }
         match parse_zgrab_line(&line, config.max_result_bytes) {
             Ok(mut parsed) => results.append(&mut parsed),
             Err(error) => {
@@ -249,14 +425,48 @@ async fn run_attempts(
         return Ok(ProcessOutcome::Cancelled);
     }
 
-    input_handle
-        .await
-        .map_err(|error| ScannerError::Scan(format!("zgrab2 input writer failed: {error}")))?
-        .map_err(|error| ScannerError::Scan(format!("failed to write zgrab2 input: {error}")))?;
-    let status = child
-        .wait()
-        .await
-        .map_err(|error| ScannerError::Scan(format!("failed to wait for zgrab2: {error}")))?;
+    let mut input_handle = input_handle;
+    let finish = async {
+        (&mut input_handle)
+            .await
+            .map_err(|error| ScannerError::Scan(format!("zgrab2 input writer failed: {error}")))?
+            .map_err(|error| {
+                ScannerError::Scan(format!("failed to write zgrab2 input: {error}"))
+            })?;
+        child.wait().await.map_err(ScannerError::Io)
+    };
+    let finish_result = {
+        let finish = tokio::time::timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(config.idle_timeout_seconds)),
+            finish,
+        );
+        tokio::pin!(finish);
+        loop {
+            tokio::select! {
+                result = &mut finish => break Some(result),
+                _ = sleep(Duration::from_millis(200)) => {
+                    if cancel_requested.load(Ordering::Relaxed) { break None; }
+                }
+            }
+        }
+    };
+    let status = match finish_result {
+        Some(Ok(result)) => result?,
+        _ => {
+            input_handle.abort();
+            let _ = child.kill().await;
+            let _ = finish_zgrab_stderr(stderr_handle).await;
+            if cancel_requested.load(Ordering::Relaxed) {
+                return Ok(ProcessOutcome::Cancelled);
+            }
+            return Ok(ProcessOutcome::TimedOut(
+                results,
+                "service_detection_process_exit_timeout",
+            ));
+        }
+    };
     let stderr_output = finish_zgrab_stderr(stderr_handle).await;
 
     if cancel_requested.load(Ordering::Relaxed) {
@@ -511,38 +721,63 @@ fn zgrab_config(config: &ServiceDetectionConfig) -> String {
     output
 }
 
-async fn collect_zgrab_stderr(stderr: ChildStderr) -> StderrCapture {
-    let mut lines = BufReader::new(stderr).lines();
-    let mut captured = String::new();
-    let mut captured_chars = 0usize;
-    let mut bytes = 0usize;
-    let mut truncated = false;
-    while let Ok(Some(line)) = lines.next_line().await {
-        tracing::debug!(line_bytes = line.len(), "zgrab2 stderr received");
-        bytes = bytes.saturating_add(line.len()).saturating_add(1);
-        if captured_chars < MAX_ZGRAB_STDERR_CHARS {
-            if !captured.is_empty() && captured_chars < MAX_ZGRAB_STDERR_CHARS {
-                captured.push('\n');
-                captured_chars += 1;
+// The buffer survives select cancellation, so progress ticks cannot corrupt JSON lines.
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<Option<String>> {
+    loop {
+        let bytes = reader.fill_buf().await?;
+        if bytes.is_empty() {
+            if buffer.is_empty() {
+                return Ok(None);
             }
-            let remaining = MAX_ZGRAB_STDERR_CHARS.saturating_sub(captured_chars);
-            let line_chars = line.chars().count();
-            captured.extend(line.chars().take(remaining));
-            captured_chars += line_chars.min(remaining);
-            truncated |= line_chars > remaining;
-        } else {
-            truncated = true;
+            return String::from_utf8(std::mem::take(buffer))
+                .map(Some)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
         }
-    }
-    StderrCapture {
-        text: captured,
-        bytes,
-        truncated,
+        let end = bytes.iter().position(|&b| b == b'\n').map(|p| p + 1);
+        let count = end.unwrap_or(bytes.len());
+        if buffer.len().saturating_add(count) > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "zgrab2 output line exceeds byte limit",
+            ));
+        }
+        buffer.extend_from_slice(&bytes[..count]);
+        reader.consume(count);
+        if end.is_some() {
+            return String::from_utf8(std::mem::take(buffer))
+                .map(Some)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+        }
     }
 }
 
-async fn finish_zgrab_stderr(handle: JoinHandle<StderrCapture>) -> StderrCapture {
-    match handle.await {
+async fn collect_zgrab_stderr(mut stderr: ChildStderr) -> StderrCapture {
+    let mut capture = StderrCapture::default();
+    let mut chunk = [0u8; 8192];
+    while let Ok(count) = stderr.read(&mut chunk).await {
+        if count == 0 {
+            break;
+        }
+        capture.bytes = capture.bytes.saturating_add(count);
+        let remaining = MAX_ZGRAB_STDERR_CHARS.saturating_sub(capture.text.chars().count());
+        let text = String::from_utf8_lossy(&chunk[..count]);
+        capture.text.extend(text.chars().take(remaining));
+        capture.truncated |= text.chars().count() > remaining;
+    }
+    capture
+}
+
+async fn finish_zgrab_stderr(mut handle: JoinHandle<StderrCapture>) -> StderrCapture {
+    let result = tokio::time::timeout(Duration::from_secs(5), &mut handle).await;
+    if result.is_err() {
+        handle.abort();
+        return StderrCapture::default();
+    }
+    match result.unwrap_or_else(|_| unreachable!("timeout handled above")) {
         Ok(output) => output,
         Err(error) => {
             tracing::warn!(
@@ -560,6 +795,136 @@ async fn finish_zgrab_stderr(handle: JoinHandle<StderrCapture>) -> StderrCapture
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn continuous_output_cannot_extend_total_runtime_budget() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("scanner-runtime-{}", uuid::Uuid::now_v7()));
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nwhile true; do printf '{}\n'; sleep 0.05; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = super::ServiceDetectionConfig {
+            zgrab_path: path.to_string_lossy().into_owned(),
+            max_runtime_seconds: 1,
+            idle_timeout_seconds: 5,
+            ..Default::default()
+        };
+        let outcome = super::run(
+            &config,
+            &[open_port("192.0.2.1", 22, "tcp")],
+            "ipv4",
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome,super::EngineOutcome::Partial(_,reason) if reason=="service_detection_runtime_exceeded")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_output_line_is_rejected_before_allocation() {
+        let mut reader = tokio::io::BufReader::new(&b"123456789\n"[..]);
+        let mut buffer = Vec::new();
+        assert!(
+            super::read_bounded_line(&mut reader, &mut buffer, 4)
+                .await
+                .is_err()
+        );
+        assert!(buffer.len() <= 4);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_child_is_terminated_and_reports_partial_results() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("scanner-idle-{}", uuid::Uuid::now_v7()));
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = super::ServiceDetectionConfig {
+            zgrab_path: path.to_string_lossy().into_owned(),
+            idle_timeout_seconds: 1,
+            max_runtime_seconds: 5,
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let outcome = super::run(
+            &config,
+            &[open_port("192.0.2.1", 22, "tcp")],
+            "ipv4",
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome,super::EngineOutcome::Partial(_,reason) if reason=="service_detection_idle_timeout")
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closing_stdout_does_not_bypass_process_exit_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("scanner-eof-{}", uuid::Uuid::now_v7()));
+        std::fs::write(&path, "#!/bin/sh\nexec 1>&-\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = super::ServiceDetectionConfig {
+            zgrab_path: path.to_string_lossy().into_owned(),
+            idle_timeout_seconds: 1,
+            max_runtime_seconds: 5,
+            ..Default::default()
+        };
+        let outcome = super::run(
+            &config,
+            &[open_port("192.0.2.1", 22, "tcp")],
+            "ipv4",
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome,super::EngineOutcome::Partial(_,reason) if reason=="service_detection_process_exit_timeout")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exhausted_checkpoint_budget_does_not_spawn_another_child() {
+        let path = std::env::temp_dir().join(format!("scanner-budget-{}", uuid::Uuid::now_v7()));
+        let store = crate::storage::StateStore::open(path.clone()).unwrap();
+        let key = format!("{}|config", uuid::Uuid::now_v7());
+        store
+            .save_checkpoint("origin", &key, 1, 0, 1000, None)
+            .unwrap();
+        let mut journal = crate::journal::ScanJournal::open(&store, "origin", key).unwrap();
+        let config = super::ServiceDetectionConfig {
+            zgrab_path: "/missing/binary".into(),
+            max_runtime_seconds: 1,
+            ..Default::default()
+        };
+        let outcome = super::run_with_journal(
+            &config,
+            &[open_port("192.0.2.1", 22, "tcp")],
+            "ipv4",
+            &std::sync::atomic::AtomicBool::new(false),
+            Some(&mut journal),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome,super::EngineOutcome::Partial(_,reason) if reason=="service_detection_runtime_exceeded")
+        );
+        drop(journal);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
     use super::*;
     use std::sync::atomic::AtomicBool;
 

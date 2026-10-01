@@ -3,6 +3,7 @@ use crate::http_client::{ServerHttpClient, response_decode_error, response_error
 use crate::types::{
     AppConfig, DnsConfig, NucleiConfig, ServiceDetectionConfig, ServiceDetectionStrategy,
 };
+use crate::types::{default_batch_endpoints, default_idle_timeout, default_service_runtime};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -31,6 +32,12 @@ pub(crate) struct RemoteMasscanConfig {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RemoteServiceDetectionConfig {
+    #[serde(default = "default_batch_endpoints")]
+    pub(crate) batch_endpoints: usize,
+    #[serde(default = "default_idle_timeout")]
+    pub(crate) idle_timeout_seconds: u64,
+    #[serde(default = "default_service_runtime")]
+    pub(crate) max_runtime_seconds: u64,
     pub(crate) enabled: bool,
     pub(crate) strategy: ServiceDetectionStrategy,
     pub(crate) max_probes_per_endpoint: usize,
@@ -212,6 +219,9 @@ impl RuntimeConfiguration {
         service.connect_timeout_seconds = remote.service_detection.connect_timeout_seconds;
         service.target_timeout_seconds = remote.service_detection.target_timeout_seconds;
         service.max_result_bytes = remote.service_detection.max_result_bytes;
+        service.batch_endpoints = remote.service_detection.batch_endpoints;
+        service.idle_timeout_seconds = remote.service_detection.idle_timeout_seconds;
+        service.max_runtime_seconds = remote.service_detection.max_runtime_seconds;
         let mut dns = self.local_dns.clone();
         dns.enabled = self.local_dns_enabled && remote.dns.enabled;
         dns.record_types = remote.dns.record_types.clone();
@@ -240,7 +250,10 @@ impl RuntimeConfiguration {
 
 impl RemoteRuntimeConfiguration {
     fn validate(&self) -> Result<(), String> {
-        if self.masscan.rate <= 0
+        if !(1..=4096).contains(&self.service_detection.batch_endpoints)
+            || !(1..=3600).contains(&self.service_detection.idle_timeout_seconds)
+            || !(1..=86400).contains(&self.service_detection.max_runtime_seconds)
+            || self.masscan.rate <= 0
             || !(1..=32).contains(&self.service_detection.max_probes_per_endpoint)
             || !(1..=100).contains(&self.service_detection.confidence_threshold)
             || !(1..=10_000).contains(&self.service_detection.senders)
@@ -319,6 +332,22 @@ pub(crate) async fn fetch_configuration(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_remote_configuration_uses_bounded_service_defaults() {
+        let value = serde_json::json!({"enabled":true,"strategy":"standard","max_probes_per_endpoint":8,
+            "confidence_threshold":80,"senders":200,"server_rate_limit":20,"connect_timeout_seconds":5,
+            "target_timeout_seconds":15,"max_result_bytes":65536});
+        let service: super::RemoteServiceDetectionConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            (
+                service.batch_endpoints,
+                service.idle_timeout_seconds,
+                service.max_runtime_seconds
+            ),
+            (512, 120, 1800)
+        );
+    }
+
     use super::*;
 
     #[tokio::test]

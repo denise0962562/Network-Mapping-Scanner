@@ -4,6 +4,7 @@ mod error;
 mod health;
 mod heartbeat;
 mod http_client;
+mod journal;
 mod logging;
 mod network;
 mod reconnect;
@@ -519,15 +520,11 @@ async fn run() -> Result<(), ScannerError> {
         log_event!(LogLevel::Info, "SCAN-DONE", "scan loop finished", "main");
     }
 
-    match flush(&uploader, scanner_id, &mut cache).await {
-        Ok(()) => active_task.clear().await,
-        Err(error) => log_flush_failure(
-            "FinalResultUploadFailed",
-            "batch_retained_on_disk",
-            &error,
-            &cache,
-        ),
-    }
+    tracing::info!(
+        event = "ShutdownUploadRetained",
+        pending = cache.has_pending_task(),
+        "shutdown preserves durable results for the next lease recovery"
+    );
     if let Err(error) = heartbeat_client.send(active_task.get().await, true).await {
         tracing::warn!(
             event = "FinalHeartbeatFailed",
@@ -1082,49 +1079,6 @@ async fn wait_until_online(receiver: &mut watch::Receiver<ConnectionState>) -> b
 
 // ---- pipeline helpers ---------------------------------------------------
 
-fn log_flush_failure(
-    event: &'static str,
-    outcome: &'static str,
-    error: &ScannerError,
-    cache: &CacheManager,
-) {
-    match error {
-        ScannerError::UploadBatch { context, source } => tracing::error!(
-            event,
-            operation = source.operation(),
-            error_kind = source.kind(),
-            error_code = source.code(),
-            error_message = %source,
-            retryable = source.is_retryable(),
-            outcome,
-            scanner_id = %context.scanner_id,
-            task_id = %context.task_id,
-            upload_id = %context.upload_id,
-            batch_index = context.batch_index,
-            is_final = context.is_final,
-            protocol_version = context.protocol_version,
-            observation_count = context.observation_count,
-            http_status = ?source.status(),
-            server_request_id = ?source.request_id(),
-            "scan result flush failed"
-        ),
-        _ => tracing::error!(
-            event,
-            operation = "prepare_or_commit_result_cache",
-            error_kind = "local_storage",
-            error_code = "result_cache_operation_failed",
-            error_message = %error,
-            retryable = false,
-            outcome,
-            task_id = ?cache.task_id,
-            upload_id = ?cache.upload_id,
-            next_batch_index = cache.next_batch_index,
-            observation_count = cache.observations.len(),
-            "scan result flush failed"
-        ),
-    }
-}
-
 fn log_terminal_scanner_error(
     event: &'static str,
     operation: &'static str,
@@ -1170,12 +1124,13 @@ async fn flush(
         return Ok(());
     }
 
-    let batches = cache.upload_batches(scanner_id)?;
-    if let Some(first) = batches.first() {
+    let ranges = cache.upload_ranges(scanner_id)?;
+    let first_batch = cache.batch_at(scanner_id, &ranges, cache.next_batch_index)?;
+    if let Some(first) = first_batch.as_ref() {
         tracing::debug!(
             task_id = %first.task_id,
             upload_id = %first.upload_id,
-            pending_batch_count = batches.len(),
+            pending_batch_count = ranges.len().saturating_sub(cache.next_batch_index as usize),
             observation_count = cache.observations.len(),
             "flushing cached scan observations"
         );
@@ -1189,10 +1144,10 @@ async fn flush(
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_owned());
     let observation_count = cache.observations.len();
-    let batch_count = batches.len();
-    for batch in &batches {
+    let batch_count = ranges.len();
+    while let Some(batch) = cache.batch_at(scanner_id, &ranges, cache.next_batch_index)? {
         uploader
-            .upload(batch)
+            .upload(&batch)
             .await
             .map_err(|source| ScannerError::UploadBatch {
                 context: UploadBatchContext {
@@ -1216,6 +1171,9 @@ async fn flush(
         observation_count,
         "all cached scan results uploaded"
     );
+    if let (Some(store), Some(task_id)) = (&cache.store, cache.task_id) {
+        store.clear_scan_failures(&cache.server_origin, task_id)?;
+    }
     cache.clear()?;
     Ok(())
 }
@@ -1236,18 +1194,12 @@ async fn flush_with_guards(
     let Some(task_id) = active_task.get().await else {
         return FlushAttempt::Completed(flush(uploader, scanner_id, cache).await);
     };
-    let remaining = active_task
-        .lease_safety_remaining(lease_safety_margin)
-        .await
-        .unwrap_or_default();
-    if remaining.is_zero() {
-        return FlushAttempt::LeaseExpired(task_id);
-    }
     let mut shutdown = shutdown_receiver();
     tokio::select! {
-        result = flush(uploader, scanner_id, cache) => FlushAttempt::Completed(result),
-        _ = sleep(remaining) => FlushAttempt::LeaseExpired(task_id),
+        biased;
+        _ = active_task.wait_for_lease_loss(task_id, lease_safety_margin) => FlushAttempt::LeaseExpired(task_id),
         _ = shutdown.changed() => FlushAttempt::Stopped,
+        result = flush(uploader, scanner_id, cache) => FlushAttempt::Completed(result),
     }
 }
 
@@ -1274,6 +1226,7 @@ async fn scan_loop(
 ) {
     let mut fetch_backoff = Backoff::new(config.retry_policy);
     let mut upload_backoff = Backoff::new(config.retry_policy);
+    let mut upload_identity_recoveries = 0u8;
 
     tracing::debug!(
         scanner_id = %config.scanner_id,
@@ -1416,36 +1369,9 @@ async fn scan_loop(
                 }
             }
             if active_task.cancellation_reason() == Some(TaskCancellationReason::LeaseLost) {
-                tracing::error!(
-                    event = "ResultCacheDiscardedAfterLeaseLoss",
-                    operation = "validate_task_lease",
-                    error_kind = "lease",
-                    error_code = "task_lease_lost",
-                    retryable = false,
-                    outcome = "discarding_cached_results",
-                    task_id = ?cache.task_id,
-                    upload_id = ?cache.upload_id,
-                    next_batch_index = cache.next_batch_index,
-                    observation_count = cache.observations.len(),
-                    "discarding cached results after task lease loss"
-                );
-                if let Err(error) = cache.clear() {
-                    tracing::error!(
-                        event = "LeaseLostResultCacheDiscardError",
-                        operation = "clear_result_cache",
-                        error_kind = "local_storage",
-                        error_code = "result_cache_clear_failed",
-                        error_message = %error,
-                        retryable = false,
-                        outcome = "cached_results_retained",
-                        task_id = ?cache.task_id,
-                        upload_id = ?cache.upload_id,
-                        next_batch_index = cache.next_batch_index,
-                        observation_count = cache.observations.len(),
-                        "failed to discard cached results after lease loss"
-                    );
-                    break;
-                }
+                tracing::warn!(event = "ResultUploadRecoveryRequired", task_id = ?cache.task_id,
+                    upload_id = ?cache.upload_id, next_batch_index = cache.next_batch_index,
+                    "upload paused after lease loss; durable results retained");
                 active_task.clear().await;
                 continue;
             }
@@ -1459,6 +1385,20 @@ async fn scan_loop(
             .await
             {
                 FlushAttempt::LeaseExpired(task_id) => {
+                    if active_task.cancellation_reason() == Some(TaskCancellationReason::Shutdown) {
+                        break;
+                    }
+                    if active_task.cancellation_reason()
+                        == Some(TaskCancellationReason::ServerRequested)
+                    {
+                        let _ = heartbeat_client.report_cancelled(task_id).await;
+                        if let Err(error) = cache.archive("server_cancelled_task") {
+                            tracing::error!(%error, "failed to archive cancelled upload");
+                            break;
+                        }
+                        active_task.clear().await;
+                        continue;
+                    }
                     active_task.request_lease_lost(task_id).await;
                     tracing::error!(
                         event = "ResultUploadLeaseDeadlineExceeded",
@@ -1466,7 +1406,7 @@ async fn scan_loop(
                         error_kind = "lease",
                         error_code = "upload_lease_safety_deadline_exceeded",
                         retryable = false,
-                        outcome = "discarding_cached_results",
+                        outcome = "cached_results_retained",
                         %task_id,
                         upload_id = ?cache.upload_id,
                         next_batch_index = cache.next_batch_index,
@@ -1474,29 +1414,13 @@ async fn scan_loop(
                         lease_safety_margin_ms = config.lease_safety_margin.as_millis() as u64,
                         "result upload stopped at the lease safety deadline"
                     );
-                    if let Err(error) = cache.clear() {
-                        tracing::error!(
-                            event = "ExpiredLeaseResultCacheDiscardError",
-                            operation = "clear_result_cache",
-                            error_kind = "local_storage",
-                            error_code = "result_cache_clear_failed",
-                            error_message = %error,
-                            retryable = false,
-                            outcome = "cached_results_retained",
-                            %task_id,
-                            upload_id = ?cache.upload_id,
-                            next_batch_index = cache.next_batch_index,
-                            observation_count = cache.observations.len(),
-                            "failed to discard results after lease expiry"
-                        );
-                        break;
-                    }
                     active_task.clear().await;
                     continue;
                 }
                 FlushAttempt::Stopped => break,
                 FlushAttempt::Completed(Ok(())) => {
                     upload_backoff.reset();
+                    upload_identity_recoveries = 0;
                     active_task.clear().await;
                 }
                 FlushAttempt::Completed(Err(ScannerError::UploadBatch { context, source }))
@@ -1571,6 +1495,30 @@ async fn scan_loop(
                     continue;
                 }
                 FlushAttempt::Completed(Err(ScannerError::UploadBatch { context, source }))
+                    if matches!(source.as_ref(), ServerError::UploadIdentityConflict { .. })
+                        && upload_identity_recoveries < 2 =>
+                {
+                    upload_identity_recoveries += 1;
+                    tracing::warn!(
+                        event = "ResultUploadExecutionRecovery",
+                        operation = source.operation(),
+                        error_kind = source.kind(),
+                        error_code = source.code(),
+                        error_message = %source,
+                        retryable = true,
+                        outcome = "execution_recovery_requested",
+                        scanner_id = %context.scanner_id,
+                        task_id = %context.task_id,
+                        upload_id = %context.upload_id,
+                        batch_index = context.batch_index,
+                        server_request_id = ?source.request_id(),
+                        attempt = upload_identity_recoveries,
+                        "upload identity conflicted with a previous execution attempt; recovering a clean execution"
+                    );
+                    active_task.clear().await;
+                    continue;
+                }
+                FlushAttempt::Completed(Err(ScannerError::UploadBatch { context, source }))
                     if is_stale_task_error(&source) =>
                 {
                     tracing::error!(
@@ -1580,7 +1528,7 @@ async fn scan_loop(
                         error_code = source.code(),
                         error_message = %source,
                         retryable = false,
-                        outcome = "batch_discarded",
+                        outcome = "batch_archived",
                         scanner_id = %context.scanner_id,
                         task_id = %context.task_id,
                         upload_id = %context.upload_id,
@@ -1590,9 +1538,9 @@ async fn scan_loop(
                         observation_count = context.observation_count,
                         http_status = ?source.status(),
                         server_request_id = ?source.request_id(),
-                        "server no longer accepts this task; discarding cached results"
+                        "server no longer accepts this task; archiving cached results"
                     );
-                    if let Err(clear_error) = cache.clear() {
+                    if let Err(clear_error) = cache.archive("server_rejected_upload") {
                         tracing::error!(
                             event = "RejectedResultCacheDiscardError",
                             operation = "clear_result_cache",
@@ -1659,8 +1607,23 @@ async fn scan_loop(
         if !wait_until_online(&mut connection).await {
             break;
         }
-        let recovered_task = match recover_task(config.server_client, config.current_task_url).await
+        let recovery_url = match cache
+            .store
+            .as_ref()
+            .map(|store| store.latest_scan_failure(&cache.server_origin))
+            .transpose()
         {
+            Ok(Some(Some((task_id, count)))) => format!(
+                "{}&failure_taskid={task_id}&failure_count={count}",
+                config.current_task_url
+            ),
+            Ok(_) => config.current_task_url.to_owned(),
+            Err(error) => {
+                tracing::error!(%error,"failed to load recovery failure report");
+                break;
+            }
+        };
+        let recovered_task = match recover_task(config.server_client, &recovery_url).await {
             Ok(FetchTaskOutcome::Task(task)) => {
                 fetch_backoff.reset();
                 tracing::info!(
@@ -1907,6 +1870,75 @@ async fn scan_loop(
             .clone()
             .unwrap_or_else(|| ScanPlan::legacy(&runtime.service_detection));
 
+        let scan_key = format!(
+            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            assigned_task.task_id,
+            target.ip,
+            target.port,
+            target.address_family,
+            target.rate,
+            scan_plan,
+            runtime.service_detection,
+            runtime.dns,
+            runtime.nuclei,
+            assigned_task.dns_resolvers
+        );
+        let journal = match cache
+            .store
+            .as_ref()
+            .map(|store| journal::ScanJournal::open(store, &cache.server_origin, scan_key))
+            .transpose()
+        {
+            Ok(journal) => journal,
+            Err(error) => {
+                tracing::error!(%error, "failed to load scan checkpoint");
+                break;
+            }
+        };
+        let retry_state = cache
+            .store
+            .as_ref()
+            .map(|store| store.scan_failures(&cache.server_origin, assigned_task.task_id))
+            .transpose();
+        let (failures, retry_at) = match retry_state {
+            Ok(state) => state.unwrap_or_default(),
+            Err(error) => {
+                tracing::error!(%error, "failed to read scan retry state");
+                break;
+            }
+        };
+        if failures >= 3 {
+            drop(journal);
+            let reported = report_task_status_with_retry(
+                heartbeat_client,
+                active_task,
+                assigned_task.task_id,
+                TaskReport::TerminalFailure("scan recovery limit exceeded after three failures"),
+                config.retry_policy,
+                config.lease_safety_margin,
+            )
+            .await;
+            active_task.clear().await;
+            if reported {
+                if let Some(store) = &cache.store
+                    && let Err(error) = store.clear_checkpoint(&cache.server_origin)
+                {
+                    tracing::error!(%error, "failed to clear terminal checkpoint");
+                    break;
+                }
+            } else if stop_requested() {
+                break;
+            }
+            continue;
+        }
+        if retry_at > chrono::Utc::now().timestamp_millis()
+            && sleep_or_stop(Duration::from_millis(
+                (retry_at - chrono::Utc::now().timestamp_millis()).max(0) as u64,
+            ))
+            .await
+        {
+            break;
+        }
         let scan_started_at = Instant::now();
         tracing::info!(
             event = "ScanTaskStarted",
@@ -1933,6 +1965,7 @@ async fn scan_loop(
         );
         let results = match run_scan(
             ScanRuntimeConfig {
+                journal,
                 scanner_path: config.scanner_path,
                 service_detection: &runtime.service_detection,
                 dns: &runtime.dns,
@@ -1976,6 +2009,13 @@ async fn scan_loop(
                     continue;
                 }
                 Some(TaskCancellationReason::LeaseLost) => {
+                    if let Some(store) = &cache.store
+                        && let Err(error) =
+                            store.record_scan_failure(&cache.server_origin, assigned_task.task_id)
+                    {
+                        tracing::error!(%error, "failed to persist scan failure");
+                        break;
+                    }
                     tracing::error!(
                         event = "ScanTaskLeaseLost",
                         operation = "monitor_task_lease",
@@ -1994,6 +2034,13 @@ async fn scan_loop(
                 Some(TaskCancellationReason::Shutdown) | None => return,
             },
             Err(e) => {
+                if let Some(store) = &cache.store
+                    && let Err(error) =
+                        store.record_scan_failure(&cache.server_origin, assigned_task.task_id)
+                {
+                    tracing::error!(%error, "failed to persist scan failure");
+                    break;
+                }
                 let diagnostics = e.scan_diagnostics();
                 tracing::error!(
                     event = "ScanTaskFailed",
@@ -2063,46 +2110,6 @@ async fn scan_loop(
             "scan task completed"
         );
 
-        match active_task.cancellation_reason() {
-            Some(TaskCancellationReason::LeaseLost) => {
-                tracing::error!(
-                    event = "CompletedResultsDiscardedAfterLeaseLoss",
-                    operation = "validate_task_lease",
-                    error_kind = "lease",
-                    error_code = "task_lease_lost",
-                    error_message = "completed results cannot be uploaded after lease loss",
-                    retryable = false,
-                    outcome = "results_discarded",
-                    task_id = %assigned_task.task_id,
-                    observation_count = results.len(),
-                    "discarding completed results after lease loss"
-                );
-                active_task.clear().await;
-                continue;
-            }
-            Some(TaskCancellationReason::Shutdown) => return,
-            Some(TaskCancellationReason::ServerRequested) => {
-                let _ = report_task_status_with_retry(
-                    heartbeat_client,
-                    active_task,
-                    assigned_task.task_id,
-                    TaskReport::Cancelled,
-                    config.retry_policy,
-                    config.lease_safety_margin,
-                )
-                .await;
-                active_task.clear().await;
-                continue;
-            }
-            None => {}
-        }
-
-        tracing::debug!(
-            task_id = %assigned_task.task_id,
-            result_count = results.len(),
-            "scan execution completed"
-        );
-
         if let Err(error) = cache.begin_task_with_observations(assigned_task.task_id, &results) {
             tracing::error!(
                 event = "ResultCacheBindFailed",
@@ -2119,22 +2126,57 @@ async fn scan_loop(
             );
             break;
         }
+        if let Some(store) = &cache.store
+            && let Err(error) = store.clear_checkpoint(&cache.server_origin)
+        {
+            tracing::error!(%error, "failed to clear completed checkpoint");
+            break;
+        }
+        match active_task.cancellation_reason() {
+            Some(TaskCancellationReason::LeaseLost) => {
+                tracing::error!(
+                    event = "CompletedResultsRetainedAfterLeaseLoss",
+                    operation = "validate_task_lease",
+                    error_kind = "lease",
+                    error_code = "task_lease_lost",
+                    error_message = "completed results cannot be uploaded after lease loss",
+                    retryable = false,
+                    outcome = "results_retained",
+                    task_id = %assigned_task.task_id,
+                    observation_count = results.len(),
+                    "retaining completed results for lease recovery"
+                );
+                active_task.clear().await;
+                continue;
+            }
+            Some(TaskCancellationReason::Shutdown) => return,
+            Some(TaskCancellationReason::ServerRequested) => {
+                let _ = report_task_status_with_retry(
+                    heartbeat_client,
+                    active_task,
+                    assigned_task.task_id,
+                    TaskReport::Cancelled,
+                    config.retry_policy,
+                    config.lease_safety_margin,
+                )
+                .await;
+                if let Err(error) = cache.archive("server_cancelled_task") {
+                    tracing::error!(%error, "failed to archive cancelled results");
+                    break;
+                }
+                active_task.clear().await;
+                continue;
+            }
+            None => {}
+        }
+
+        tracing::debug!(
+            task_id = %assigned_task.task_id,
+            result_count = results.len(),
+            "scan execution completed"
+        );
 
         if stop_requested() {
-            log_event!(
-                LogLevel::Info,
-                "FLUSH",
-                "flushing on stop signal",
-                "scan_loop"
-            );
-            if let Err(error) = flush(uploader, config.scanner_id, cache).await {
-                log_flush_failure(
-                    "ShutdownResultUploadFailed",
-                    "batch_retained_on_disk",
-                    &error,
-                    cache,
-                );
-            }
             return;
         }
 
@@ -2147,36 +2189,11 @@ async fn scan_loop(
 
     tracing::debug!(stop_requested = stop_requested(), "scan loop exiting");
 
-    if active_task.cancellation_reason() == Some(TaskCancellationReason::LeaseLost) {
-        if let Err(error) = cache.clear() {
-            tracing::error!(
-                event = "FinalLeaseLostCacheDiscardError",
-                operation = "clear_result_cache",
-                error_kind = "local_storage",
-                error_code = "result_cache_clear_failed",
-                error_message = %error,
-                retryable = false,
-                outcome = "cached_results_retained",
-                task_id = ?cache.task_id,
-                upload_id = ?cache.upload_id,
-                next_batch_index = cache.next_batch_index,
-                observation_count = cache.observations.len(),
-                "failed to discard cached results after lease loss"
-            );
-        }
-        active_task.clear().await;
-    } else {
-        match flush(uploader, config.scanner_id, cache).await {
-            Ok(()) if !cache.has_pending_task() => active_task.clear().await,
-            Ok(()) => {}
-            Err(error) => log_flush_failure(
-                "FinalScanLoopUploadFailed",
-                "batch_retained_on_disk",
-                &error,
-                cache,
-            ),
-        }
-    }
+    tracing::info!(
+        event = "ScanLoopStopped",
+        pending = cache.has_pending_task(),
+        "scan loop stopped; durable state retained"
+    );
 }
 
 fn pending_upload_recovery_url(
@@ -2449,5 +2466,148 @@ mod cli_command_tests {
                 }
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod upload_recovery_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn fixture(
+        delays: Vec<Option<std::time::Duration>>,
+    ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let thread = std::thread::spawn(move || {
+            let mut payloads = Vec::new();
+            for delay in delays {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut data = Vec::new();
+                let mut buffer = [0; 8192];
+                let (start, length) = loop {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    data.extend_from_slice(&buffer[..count]);
+                    if let Some(pos) = data.windows(4).position(|b| b == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&data[..pos]);
+                        let length = header
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")?
+                                    .trim()
+                                    .parse::<usize>()
+                                    .ok()
+                            })
+                            .unwrap();
+                        break (pos + 4, length);
+                    }
+                };
+                while data.len() < start + length {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    data.extend_from_slice(&buffer[..count]);
+                }
+                payloads.push(serde_json::from_slice(&data[start..start + length]).unwrap());
+                if let Some(delay) = delay {
+                    std::thread::sleep(delay);
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                }
+            }
+            payloads
+        });
+        (url, thread)
+    }
+
+    fn uploader(url: String) -> Uploader {
+        Uploader::new(
+            url,
+            ServerHttpClient::new(
+                true,
+                "fixture-token".into(),
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn missing_ack_retries_identical_final_batch_without_clearing_cache() {
+        let (url, thread) = fixture(vec![None, Some(std::time::Duration::ZERO)]);
+        let uploader = uploader(url);
+        let scanner = Uuid::now_v7();
+        let mut cache = CacheManager::default();
+        cache
+            .begin_task_with_observations(Uuid::now_v7(), &[])
+            .unwrap();
+        let upload = cache.upload_id;
+        assert!(flush(&uploader, scanner, &mut cache).await.is_err());
+        assert_eq!(cache.next_batch_index, 0);
+        assert_eq!(cache.upload_id, upload);
+        flush(&uploader, scanner, &mut cache).await.unwrap();
+        assert!(!cache.has_pending_task());
+        let payloads = thread.join().unwrap();
+        assert_eq!(payloads[0], payloads[1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_lease_never_starts_upload_or_discards_cache() {
+        SHUTDOWN.get_or_init(|| watch::channel(false).0);
+        let uploader = uploader("http://127.0.0.1:1".into());
+        let scanner = Uuid::now_v7();
+        let task = Uuid::now_v7();
+        let mut cache = CacheManager::default();
+        cache.begin_task_with_observations(task, &[]).unwrap();
+        let upload = cache.upload_id;
+        let active = ActiveTask::default();
+        active.set(task, 90_000).await;
+        tokio::time::advance(Duration::from_secs(81)).await;
+        assert!(
+            matches!(flush_with_guards(&uploader,scanner,&mut cache,&active,Duration::from_secs(10)).await,FlushAttempt::LeaseExpired(id) if id==task)
+        );
+        assert_eq!(cache.task_id, Some(task));
+        assert_eq!(cache.upload_id, upload);
+        assert_eq!(cache.next_batch_index, 0);
+    }
+
+    #[tokio::test]
+    async fn slow_upload_completes_after_lease_renewal() {
+        SHUTDOWN.get_or_init(|| watch::channel(false).0);
+        let (url, thread) = fixture(vec![Some(std::time::Duration::from_millis(250))]);
+        let uploader = uploader(url);
+        let scanner = Uuid::now_v7();
+        let task = Uuid::now_v7();
+        let mut cache = CacheManager::default();
+        cache.begin_task_with_observations(task, &[]).unwrap();
+        let active = ActiveTask::default();
+        active.set(task, 150).await;
+        let renewer = active.clone();
+        let renew = tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            renewer.renew_lease(1000).await;
+        });
+        assert!(matches!(
+            flush_with_guards(
+                &uploader,
+                scanner,
+                &mut cache,
+                &active,
+                Duration::from_millis(10)
+            )
+            .await,
+            FlushAttempt::Completed(Ok(()))
+        ));
+        assert!(!cache.has_pending_task());
+        renew.await.unwrap();
+        thread.join().unwrap();
     }
 }
