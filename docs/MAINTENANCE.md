@@ -384,6 +384,21 @@ pub(crate) struct NetworkCapabilities {
 
 ---
 
+## 本地部署配置与远程运行配置
+
+管理员可在控制端 `/scanner/{id}/configuration` 发布扫描器运行参数。心跳响应通知配置 revision；扫描器通过带运行凭据的 `GET /api/scanner/runtime-config?scannerid={scanner_id}` 拉取文档并暂存，在扫描循环的任务边界校验、应用。正在执行的扫描不会中途切换参数。
+
+远程文档可调整 masscan 速率、服务识别策略/探测预算/并发/超时/结果限制、DNS 开关/记录类型/查询超时，以及 Nuclei 开关/严重级别/速率/并发/超时/结果限制等参数。合并规则为：
+
+- masscan 运行速率取远程值与本地 `scanner.rate` 的较小值。
+- 服务识别、DNS 和 Nuclei 的有效开关为“本地 enabled 且远程 enabled”，远程不能开启本地禁用的引擎。
+- 二进制路径、Nuclei 模板目录、服务端连接、身份、日志目录和网络探测等部署字段继续来自本地配置；远程文档不接收任意 CLI 参数。
+- 不支持的 schema version、非法 revision 或越界参数不会替换当前有效配置；拉取失败也保留已有配置。
+
+已应用的远程文档按服务端 origin 缓存到 `--database` 指定的 SQLite。启动时重新按本地限制校验缓存，合法则恢复，非法则记录警告并保留本地配置。应用成功但缓存写入失败时，本进程仍使用新配置并记录警告，重启后不能保证恢复该版本。心跳上报 `applied_revision`、状态和错误，供控制端核对。
+
+修改本地部署限制需要重启扫描器；已有合法远程缓存会再次合并，并不会因修改 TOML 自动消失。需要丢弃远程缓存时，在扫描器停止后使用 `cache clear --include-runtime-config`；该命令也会清除对应待上传结果，应先阅读[扫描缓存管理](CACHE_MANAGEMENT.md)。重新连接后服务端仍可再次下发配置。
+
 ## 配置参考
 
 ### config.toml
@@ -517,7 +532,7 @@ endpoint = "https://example.com/api/scanner/result"
 
 ### 静态配置与运行状态
 
-TOML 保存服务端、扫描引擎、网络与超时等静态部署配置；SQLite 保存身份和待上传运行状态。
+TOML 保存本地部署配置；支持远程调整的扫描参数还会与服务端下发文档合并。SQLite 保存身份、待上传状态和已应用的远程配置。详见[本地部署配置与远程运行配置](#本地部署配置与远程运行配置)。
 注册时必须同时提供 `--id` 和 `--token`，其中 `--token` 是不落盘的一次性注册令牌。成功后
 `scanner_id` / `runtime_token` 写入 `--database` 指定的 SQLite，而不是配置文件。旧配置中的
 `scanner.token` 不会被当作运行令牌；旧 `scanner_id` / `runtime_token` 会在首次升级启动时
