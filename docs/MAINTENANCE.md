@@ -796,7 +796,7 @@ request/response。协议版本 1、2 仍可用于滚动升级，但版本 2 不
 | 目标 | 格式 |
 |------|------|
 | stderr | 人类可读，含文件+行号 |
-| `./logs/scanner.YYYY-MM-DD` | JSON，按日滚动 |
+| `./logs/scanner.log.YYYY-MM-DD` | JSON，按日滚动 |
 
 级别：默认 `INFO`，`--debug` 启用 `DEBUG`。如果设置了 `RUST_LOG`，其过滤规则优先于 CLI 默认级别，例如 `RUST_LOG=scanner_rs=debug scanner-rs`。
 
@@ -814,8 +814,9 @@ DEBUG 日志覆盖配置加载、启动模式、任务 HTTP 状态、任务上�
 | `toml_edit` (serde) | TOML 读写（注释保留） |
 | `uuid` (v7) | UUIDv7 生成 |
 | `reqwest` (json) | HTTP 客户端 |
+| `rusqlite` (bundled) | SQLite 身份、扫描状态与配置持久化 |
 | `chrono` (serde) | 时间戳生成 |
 | `tracing` + `tracing-subscriber` + `tracing-appender` | 结构化日志 |
 | `thiserror` | 错误类型 derive |
 
-不再依赖：~~`tokio-postgres`~~、~~`anyhow`~~、~~`toml`~~
+依赖版本与功能特性以 `Cargo.toml` 为准。
