@@ -1,5 +1,6 @@
 mod cache;
 mod config;
+mod diagnostics;
 mod error;
 mod health;
 mod heartbeat;
@@ -154,15 +155,34 @@ fn shutdown_receiver() -> watch::Receiver<bool> {
 // ---- entry point --------------------------------------------------------
 
 #[tokio::main]
-async fn main() {
-    if let Err(e) = run().await {
-        eprintln!("\x1b[31mfatal: {}\x1b[0m", e);
-        std::process::exit(1);
-    }
+async fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+    init_shutdown();
+    let logging_guard = match init_logging(cli.debug, &cli.log_directory) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("failed to initialize logs: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(event="ScannerPanic",error_kind="process",error_code="scanner_panic",operation="runtime",error_message=%info,"scanner panicked");
+        previous_hook(info);
+    }));
+    let result = run(cli, &logging_guard).await;
+    let code = if let Err(e) = result {
+        tracing::error!(event="ScannerFatal",error_kind="process",error_code="scanner_fatal",operation="runtime",error_message=%e,"scanner terminated");
+        eprintln!("fatal: {e}");
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    };
+    diagnostics::flush_capture().await;
+    code
 }
 
-async fn run() -> Result<(), ScannerError> {
-    let cli = Cli::parse();
+async fn run(cli: Cli, logging_guard: &crate::logging::LoggingGuard) -> Result<(), ScannerError> {
     if cli.command.is_some()
         && (cli.health_check || cli.get_system_info || cli.id.is_some() || cli.token.is_some())
     {
@@ -171,9 +191,6 @@ async fn run() -> Result<(), ScannerError> {
                 .into(),
         ));
     }
-    init_shutdown();
-
-    let logging_guard = init_logging(cli.debug, &cli.log_directory)?;
 
     tracing::debug!(
         version = env!("CARGO_PKG_VERSION"),
@@ -392,15 +409,6 @@ async fn run() -> Result<(), ScannerError> {
         return Ok(());
     }
 
-    validate_scanner_binary(&cfg.scanner.scanner_path)?;
-    if cfg.service_detection.enabled {
-        validate_zgrab_binary(&cfg.service_detection.zgrab_path)?;
-    }
-    if cfg.nuclei.enabled {
-        validate_nuclei_binary(&cfg.nuclei.path)?;
-        validate_nuclei_templates(&cfg.nuclei.templates_path)?;
-    }
-
     println!("starting...");
 
     if cfg.scanner.runtime_token.is_empty() {
@@ -441,6 +449,40 @@ async fn run() -> Result<(), ScannerError> {
     }
     let network_probe_handle =
         network_detector.spawn(network_capabilities.clone(), connection_rx.clone());
+    let diagnostics_runtime = diagnostics::DiagnosticsRuntime::start(
+        logging_guard.directory(),
+        &cli.database,
+        server_origin.clone(),
+        scanner_id,
+        server_client.clone(),
+        connection_rx.clone(),
+        shutdown_receiver(),
+    )
+    .await
+    .map_err(|e| ScannerError::Config(format!("diagnostics initialization failed: {e}")))?;
+    let diagnostics_supervisor = diagnostics_runtime.supervisor();
+    let startup_validation = (|| -> Result<(), ScannerError> {
+        validate_scanner_binary(&cfg.scanner.scanner_path)?;
+        if cfg.service_detection.enabled {
+            validate_zgrab_binary(&cfg.service_detection.zgrab_path)?;
+        }
+        if cfg.nuclei.enabled {
+            validate_nuclei_binary(&cfg.nuclei.path)?;
+            validate_nuclei_templates(&cfg.nuclei.templates_path)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = &startup_validation {
+        diagnostics_runtime.handle.set_accepting_tasks(false);
+        tracing::error!(event="ScannerStartupValidationFailed",error_kind="configuration",error_code="scanner_engine_validation_failed",operation="startup",error_message=%error,"scanner engine validation failed; diagnostics remain available");
+    }
+    if startup_validation.is_ok() {
+        tracing::info!(
+            event = "ScannerOperationRecovered",
+            operation = "startup",
+            "scanner startup checks passed"
+        );
+    }
     let heartbeat_client = HeartbeatClient::new(
         server_client.clone(),
         HeartbeatEndpoints {
@@ -454,7 +496,8 @@ async fn run() -> Result<(), ScannerError> {
         scan_capabilities,
         cfg.scanner.runtime_configuration_url(),
         runtime_configuration.clone(),
-    );
+    )
+    .with_diagnostics(diagnostics_runtime.handle.clone());
     let active_task = ActiveTask::default();
     let stop_bridge_handle = spawn_active_task_stop_bridge(active_task.clone());
     let heartbeat_handle = spawn_heartbeat(
@@ -494,7 +537,17 @@ async fn run() -> Result<(), ScannerError> {
         );
     }
 
-    if !stop_requested() {
+    if startup_validation.is_err() {
+        let mut shutdown = shutdown_receiver();
+        while !stop_requested() {
+            if heartbeat_handle.is_finished() || diagnostics_runtime.is_finished() {
+                request_stop();
+                break;
+            }
+            tokio::select! {_ = sleep(Duration::from_secs(1)) => {}, _ = shutdown.changed() => break}
+        }
+    }
+    if !stop_requested() && startup_validation.is_ok() {
         scan_loop(
             ScanLoopConfig {
                 scanner_path: &cfg.scanner.scanner_path,
@@ -538,6 +591,9 @@ async fn run() -> Result<(), ScannerError> {
     heartbeat_handle.abort();
     stop_bridge_handle.abort();
     network_probe_handle.abort();
+    request_stop();
+    diagnostics_supervisor.abort();
+    diagnostics_runtime.stop(true).await;
 
     log_event!(LogLevel::Info, "CLEANUP", "shutdown complete", "main");
     println!("shutdown complete");

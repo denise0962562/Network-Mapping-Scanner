@@ -1,5 +1,8 @@
-use std::path::{Path, PathBuf};
-use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
+use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub(crate) struct LoggingGuard {
@@ -19,8 +22,18 @@ pub(crate) fn init_logging(
 ) -> Result<LoggingGuard, std::io::Error> {
     std::fs::create_dir_all(log_directory)?;
     let log_directory = log_directory.canonicalize()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&log_directory, std::fs::Permissions::from_mode(0o700))?;
+    }
 
-    let file_appender = tracing_appender::rolling::daily(&log_directory, "scanner.log");
+    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("scanner.log")
+        .max_log_files(14)
+        .build(&log_directory)
+        .map_err(std::io::Error::other)?;
     let (file_writer, file_guard) = NonBlockingBuilder::default()
         .lossy(false)
         .finish(file_appender);
@@ -36,7 +49,7 @@ pub(crate) fn init_logging(
 
     let file = fmt::layer()
         .json()
-        .with_writer(file_writer)
+        .with_writer(JsonDiagnosticWriter(file_writer))
         .with_target(true)
         .with_file(true)
         .with_line_number(true)
@@ -63,6 +76,55 @@ pub(crate) fn init_logging(
         _file_guard: file_guard,
         directory: log_directory,
     })
+}
+
+#[derive(Clone)]
+struct JsonDiagnosticWriter(NonBlocking);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JsonDiagnosticWriter {
+    type Writer = JsonEventWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        JsonEventWriter {
+            output: self.0.clone(),
+            buffer: Vec::new(),
+        }
+    }
+}
+
+struct JsonEventWriter {
+    output: NonBlocking,
+    buffer: Vec<u8>,
+}
+impl Write for JsonEventWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl Drop for JsonEventWriter {
+    fn drop(&mut self) {
+        if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&self.buffer) {
+            value["fields"]["boot_id"] = serde_json::json!(crate::diagnostics::boot_id());
+            if matches!(value["level"].as_str(), Some("WARN" | "ERROR"))
+                || value
+                    .pointer("/fields/event")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("ScannerOperationRecovered")
+            {
+                value["fields"]["event_id"] = serde_json::json!(uuid::Uuid::now_v7());
+                crate::diagnostics::capture(&value);
+            }
+            if let Ok(mut bytes) = serde_json::to_vec(&value) {
+                bytes.push(b'\n');
+                let _ = self.output.write_all(&bytes);
+                return;
+            }
+        }
+        let _ = self.output.write_all(&self.buffer);
+    }
 }
 
 /// Convenience macro wrapping `tracing` field-value syntax for structured log events.

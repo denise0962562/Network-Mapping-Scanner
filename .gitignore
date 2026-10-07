@@ -11,3 +11,7 @@ scanner-state.sqlite3
 scanner-state.sqlite3-journal
 scanner-state.sqlite3-wal
 scanner-state.sqlite3-shm
+*.diagnostics.sqlite3
+*.diagnostics.sqlite3-journal
+*.diagnostics.lock
+*.diagnostics-spool/

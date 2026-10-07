@@ -17,6 +17,7 @@ pub(crate) enum FetchTaskOutcome {
 pub(crate) struct ServerHttpClient {
     client: Client,
     runtime_token: String,
+    failed_operations: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<&'static str>>>,
 }
 
 impl ServerHttpClient {
@@ -36,6 +37,7 @@ impl ServerHttpClient {
         Ok(Self {
             client,
             runtime_token,
+            failed_operations: Default::default(),
         })
     }
 
@@ -90,10 +92,52 @@ impl ServerHttpClient {
         request: RequestBuilder,
         operation: &'static str,
     ) -> Result<Response, ServerError> {
-        request
+        let result = request
             .send()
             .await
-            .map_err(|error| request_error(error, operation))
+            .map_err(|error| request_error(error, operation));
+        if !operation.contains("diagnostic")
+            && let Ok(mut failed) = self.failed_operations.lock()
+        {
+            if result
+                .as_ref()
+                .is_ok_and(|response| response.status().is_success())
+            {
+                if failed.remove(operation) {
+                    tracing::info!(
+                        event = "ScannerOperationRecovered",
+                        operation,
+                        "scanner operation recovered"
+                    );
+                }
+            } else if result
+                .as_ref()
+                .map(|response| {
+                    response.status().as_u16() == 429 || response.status().is_server_error()
+                })
+                .unwrap_or(true)
+            {
+                failed.insert(operation);
+            }
+        }
+        result
+    }
+
+    pub(crate) async fn put_bytes(
+        &self,
+        url: &str,
+        bytes: Vec<u8>,
+    ) -> Result<Response, ServerError> {
+        self.execute(
+            self.client
+                .put(url)
+                .bearer_auth(&self.runtime_token)
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .timeout(Duration::from_secs(60))
+                .body(bytes),
+            "upload diagnostic log chunk",
+        )
+        .await
     }
 }
 
