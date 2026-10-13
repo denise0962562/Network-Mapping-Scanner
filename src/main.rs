@@ -1,5 +1,6 @@
 mod cache;
 mod config;
+mod config_check;
 mod diagnostics;
 mod error;
 mod health;
@@ -33,7 +34,7 @@ use crate::scan::{
 };
 use crate::storage::{StateStore, StoredIdentity};
 use crate::sysinfo::SystemInfo;
-use crate::types::{CacheManager, TargetParams};
+use crate::types::{CacheManager, MasscanConfig, TargetParams};
 use crate::upload::Uploader;
 use clap::{Parser, Subcommand};
 use std::io::{self, IsTerminal, Write};
@@ -313,6 +314,9 @@ async fn run(cli: Cli, logging_guard: &crate::logging::LoggingGuard) -> Result<(
         scan_rate = cfg.scanner.rate,
         verify_tls = cfg.scanner.verify_tls,
         scanner_path = %cfg.scanner.scanner_path,
+        masscan_output_mode = ?cfg.scanner.masscan.output_mode,
+        masscan_wait_seconds = cfg.scanner.masscan.wait_seconds,
+        masscan_max_runtime_seconds = cfg.scanner.masscan.max_runtime_seconds,
         scanner_id = %cfg.scanner.scanner_id,
         runtime_token_configured = !cfg.scanner.runtime_token.is_empty(),
         upload_endpoint = %cfg.upload.endpoint,
@@ -497,7 +501,8 @@ async fn run(cli: Cli, logging_guard: &crate::logging::LoggingGuard) -> Result<(
         cfg.scanner.runtime_configuration_url(),
         runtime_configuration.clone(),
     )
-    .with_diagnostics(diagnostics_runtime.handle.clone());
+    .with_diagnostics(diagnostics_runtime.handle.clone())
+    .with_config_check(loaded.check.clone());
     let active_task = ActiveTask::default();
     let stop_bridge_handle = spawn_active_task_stop_bridge(active_task.clone());
     let heartbeat_handle = spawn_heartbeat(
@@ -551,6 +556,7 @@ async fn run(cli: Cli, logging_guard: &crate::logging::LoggingGuard) -> Result<(
         scan_loop(
             ScanLoopConfig {
                 scanner_path: &cfg.scanner.scanner_path,
+                masscan: &cfg.scanner.masscan,
                 task_url: &task_url,
                 current_task_url: &current_task_url,
                 server_client: &server_client,
@@ -1263,6 +1269,7 @@ async fn flush_with_guards(
 
 struct ScanLoopConfig<'a> {
     scanner_path: &'a str,
+    masscan: &'a MasscanConfig,
     task_url: &'a str,
     current_task_url: &'a str,
     server_client: &'a ServerHttpClient,
@@ -1926,7 +1933,7 @@ async fn scan_loop(
             .clone()
             .unwrap_or_else(|| ScanPlan::legacy(&runtime.service_detection));
 
-        let scan_key = format!(
+        let mut scan_key = format!(
             "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
             assigned_task.task_id,
             target.ip,
@@ -1939,6 +1946,11 @@ async fn scan_loop(
             runtime.nuclei,
             assigned_task.dns_resolvers
         );
+        // Preserve existing checkpoints on an upgrade with default settings.
+        // A changed output contract or timeout must not reuse another configuration's scan.
+        if config.masscan != &MasscanConfig::default() {
+            scan_key.push_str(&format!("|masscan={:?}", config.masscan));
+        }
         let journal = match cache
             .store
             .as_ref()
@@ -2023,6 +2035,7 @@ async fn scan_loop(
             ScanRuntimeConfig {
                 journal,
                 scanner_path: config.scanner_path,
+                masscan: config.masscan,
                 service_detection: &runtime.service_detection,
                 dns: &runtime.dns,
                 nuclei: &runtime.nuclei,
