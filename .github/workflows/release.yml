@@ -96,8 +96,34 @@ jobs:
       - name: Build scanner
         run: |
           set -euo pipefail
-          cargo build --locked --release --target "$BUILD_TARGET"
+          cargo build --locked --release --bins --target "$BUILD_TARGET"
 
+      - name: Verify Debian 12 GLIBC compatibility
+        if: endsWith(matrix.target, '-gnu')
+        run: |
+          set -euo pipefail
+
+          for scanner_binary in scanner-rs scanner-worker scanner-package; do
+            binary_path="target/$BUILD_TARGET/release/$scanner_binary"
+
+            required_glibc="$({
+              objdump -T "$binary_path" \
+                | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p'
+            } | sort -V | tail -n 1)"
+
+            if [[ -z "$required_glibc" ]]; then
+              echo "Unable to determine GLIBC requirement: $scanner_binary" >&2
+              exit 1
+            fi
+
+            if dpkg --compare-versions "$required_glibc" gt '2.36'; then
+              echo "$scanner_binary requires GLIBC_$required_glibc, newer than Debian 12 GLIBC_2.36" >&2
+              exit 1
+            fi
+
+            echo "$scanner_binary maximum GLIBC requirement: GLIBC_$required_glibc"
+          done
+          
       - name: Verify Debian 12 GLIBC compatibility
         if: endsWith(matrix.target, '-gnu')
         run: |
@@ -164,7 +190,9 @@ jobs:
           package_root="$stage_parent/$ARCHIVE_NAME"
 
           mkdir -p "$package_root" release
-          install -m 0755 "target/$BUILD_TARGET/release/scanner-rs" "$package_root/scanner-rs"
+          install -m 0755 target/release/scanner-rs "$package_root/scanner-rs"
+          install -m 0755 target/release/scanner-worker "$package_root/scanner-worker"
+          install -m 0755 target/release/scanner-package "$package_root/scanner-package"
           install -m 0644 config.toml "$package_root/config.example.toml"
           sed -E -i \
             -e 's/^([[:space:]]*(scanner_id|runtime_token)[[:space:]]*=).*/\1 ""/' \

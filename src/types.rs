@@ -180,7 +180,7 @@ pub(crate) struct AssignedTask {
 /// A DNS server selected by the user for one task. DNS task configuration is
 /// delivered by the control plane instead of being taken from the scanner's
 /// host configuration, so a result can always be attributed to its source.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub(crate) struct DnsResolver {
     pub(crate) id: String,
     pub(crate) label: String,
@@ -285,7 +285,7 @@ fn default_task_lease_ttl_ms() -> u64 {
 }
 
 /// Parameters passed to masscan after applying local scanner settings.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TargetParams {
     pub(crate) ip: String,
     pub(crate) port: String,
@@ -318,6 +318,8 @@ pub(crate) struct ScannerResultBatchUpload {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct AppConfig {
+    #[serde(default)]
+    pub(crate) modules: crate::modules::ModulesConfig,
     pub(crate) scanner: ScannerConfig,
     pub(crate) upload: UploadConfig,
     #[serde(default)]

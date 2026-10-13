@@ -199,6 +199,8 @@ impl ActiveTask {
 struct HeartbeatPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     local_config_check: Option<crate::config_check::ConfigCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    module_state: Option<serde_json::Value>,
     diagnostics: crate::diagnostics::protocol::Capabilities,
     diagnostic_health: serde_json::Value,
     scanner_id: Uuid,
@@ -276,6 +278,7 @@ struct HeartbeatLease {
 #[derive(Clone)]
 pub(crate) struct HeartbeatClient {
     local_config_check: Option<crate::config_check::ConfigCheck>,
+    modules: Option<crate::modules::registry::Registry>,
     diagnostics: Option<crate::diagnostics::DiagnosticsHandle>,
     client: ServerHttpClient,
     heartbeat_url: String,
@@ -333,6 +336,7 @@ impl HeartbeatClient {
     ) -> Self {
         Self {
             local_config_check: None,
+            modules: None,
             diagnostics: None,
             client,
             heartbeat_url: endpoints.heartbeat,
@@ -346,6 +350,14 @@ impl HeartbeatClient {
             runtime_configuration_url,
             runtime_configuration,
         }
+    }
+
+    pub(crate) fn with_modules(
+        mut self,
+        registry: Option<crate::modules::registry::Registry>,
+    ) -> Self {
+        self.modules = registry;
+        self
     }
 
     pub(crate) async fn maintenance_status(&self) -> Result<MaintenanceInfo, ScannerError> {
@@ -384,8 +396,27 @@ impl HeartbeatClient {
         } else {
             "idle"
         };
+        let scan_capabilities = if let Some(registry) = &self.modules {
+            let mut runtime = self.runtime_configuration.snapshot().await;
+            if let Ok(Some(environment)) = registry.active() {
+                runtime.service_detection.enabled &=
+                    environment.modules.contains_key("service_detection");
+                runtime.dns.enabled &= environment.modules.contains_key("dns_lookup");
+                runtime.nuclei.enabled &=
+                    environment.modules.contains_key("vulnerability_detection");
+            }
+            ScanCapabilities::from_config(&runtime.service_detection, &runtime.dns, &runtime.nuclei)
+        } else {
+            self.scan_capabilities.clone()
+        };
         let payload = HeartbeatPayload {
             local_config_check: self.local_config_check.clone(),
+            module_state: self.modules.as_ref().map(|registry| {
+                let mut report = registry.report();
+                report["task_generation"] =
+                    serde_json::json!(active_task_id.and_then(|id| registry.task_generation(id)));
+                report
+            }),
             diagnostics: self
                 .diagnostics
                 .as_ref()
@@ -402,7 +433,7 @@ impl HeartbeatClient {
             scanner_version: env!("CARGO_PKG_VERSION"),
             system: SystemInfo::gather()?,
             network_capabilities: self.network_capabilities.get().await,
-            scan_capabilities: self.scan_capabilities.clone(),
+            scan_capabilities,
             latency_report: self.pending_latency.read().await.clone(),
             config_state: self.runtime_configuration.report().await,
         };

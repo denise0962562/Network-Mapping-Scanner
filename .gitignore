@@ -16,6 +16,10 @@ scanner-state.sqlite3-shm
 *.diagnostics.lock
 *.diagnostics-spool/
 
+scanner-modules/
+scanner-modules.sqlite3*
+trusted-update-keys.json
+*.pkcs8
 # Docker runtime secrets and generated build artifacts
 /docker/runtime/
 /docker/output/

@@ -1,8 +1,8 @@
 mod detection;
-mod engines;
+pub(crate) mod engines;
 mod observation;
 mod orchestrator;
-mod plan;
+pub(crate) mod plan;
 
 pub(crate) use engines::masscan::validate_scanner_binary;
 pub(crate) use engines::nuclei::validate_binary as validate_nuclei_binary;
@@ -14,3 +14,6 @@ pub(crate) use observation::{
 };
 pub(crate) use orchestrator::{ScanOutcome, ScanRuntimeConfig, run_scan};
 pub(crate) use plan::{ScanCapabilities, ScanPlan};
+
+#[cfg(test)]
+pub(crate) use orchestrator::process_worker_result;
