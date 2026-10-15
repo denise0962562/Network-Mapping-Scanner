@@ -190,9 +190,9 @@ jobs:
           package_root="$stage_parent/$ARCHIVE_NAME"
 
           mkdir -p "$package_root" release
-          install -m 0755 target/release/scanner-rs "$package_root/scanner-rs"
-          install -m 0755 target/release/scanner-worker "$package_root/scanner-worker"
-          install -m 0755 target/release/scanner-package "$package_root/scanner-package"
+          install -m 0755 "target/$BUILD_TARGET/release/scanner-rs" "$package_root/scanner-rs"
+          install -m 0755 "target/$BUILD_TARGET/release/scanner-worker" "$package_root/scanner-worker"
+          install -m 0755 "target/$BUILD_TARGET/release/scanner-package" "$package_root/scanner-package"
           install -m 0644 config.toml "$package_root/config.example.toml"
           sed -E -i \
             -e 's/^([[:space:]]*(scanner_id|runtime_token)[[:space:]]*=).*/\1 ""/' \
