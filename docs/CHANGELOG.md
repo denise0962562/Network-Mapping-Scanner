@@ -2,6 +2,41 @@
 
 [文档中心](README.md) · [部署与升级](DEPLOYMENT.md) · [服务端更新日志](https://github.com/wshijiang/network-mapping/blob/main/docs/CHANGELOG.md)
 
+## 未发布：全部服务自动识别（2026-10-23）
+
+- 默认识别策略为 adaptive，所有已实现 TCP 协议进入自动候选；补齐工业端口映射和工业回退/full exhaustive，HTTPS 自动细分 DoH，完整 RFB Banner 可确认非标准端口 VNC。
+- 保留节点探测预算、阶段期限和 TLS 校验；TCP 无需 required_services，UDP 默认协议由服务端规范化后下发，IPv6 不尝试经典 BACnet/IP。
+- 增加全模块默认端口覆盖、工业回退、HTTPS→DoH 细分与预算、RFB 正反例回归。
+
+## 未发布：PR review 与 CI 核验修复（2026-10-23）
+
+- 远程 CI 暴露诊断存储立即重开的偶发锁冲突；阻塞数据库调用在返回完成前显式释放捕获的 Store，并增加多线程连续重开回归，不增加重试或忽略失败。
+- 核实 PR #91 的检查点与期限意见：被动接收改为在固定游标保存包含恢复结果的累计快照，并恢复已观察来源的去重集合，避免多条 ACK 证据被覆盖。
+- 原生 TCP 与 UDP 探测在接受末次结果时重新检查阶段期限；UDP 阶段耗尽不再提交端点完成游标或返回成功。
+- 增加跨重启多来源恢复、原生期限竞争及末端 UDP 超时回归。旧 IPC fixture 意见已由上一提交配套 IPC 3 修复，本轮核对保留。
+
+## 未发布：加密 DNS、工业与 UDP 服务识别（2026-10-23）
+
+- 增加默认验证证书的 DoT/DoH 原生识别，固定目标 IP、合法 SNI/路径、公开 CA；普通 HTTPS/HTML、重定向和不匹配 DNS 不确认 DoH。
+- 增加显式 Modbus TCP、EtherNet/IP、经典 S7comm、OPC UA 最小握手；MQTT/MQTTS 改为原生 3.1.1/5.0 CONNECT/CONNACK，确认合法认证拒绝。
+- plan v2 独立 UDP 任务接入 DNS、EtherNet/IP ListIdentity、BACnet/IP 单播，以及有界 IPv4 实时流量被动接收；不发送 I/O 控制数据，不把沉默标为开放/关闭。
+- 新增 `max_service_probes` 能力和 IPC 3 参数契约，复用期限、限速、取消、ACK 与检查点。新增直接依赖 tokio-rustls/rustls-native-certs/ipnet，复用锁定传递版本；未进行无关升级。
+- 详见[使用说明](USAGE.md)、[模块更新](MODULE_UPDATES.md)和[完整支持矩阵](https://github.com/wshijiang/network-mapping/blob/main/docs/SERVICE_PROTOCOLS.md)。被动协议仅支持文档列出的保守子集，真实设备验收仍需进行。
+
+## 未发布：DNS TCP / VNC 服务探测（2026-10-23）
+
+- 服务识别阶段新增原生 DNS TCP 与 VNC 探测：默认映射 53、5900–5909，支持显式选择协议探测非标准端口；不向 zgrab2 注册未支持的模块。默认服务策略继续识别其他已有协议。
+- DNS 校验 TCP 分帧、随机事务 ID 和根 SOA 问题，合法拒绝响应只证明协议存在；VNC 只接收完整受支持的 RFB 问候，不尝试认证。结果记录 `source=native` 和有界 schema 2 证据。
+- 节点上报 `scan_capabilities.service_protocols`，任务通过 `scan_plan.required_services` 显式选择 DNS/VNC，复用阶段期限、取消、限速、分块 ACK 与检查点。
+- Worker IPC 升为 2，拒绝旧 Worker 静默忽略定向探测参数。启用模块的部署须排空旧 generation 任务，配套升级 Agent、Worker 和完整 IPC 2 模块包；结果上传仍为协议 3。详见[模块更新](MODULE_UPDATES.md)。
+- 已完成合成协议、回环、真实 Worker 及本地回归；未进行线上节点/真实 DNS、VNC 产品验收。本条记录 A 阶段；其后实现见上方扩展条目。
+
+## 未发布：服务识别扩展规划（2026-10-23）
+
+- 补充 [DNS、DoH、DoT 与 VNC 扩展规划](https://github.com/wshijiang/network-mapping/blob/main/docs/DNS_DOH_DOT_VNC_PLAN.md)入口及 UDP 接入前置条件，明确原生适配器、统一预算、Worker/检查点兼容和协议验收。
+- 本条仅涉及文档，尚未新增对应服务模块或开放 DNS UDP 任务；现有 DNS UDP 仍为独立库 API。
+- 补充[工业服务识别规划](https://github.com/wshijiang/network-mapping/blob/main/docs/INDUSTRIAL_SERVICE_DETECTION_PLAN.md)：新增协议的有界识别、UDP 发现与被动观察、Worker/恢复及逐协议验收；MQTT/MQTTS 已有模块，作为核验与补强项，不重复计为新增支持。
+
 ## 未发布：服务探测第一批（2026-10-22）
 
 - 新增 DNS/NTP/STUN UDP 单播探测库内核，具备事务匹配、连接式来源过滤、超时重试、取消、报文大小和无效响应预算。
