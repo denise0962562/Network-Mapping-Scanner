@@ -2,6 +2,10 @@
 
 [文档中心](README.md) · [部署与升级](DEPLOYMENT.md) · [服务端更新日志](https://github.com/wshijiang/network-mapping/blob/main/docs/CHANGELOG.md)
 
+## 未发布：sha2 0.11 升级适配（2026-10-24）
+
+- 修复 sha2 0.11 摘要输出不再实现 LowerHex 导致诊断、注册和 TLS 指纹编译失败；复用逐字节小写十六进制编码，保持已有摘要及身份状态兼容。
+- 增加标准 SHA-256 已知向量回归；保留诊断快照、注册重启和 TLS 证据验证。
 ## 未发布：Hickory 0.26 升级适配（2026-10-24）
 
 - 适配 Hickory 0.26 的解析器构造错误、连接配置、Lookup answer API、MX/SRV 字段与 DNS 消息元数据，修复依赖升级的编译失败。
