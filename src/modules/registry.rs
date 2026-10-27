@@ -4,6 +4,7 @@ use super::{
 };
 use crate::{
     error::ScannerError,
+    file_lock::ExclusiveFileLock,
     runtime_config::RuntimeSnapshot,
     scan::plan::ScanStageKind,
     types::{AppConfig, AssignedTask},
@@ -48,16 +49,7 @@ pub(crate) struct Registry {
 struct Store {
     // Fields drop in declaration order: close SQLite before releasing ownership.
     db: Connection,
-    _lock: StoreLock,
-}
-
-struct StoreLock(File);
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        // fork/dup can keep the open-file description alive after our File closes.
-        // Explicitly unlock when the final Registry owner releases the Store.
-        let _ = fs2::FileExt::unlock(&self.0);
-    }
+    _lock: ExclusiveFileLock,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,10 +125,9 @@ impl Registry {
             .read(true)
             .write(true)
             .open(&lock_path)?;
-        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| {
+        let lock = ExclusiveFileLock::acquire(lock).map_err(|_| {
             ScannerError::Config("module store is in use by the running agent".into())
         })?;
-        let lock = StoreLock(lock);
         let db = Connection::open(&config.state_database)?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.busy_timeout(Duration::from_secs(5))?;
@@ -892,7 +883,13 @@ mod tests {
         let f = Fixture::new();
         let registry = Registry::open_store(f.local.modules.clone(), "origin".into()).unwrap();
         // dup and fork share the same open-file description on Unix.
-        let inherited = registry.state.lock().unwrap()._lock.0.try_clone().unwrap();
+        let inherited = registry
+            .state
+            .lock()
+            .unwrap()
+            ._lock
+            .try_clone_file()
+            .unwrap();
         let owner = registry.clone();
         drop(registry);
         assert!(Registry::open_store(f.local.modules.clone(), "origin".into()).is_err());

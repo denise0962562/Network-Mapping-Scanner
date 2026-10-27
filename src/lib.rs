@@ -4,6 +4,7 @@ mod config_check;
 mod config_env;
 mod diagnostics;
 mod error;
+mod file_lock;
 mod health;
 mod heartbeat;
 mod http_client;
@@ -163,6 +164,8 @@ enum CacheCommand {
 // ---- globals ------------------------------------------------------------
 
 static STOP: AtomicBool = AtomicBool::new(false);
+// Failures take precedence over a concurrent user-requested shutdown.
+static FAILED_STOP: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN: OnceLock<watch::Sender<bool>> = OnceLock::new();
 
 fn init_shutdown() {
@@ -172,6 +175,15 @@ fn init_shutdown() {
 
 fn stop_requested() -> bool {
     STOP.load(Ordering::Relaxed)
+}
+
+fn request_failure_stop() {
+    mark_failure();
+    request_stop();
+}
+
+fn mark_failure() {
+    FAILED_STOP.store(true, Ordering::Release);
 }
 
 fn request_stop() {
@@ -621,6 +633,10 @@ async fn run(cli: Cli, logging_guard: &crate::logging::LoggingGuard) -> Result<(
             lease_safety_margin: Duration::from_secs(cfg.scanner.lease_safety_margin_seconds),
         },
     );
+    // An unexpected heartbeat task exit must cancel the active scan as well as
+    // stop idle scanners; otherwise a failed heartbeat can leave a scan running.
+    let heartbeat_abort = heartbeat_handle.abort_handle();
+    let mut heartbeat_supervisor = spawn_heartbeat_supervisor(heartbeat_handle);
     tracing::debug!(
         scanner_id = %scanner_id,
         heartbeat_interval_seconds = cfg.scanner.heartbeat_interval_seconds,
@@ -645,8 +661,10 @@ async fn run(cli: Cli, logging_guard: &crate::logging::LoggingGuard) -> Result<(
     if startup_validation.is_err() {
         let mut shutdown = shutdown_receiver();
         while !stop_requested() {
-            if heartbeat_handle.is_finished() || diagnostics_runtime.is_finished() {
-                request_stop();
+            if (heartbeat_supervisor.is_finished() || diagnostics_runtime.is_finished())
+                && !stop_requested()
+            {
+                request_failure_stop();
                 break;
             }
             tokio::select! {_ = sleep(Duration::from_secs(1)) => {}, _ = shutdown.changed() => break}
@@ -675,8 +693,17 @@ async fn run(cli: Cli, logging_guard: &crate::logging::LoggingGuard) -> Result<(
             connection_rx,
         )
         .await;
-        println!("scan complete");
-        log_event!(LogLevel::Info, "SCAN-DONE", "scan loop finished", "main");
+        if !stop_requested() {
+            tracing::error!(
+                event = "ScanLoopExitedUnexpectedly",
+                "scan loop exited without a shutdown request"
+            );
+            request_failure_stop();
+        }
+        if !FAILED_STOP.load(Ordering::Acquire) {
+            println!("scan complete");
+            log_event!(LogLevel::Info, "SCAN-DONE", "scan loop finished", "main");
+        }
     }
 
     tracing::info!(
@@ -697,16 +724,28 @@ async fn run(cli: Cli, logging_guard: &crate::logging::LoggingGuard) -> Result<(
     if let Some(handle) = module_update_handle {
         handle.abort();
     }
-    heartbeat_handle.abort();
     stop_bridge_handle.abort();
     network_probe_handle.abort();
     request_stop();
+    if tokio::time::timeout(Duration::from_secs(5), &mut heartbeat_supervisor)
+        .await
+        .is_err()
+    {
+        heartbeat_abort.abort();
+        let _ = heartbeat_supervisor.await;
+    }
     diagnostics_supervisor.abort();
     diagnostics_runtime.stop(true).await;
 
     log_event!(LogLevel::Info, "CLEANUP", "shutdown complete", "main");
     println!("shutdown complete");
-    Ok(())
+    if FAILED_STOP.load(Ordering::Acquire) {
+        Err(ScannerError::Scan(
+            "scanner stopped after a runtime failure; see preceding errors".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn execute_maintenance_command(
@@ -877,6 +916,22 @@ fn spawn_active_task_stop_bridge(active_task: ActiveTask) -> tokio::task::JoinHa
     })
 }
 
+fn spawn_heartbeat_supervisor(
+    heartbeat: tokio::task::JoinHandle<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let outcome = heartbeat.await;
+        if outcome.as_ref().is_err_and(|error| error.is_panic()) || !stop_requested() {
+            tracing::error!(
+                event = "HeartbeatWorkerStopped",
+                ?outcome,
+                "heartbeat worker stopped unexpectedly"
+            );
+            request_failure_stop();
+        }
+    })
+}
+
 async fn wait_for_stop() {
     if stop_requested() {
         return;
@@ -982,7 +1037,7 @@ fn spawn_heartbeat(
                                     "process_stopping",
                                     active_task_id,
                                 );
-                                request_stop();
+                                request_failure_stop();
                                 break;
                             }
                         }
@@ -1026,19 +1081,35 @@ fn spawn_heartbeat(
                             tracing::info!("system maintenance ended; resuming heartbeat");
                         }
                         Ok(false) => break,
-                        Err(ScannerError::Server(ServerError::AuthRejected { .. })) => {
+                        Err(error @ ScannerError::Server(ServerError::AuthRejected { .. })) => {
+                            mark_failure();
+                            log_terminal_scanner_error(
+                                "MaintenanceProbeFailed",
+                                "poll_maintenance_status",
+                                &error,
+                                "process_stopping",
+                                active_task_id,
+                            );
+                            request_stop();
                             publish_connection_state(&connection_tx, ConnectionState::AuthRejected);
                             active_task.request_shutdown().await;
-                            request_stop();
                             break;
                         }
-                        Err(ScannerError::Server(ServerError::PolicyBlocked { .. })) => {
+                        Err(error @ ScannerError::Server(ServerError::PolicyBlocked { .. })) => {
+                            mark_failure();
+                            log_terminal_scanner_error(
+                                "MaintenanceProbeFailed",
+                                "poll_maintenance_status",
+                                &error,
+                                "process_stopping",
+                                active_task_id,
+                            );
+                            request_stop();
                             publish_connection_state(
                                 &connection_tx,
                                 ConnectionState::PolicyBlocked,
                             );
                             active_task.request_shutdown().await;
-                            request_stop();
                             break;
                         }
                         Err(error) => {
@@ -1049,7 +1120,7 @@ fn spawn_heartbeat(
                                 "process_stopping",
                                 active_task_id,
                             );
-                            request_stop();
+                            request_failure_stop();
                             break;
                         }
                     }
@@ -1095,8 +1166,7 @@ fn spawn_heartbeat(
                     }
                 }
                 Err(ScannerError::Server(error @ ServerError::AuthRejected { .. })) => {
-                    publish_connection_state(&connection_tx, ConnectionState::AuthRejected);
-                    active_task.request_shutdown().await;
+                    mark_failure();
                     log_terminal_scanner_error(
                         "HeartbeatAuthenticationRejected",
                         "send_heartbeat",
@@ -1105,11 +1175,12 @@ fn spawn_heartbeat(
                         active_task_id,
                     );
                     request_stop();
+                    publish_connection_state(&connection_tx, ConnectionState::AuthRejected);
+                    active_task.request_shutdown().await;
                     break;
                 }
                 Err(ScannerError::Server(error @ ServerError::PolicyBlocked { .. })) => {
-                    publish_connection_state(&connection_tx, ConnectionState::PolicyBlocked);
-                    active_task.request_shutdown().await;
+                    mark_failure();
                     log_terminal_scanner_error(
                         "HeartbeatPolicyBlocked",
                         "send_heartbeat",
@@ -1118,6 +1189,8 @@ fn spawn_heartbeat(
                         active_task_id,
                     );
                     request_stop();
+                    publish_connection_state(&connection_tx, ConnectionState::PolicyBlocked);
+                    active_task.request_shutdown().await;
                     break;
                 }
                 Err(ScannerError::Server(error)) => {
@@ -1128,7 +1201,7 @@ fn spawn_heartbeat(
                         "process_stopping",
                         active_task_id,
                     );
-                    request_stop();
+                    request_failure_stop();
                     break;
                 }
                 Err(error) => {
@@ -1412,7 +1485,7 @@ async fn scan_loop(
             && let Err(error) = registry.release(task_id)
         {
             tracing::error!(%error,"module pin release failed");
-            request_stop();
+            request_failure_stop();
             break;
         }
         apply_runtime_configuration(&config.runtime_configuration, cache).await;
@@ -1438,6 +1511,7 @@ async fn scan_loop(
                         observation_count = cache.observations.len(),
                         "pending upload is missing its task identity"
                     );
+                    request_failure_stop();
                     break;
                 };
                 let recovery_url = pending_upload_recovery_url(
@@ -1471,7 +1545,7 @@ async fn scan_loop(
                             next_batch_index = cache.next_batch_index,
                             "server returned the wrong task during upload recovery"
                         );
-                        request_stop();
+                        request_failure_stop();
                         break;
                     }
                     Ok(FetchTaskOutcome::NoTask) => {
@@ -1543,7 +1617,7 @@ async fn scan_loop(
                             "process_stopping",
                             Some(cached_task_id),
                         );
-                        request_stop();
+                        request_failure_stop();
                         break;
                     }
                 }
@@ -1574,6 +1648,7 @@ async fn scan_loop(
                         let _ = heartbeat_client.report_cancelled(task_id).await;
                         if let Err(error) = cache.archive("server_cancelled_task") {
                             tracing::error!(%error, "failed to archive cancelled upload");
+                            request_failure_stop();
                             break;
                         }
                         active_task.clear().await;
@@ -1735,6 +1810,7 @@ async fn scan_loop(
                             batch_index = context.batch_index,
                             "failed to discard rejected cached results"
                         );
+                        request_failure_stop();
                         break;
                     }
                     active_task.clear().await;
@@ -1760,7 +1836,7 @@ async fn scan_loop(
                         server_request_id = ?source.request_id(),
                         "non-retryable upload failure; stopping"
                     );
-                    request_stop();
+                    request_failure_stop();
                     break;
                 }
                 FlushAttempt::Completed(Err(error)) => {
@@ -1778,7 +1854,7 @@ async fn scan_loop(
                         observation_count = cache.observations.len(),
                         "non-retryable result cache failure; stopping"
                     );
-                    request_stop();
+                    request_failure_stop();
                     break;
                 }
             }
@@ -1800,6 +1876,7 @@ async fn scan_loop(
             Ok(_) => config.current_task_url.to_owned(),
             Err(error) => {
                 tracing::error!(%error,"failed to load recovery failure report");
+                request_failure_stop();
                 break;
             }
         };
@@ -1875,7 +1952,7 @@ async fn scan_loop(
                     "process_stopping",
                     None,
                 );
-                request_stop();
+                request_failure_stop();
                 break;
             }
         };
@@ -1958,7 +2035,7 @@ async fn scan_loop(
                         "process_stopping",
                         None,
                     );
-                    request_stop();
+                    request_failure_stop();
                     break;
                 }
             }
@@ -2047,7 +2124,7 @@ async fn scan_loop(
             Ok(value) => value,
             Err(error) => {
                 tracing::error!(%error, "failed to pin module task environment");
-                request_stop();
+                request_failure_stop();
                 break;
             }
         };
@@ -2108,6 +2185,7 @@ async fn scan_loop(
             Ok(journal) => journal,
             Err(error) => {
                 tracing::error!(%error, "failed to load scan checkpoint");
+                request_failure_stop();
                 break;
             }
         };
@@ -2120,6 +2198,7 @@ async fn scan_loop(
             Ok(state) => state.unwrap_or_default(),
             Err(error) => {
                 tracing::error!(%error, "failed to read scan retry state");
+                request_failure_stop();
                 break;
             }
         };
@@ -2140,6 +2219,7 @@ async fn scan_loop(
                     && let Err(error) = store.clear_checkpoint(&cache.server_origin)
                 {
                     tracing::error!(%error, "failed to clear terminal checkpoint");
+                    request_failure_stop();
                     break;
                 }
             } else if stop_requested() {
@@ -2237,6 +2317,7 @@ async fn scan_loop(
                             store.record_scan_failure(&cache.server_origin, assigned_task.task_id)
                     {
                         tracing::error!(%error, "failed to persist scan failure");
+                        request_failure_stop();
                         break;
                     }
                     tracing::error!(
@@ -2262,6 +2343,7 @@ async fn scan_loop(
                         store.record_scan_failure(&cache.server_origin, assigned_task.task_id)
                 {
                     tracing::error!(%error, "failed to persist scan failure");
+                    request_failure_stop();
                     break;
                 }
                 let diagnostics = e.scan_diagnostics();
@@ -2369,6 +2451,7 @@ async fn scan_loop(
                 observation_count = results.len(),
                 "failed to bind results to task"
             );
+            request_failure_stop();
             break;
         }
         module_task_id = Some(assigned_task.task_id);
@@ -2376,6 +2459,7 @@ async fn scan_loop(
             && let Err(error) = store.clear_checkpoint(&cache.server_origin)
         {
             tracing::error!(%error, "failed to clear completed checkpoint");
+            request_failure_stop();
             break;
         }
         match active_task.cancellation_reason() {
@@ -2408,6 +2492,7 @@ async fn scan_loop(
                 .await;
                 if let Err(error) = cache.archive("server_cancelled_task") {
                     tracing::error!(%error, "failed to archive cancelled results");
+                    request_failure_stop();
                     break;
                 }
                 active_task.clear().await;
@@ -2624,7 +2709,7 @@ async fn report_task_status_with_retry(
                     "process_stopping",
                     Some(task_id),
                 );
-                request_stop();
+                request_failure_stop();
                 return false;
             }
         }
@@ -2654,7 +2739,7 @@ fn stop_for_server_error(error: &ServerError, task_id: Option<Uuid>) -> bool {
                 server_request_id = ?error.request_id(),
                 "runtime token rejected; register the scanner again"
             );
-            request_stop();
+            request_failure_stop();
             true
         }
         ServerError::PolicyBlocked { .. } => {
@@ -2671,7 +2756,7 @@ fn stop_for_server_error(error: &ServerError, task_id: Option<Uuid>) -> bool {
                 server_request_id = ?error.request_id(),
                 "request blocked by server policy"
             );
-            request_stop();
+            request_failure_stop();
             true
         }
         _ => false,
